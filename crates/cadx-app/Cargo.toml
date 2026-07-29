@@ -6,8 +6,12 @@ license.workspace = true
 
 [dependencies]
 cadx-agent = { path = "../cadx-agent" }
+cadx-config = { path = "../cadx-config" }
 cadx-core = { path = "../cadx-core" }
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow"] }
+cadx-io = { path = "../cadx-io" }
+cadx-render = { path = "../cadx-render" }
+bytemuck.workspace = true
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
 
 [lints]
 workspace = true

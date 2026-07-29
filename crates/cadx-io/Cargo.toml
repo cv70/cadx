@@ -1,0 +1,21 @@
+[package]
+name = "cadx-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cadx-core = { path = "../cadx-core" }
+cadx-render = { path = "../cadx-render" }
+crc32fast.workspace = true
+dxf.workspace = true
+pdf-writer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+lopdf.workspace = true
+
+[lints]
+workspace = true

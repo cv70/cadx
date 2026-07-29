@@ -1,0 +1,271 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180" role="img" aria-labelledby="title description">
+  <title id="title">CADX AI-Native CAD Target Architecture</title>
+  <desc id="description">CADX architecture panorama covering human interaction, agent orchestration, untrusted model and remote compute, the local authoritative commit boundary, immutable derived views, persistence, release, and cloud replication.</desc>
+
+  <defs>
+    <style>
+      .canvas { fill: #f6f8fa; }
+      .section { fill: #ffffff; stroke: #b8c1c8; stroke-width: 2; }
+      .section-blue { fill: #f3f8fc; stroke: #6a96b7; stroke-width: 2; }
+      .section-amber { fill: #fff8e8; stroke: #c89438; stroke-width: 2; }
+      .section-green { fill: #f2faf5; stroke: #4f8b68; stroke-width: 2.5; }
+      .section-teal { fill: #f1f9f9; stroke: #4d8e91; stroke-width: 2; }
+      .section-violet { fill: #f8f5fb; stroke: #876da0; stroke-width: 2; }
+      .node { fill: #ffffff; stroke: #65727b; stroke-width: 1.5; }
+      .node-blue { fill: #e9f3fa; stroke: #5485a8; stroke-width: 1.5; }
+      .node-amber { fill: #fff1cf; stroke: #b47a1e; stroke-width: 1.5; }
+      .node-green { fill: #e4f4e9; stroke: #397b55; stroke-width: 1.8; }
+      .node-teal { fill: #e4f4f4; stroke: #367c80; stroke-width: 1.5; }
+      .node-violet { fill: #eee7f5; stroke: #72568d; stroke-width: 1.5; }
+      .node-red { fill: #faecea; stroke: #aa5d55; stroke-width: 1.5; }
+      .title, .subtitle, .section-title, .section-note, .node-title, .node-detail, .edge-label { font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .title { font-size: 28px; font-weight: 700; fill: #17242b; }
+      .subtitle { font-size: 14px; font-weight: 400; fill: #55636c; }
+      .section-title { font-size: 17px; font-weight: 700; fill: #26343c; }
+      .section-note { font-size: 12px; font-weight: 400; fill: #63717a; }
+      .node-title { font-size: 13.5px; font-weight: 700; fill: #1e2d35; }
+      .node-detail { font-size: 11.5px; font-weight: 400; fill: #52616a; }
+      .edge-label { font-size: 11.5px; font-weight: 600; fill: #34454f; }
+      .flow { fill: none; stroke: #34454f; stroke-width: 2.2; marker-end: url(#arrow); }
+      .flow-thick { fill: none; stroke: #2f7450; stroke-width: 3; marker-end: url(#arrow-green); }
+      .derived { fill: none; stroke: #397f83; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow-teal); }
+      .proposal { fill: none; stroke: #b47a1e; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow-amber); }
+      .replica { fill: none; stroke: #72568d; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow-violet); }
+      .govern { fill: none; stroke: #9a514a; stroke-width: 2; marker-end: url(#arrow-red); }
+    </style>
+
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34454f"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f7450"/>
+    </marker>
+    <marker id="arrow-teal" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#397f83"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b47a1e"/>
+    </marker>
+    <marker id="arrow-violet" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#72568d"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9a514a"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1600" height="1180"/>
+  <text class="title" x="40" y="44">CADX AI-Native CAD 架构全景</text>
+  <text class="subtitle" x="40" y="69">Target architecture · local authority · semantic operations · deterministic validation · immutable derivation</text>
+
+  <!-- Interaction and decision -->
+  <rect class="section-blue" x="40" y="100" width="420" height="190" rx="7"/>
+  <text class="section-title" x="62" y="130">交互与决策层</text>
+  <text class="section-note" x="62" y="150">人类设定目标、编辑模型、处理冲突并签署 Release</text>
+
+  <rect class="node-blue" x="70" y="176" width="135" height="66" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="137.5" y="204">人类工程师</text>
+  <text class="node-detail" text-anchor="middle" x="137.5" y="224">目标与最终决策</text>
+
+  <rect class="node" x="245" y="166" width="180" height="70" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="335" y="194">Workbench</text>
+  <text class="node-detail" text-anchor="middle" x="335" y="214">建模 · 选择 · 历史</text>
+
+  <rect class="node-red" x="245" y="246" width="180" height="31" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="335" y="267">评审 · 冲突 · 签署</text>
+
+  <path class="flow" d="M 205 209 L 245 201"/>
+  <path class="govern" d="M 205 220 C 220 238, 225 260, 245 261"/>
+
+  <!-- Agent orchestration -->
+  <rect class="section-blue" x="480" y="100" width="600" height="190" rx="7"/>
+  <text class="section-title" x="502" y="130">Agent 编排层</text>
+  <text class="section-note" x="502" y="150">任务归组、可恢复执行、受限上下文与版本化语义工具</text>
+
+  <rect class="node-blue" x="510" y="170" width="160" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="590" y="194">DesignTask</text>
+  <text class="node-detail" text-anchor="middle" x="590" y="212">ChangeSet · AgentRun</text>
+
+  <rect class="node-blue" x="700" y="170" width="165" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="782.5" y="194">Agent Runtime</text>
+  <text class="node-detail" text-anchor="middle" x="782.5" y="212">observe · tool · replan</text>
+
+  <rect class="node-blue" x="895" y="170" width="155" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="972.5" y="194">Tool Registry</text>
+  <text class="node-detail" text-anchor="middle" x="972.5" y="212">SemanticOperation</text>
+
+  <rect class="node" x="700" y="242" width="165" height="34" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="782.5" y="264">Context Gateway</text>
+
+  <path class="flow" d="M 670 201 L 700 201"/>
+  <path class="flow" d="M 865 201 L 895 201"/>
+  <path class="flow" d="M 782.5 232 L 782.5 242"/>
+  <path class="flow" d="M 425 201 C 458 201, 476 201, 510 201"/>
+
+  <!-- Untrusted proposal and cloud -->
+  <rect class="section-amber" x="1100" y="100" width="460" height="190" rx="7"/>
+  <text class="section-title" x="1122" y="130">非权威提议与远程计算</text>
+  <text class="section-note" x="1122" y="150">输出在本地 prepare 与 validation 前均不可信</text>
+
+  <rect class="node-amber" x="1130" y="170" width="390" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1325" y="194">Local / Cloud Model · Remote Compute</text>
+  <text class="node-detail" text-anchor="middle" x="1325" y="213">SemanticOperation · derived candidate · UntrustedClaim</text>
+
+  <rect class="node-violet" x="1235" y="242" width="180" height="34" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1325" y="264">Cloud Replica</text>
+
+  <path class="proposal" d="M 865 259 C 955 279, 1045 245, 1130 207"/>
+  <path class="proposal" d="M 1130 220 C 1040 283, 935 287, 865 222"/>
+  <rect x="935" y="268" width="185" height="18" rx="4" fill="#fff8e8"/>
+  <text class="edge-label" x="947" y="281">RemoteContext / proposal</text>
+
+  <!-- Local authority -->
+  <rect class="section-green" x="40" y="330" width="1520" height="330" rx="7"/>
+  <text class="section-title" x="62" y="362">本地权威提交边界</text>
+  <text class="section-note" x="254" y="362">Core + 受信 Domain Pack · KernelFacade 是唯一写入口</text>
+
+  <rect class="node" x="70" y="405" width="160" height="64" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="150" y="429">Authorization Policy</text>
+  <text class="node-detail" text-anchor="middle" x="150" y="447">Context Grant</text>
+  <text class="node-detail" text-anchor="middle" x="150" y="462">CapabilityToken</text>
+
+  <rect class="node" x="70" y="505" width="160" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="150" y="530">PackLock</text>
+  <text class="node-detail" text-anchor="middle" x="150" y="549">versions · hashes</text>
+
+  <rect class="node-green" x="270" y="390" width="1255" height="220" rx="7"/>
+  <text class="section-title" x="292" y="420">KernelFacade · prepare / validate / commit</text>
+  <text class="section-note" x="1230" y="420">唯一权威写路径</text>
+
+  <rect class="node" x="295" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="362.5" y="480">授权与前置条件</text>
+  <text class="node-detail" text-anchor="middle" x="362.5" y="501">scope · version</text>
+
+  <rect class="node" x="445" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="512.5" y="480">DomainPack</text>
+  <text class="node-detail" text-anchor="middle" x="512.5" y="501">schema · operation</text>
+
+  <rect class="node" x="595" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="662.5" y="480">Geometry</text>
+  <text class="node-detail" text-anchor="middle" x="662.5" y="501">OCCT · solver</text>
+
+  <rect class="node-amber" x="745" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="812.5" y="480">PreparedAction</text>
+  <text class="node-detail" text-anchor="middle" x="812.5" y="501">candidate · RW set</text>
+
+  <rect class="node-teal" x="895" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="962.5" y="480">Local Validators</text>
+  <text class="node-detail" text-anchor="middle" x="962.5" y="501">structure · rules</text>
+
+  <rect class="node-teal" x="1045" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1112.5" y="477">Validation</text>
+  <text class="node-title" text-anchor="middle" x="1112.5" y="494">Evidence</text>
+  <text class="node-detail" text-anchor="middle" x="1112.5" y="513">candidate-bound</text>
+
+  <rect class="node-green" x="1195" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1262.5" y="480">ActionCommit</text>
+  <text class="node-detail" text-anchor="middle" x="1262.5" y="501">append-only</text>
+
+  <rect class="node-green" x="1345" y="455" width="135" height="72" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1412.5" y="480">DocumentStore</text>
+  <text class="node-detail" text-anchor="middle" x="1412.5" y="501">editable semantics</text>
+
+  <path class="flow-thick" d="M 430 491 L 445 491"/>
+  <path class="flow-thick" d="M 580 491 L 595 491"/>
+  <path class="flow-thick" d="M 730 491 L 745 491"/>
+  <path class="flow-thick" d="M 880 491 L 895 491"/>
+  <path class="flow-thick" d="M 1030 491 L 1045 491"/>
+  <path class="flow-thick" d="M 1180 491 L 1195 491"/>
+  <path class="flow-thick" d="M 1330 491 L 1345 491"/>
+
+  <path class="flow" d="M 972.5 232 L 972.5 315 L 362.5 315 L 362.5 455"/>
+  <path class="flow" d="M 230 437 L 265 437 L 265 475 L 295 475"/>
+  <path class="derived" d="M 230 534 L 512.5 534 L 512.5 527"/>
+  <path class="derived" d="M 230 548 L 962.5 548 L 962.5 527"/>
+  <path class="govern" d="M 335 277 L 335 305 L 150 305 L 150 405"/>
+
+  <rect x="295" y="555" width="1185" height="34" rx="6" fill="#dcefe3" stroke="#72a486"/>
+  <text class="edge-label" text-anchor="middle" x="887.5" y="577">SemanticOperation → KernelFacade → PreparedAction → ValidationEvidence → ActionCommit → DocumentStore</text>
+
+  <!-- Immutable read and derivation -->
+  <rect class="section-teal" x="40" y="700" width="880" height="230" rx="7"/>
+  <text class="section-title" x="62" y="732">不可变读取与派生层</text>
+  <text class="section-note" x="62" y="752">Workbench 与 Agent 只消费 revision-bound snapshot，不持有第二份可写模型</text>
+
+  <rect class="node" x="75" y="790" width="165" height="65" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="157.5" y="816">Exchange Adapters</text>
+  <text class="node-detail" text-anchor="middle" x="157.5" y="837">STEP · DXF · PDF</text>
+
+  <rect class="node-teal" x="285" y="790" width="165" height="65" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="367.5" y="816">Renderer</text>
+  <text class="node-detail" text-anchor="middle" x="367.5" y="837">2D · 3D · picking</text>
+
+  <rect class="node-teal" x="495" y="790" width="165" height="65" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="577.5" y="816">ViewSnapshot</text>
+  <text class="node-detail" text-anchor="middle" x="577.5" y="837">RenderScene</text>
+
+  <rect class="node-teal" x="705" y="790" width="165" height="65" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="787.5" y="816">DocumentSnapshot</text>
+  <text class="node-detail" text-anchor="middle" x="787.5" y="837">revision-bound</text>
+
+  <path class="derived" d="M 705 822.5 L 660 822.5"/>
+  <path class="derived" d="M 495 822.5 L 450 822.5"/>
+  <path class="derived" d="M 705 846 C 560 900, 355 900, 240 846"/>
+  <path class="derived" d="M 1412.5 527 L 1412.5 680 L 787.5 680 L 787.5 790"/>
+
+  <!-- Persistence, release, audit and sync -->
+  <rect class="section-violet" x="940" y="700" width="620" height="390" rx="7"/>
+  <text class="section-title" x="962" y="732">本地持久化、审计、Release 与同步</text>
+  <text class="section-note" x="962" y="752">权威事件与证据本地保存；云端仅复制不可变对象</text>
+  <text class="section-note" x="962" y="770">Release = fixed snapshot + PackLock + evidence + trusted signature</text>
+
+  <rect class="node-violet" x="970" y="790" width="170" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1055" y="815">Project Store API</text>
+  <text class="node-detail" text-anchor="middle" x="1055" y="834">restore · replay</text>
+
+  <rect class="node" x="1160" y="790" width="170" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1245" y="815">SQLite / WAL</text>
+  <text class="node-detail" text-anchor="middle" x="1245" y="834">events · objects · branches</text>
+
+  <rect class="node" x="1350" y="790" width="170" height="62" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1435" y="815">Content-addressed</text>
+  <text class="node-detail" text-anchor="middle" x="1435" y="834">B-rep · mesh · attachments</text>
+
+  <rect class="node" x="970" y="900" width="130" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1035" y="925">Hash-chain</text>
+  <text class="node-detail" text-anchor="middle" x="1035" y="944">audit</text>
+
+  <rect class="node-red" x="1115" y="900" width="150" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1190" y="920">ReleaseAttestation</text>
+  <text class="node-detail" text-anchor="middle" x="1190" y="943">signed proof</text>
+
+  <rect class="node" x="1280" y="900" width="130" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1345" y="925">Portable .cadx</text>
+  <text class="node-detail" text-anchor="middle" x="1345" y="944">package</text>
+
+  <rect class="node-violet" x="1425" y="900" width="105" height="58" rx="6"/>
+  <text class="node-title" text-anchor="middle" x="1477.5" y="925">Sync Client</text>
+  <text class="node-detail" text-anchor="middle" x="1477.5" y="944">parent CAS</text>
+
+  <path class="flow" d="M 1140 821 L 1160 821"/>
+  <path class="flow" d="M 1055 852 L 1055 875 L 1035 875 L 1035 900"/>
+  <path class="derived" d="M 1055 852 L 1055 875 L 1345 875 L 1345 900"/>
+  <path class="derived" d="M 1435 852 L 1435 875 L 1345 875 L 1345 900"/>
+  <path class="replica" d="M 1100 821 L 1100 980 L 1477.5 980 L 1477.5 958"/>
+  <path class="replica" d="M 1435 852 L 1435 880 L 1477.5 880 L 1477.5 900"/>
+  <path class="replica" d="M 1190 958 L 1190 1010 L 1477.5 1010 L 1477.5 958"/>
+  <path class="replica" d="M 1477.5 900 L 1540 900 L 1540 259 L 1415 259"/>
+  <path class="replica" d="M 1415 267 L 1550 267 L 1550 929 L 1530 929"/>
+  <path class="flow" d="M 1100 852 L 1100 875 L 1190 875 L 1190 900"/>
+
+  <path class="flow" d="M 1262.5 527 L 1262.5 640 L 930 640 L 930 821 L 970 821"/>
+  <path class="derived" d="M 662.5 527 L 662.5 675 L 1540 675 L 1540 770 L 1435 770 L 1435 790"/>
+
+  <!-- Legend -->
+  <line x1="52" y1="1135" x2="102" y2="1135" class="flow"/>
+  <text class="subtitle" x="116" y="1140">请求、验证与权威状态转换</text>
+  <line x1="390" y1="1135" x2="440" y2="1135" class="derived"/>
+  <text class="subtitle" x="454" y="1140">只读派生、缓存或异步复制</text>
+  <rect x="805" y="1111" width="745" height="46" rx="6" fill="#e4f4e9" stroke="#4f8b68"/>
+  <text class="edge-label" text-anchor="middle" x="1177.5" y="1140">远端、Renderer、Exchange 与 Sync 均不能绕过 KernelFacade 写入 DocumentStore</text>
+</svg>
