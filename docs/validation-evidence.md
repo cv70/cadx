@@ -85,7 +85,10 @@ format v6 增加 commit/pending-action preparation。Format v7 增加
 `DesignTask -> PromptChangeSet -> AgentRun` 层级，把 commit source 与 idempotency key 绑定到
 task/ChangeSet/Run，并将远程上下文 schema 提升为 v2。Format v8 增加补偿关联、冲突记录
 和参数删除 diff；Format v9 增加显式 batch/iterative execution strategy、逐 action
-re-observation 与结构化 repair feedback。Loader 重新构造 preparation，并拒绝
+re-observation 与结构化 repair feedback；Format v10 增加 stable project identity、remote
+grant ledger 和 schema-v3 audit binding；Format v11 增加持久 planning budget，并要求当前
+remote iterative decision 具有 schema-v4 execution-state audit；Format v12 增加 ChangeSet
+write-authorization revocation ledger。Loader 重新构造 preparation，并拒绝
 缺失或篡改的层级 ownership、对象 precondition、hash 和 idempotency key；v0-v6 只通过显式
 legacy migration 进入新层级。这些升级都不改变 document schema。格式细节见
 [原生工程格式](native-project-format.md)。

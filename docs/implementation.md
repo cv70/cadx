@@ -34,7 +34,7 @@ Agent edit 进入同一 semantic history。
 ```text
 cadx/
   crates/
-    cadx-config/     # 用户目录和 Provider YAML 配置
+    cadx-config/     # 用户目录、Provider YAML、界面偏好和出口策略
     cadx-core/       # Document、参数、约束、typed command、task、history
     cadx-agent/      # Planner contract、远程 adapter 和 task runner
     cadx-io/         # Native archive、migration、DXF/PDF 边界
@@ -62,8 +62,8 @@ cadx/
 | Semantic history、branch、undo/redo | Implemented | 单 parent commit、snapshot + forward replay；没有 semantic merge。 |
 | Native persistence 与 recovery | Implemented | 已实现 lossless project archive 和 recovery sidecar；详见[原生工程格式](native-project-format.md)。 |
 | Task/Prompt/Run 与 pause/resume | Implemented | DesignTask 跨 Prompt；ChangeSet 保存授权/诊断，Run 保存 checkpoint/identity/commit 顺序并可跨无关 commit 恢复；Capability 粒度仍较粗。 |
-| Agent runtime | Partial | 本地 `TaskPlanner` 已逐 action re-observe/replan，并对可修复失败最多重试三次；远程 `RemoteTaskPlanner` 仍是 grant 覆盖下的单次批计划，尚未进入逐 action 多轮。 |
-| Remote Planner | Partial | 已有不可越权 `RemoteContext`、持久 project grant、expiry/revocation、每次发送的 hash-bound audit、budget、strict DSL 和非阻塞 UI worker；尚无企业 endpoint allowlist、组织策略或 OS credential store。 |
+| Agent runtime | Partial | 本地与远程 Planner 都逐 action re-observe/replan，并对可修复失败最多重试三次；跨轮 action/decision 总预算随 Run 持久化。尚无 Pack query/tool registry 或 durable distributed scheduler。 |
+| Remote Planner | Partial | 已有不可越权 `RemoteContext`、本机强制 endpoint/model egress allowlist、持久 project grant、expiry/revocation、每轮 hash-bound audit、one-decision strict DSL 和非阻塞 UI worker；尚无组织签名策略或 OS credential store。 |
 | 2D viewport | Implemented | CPU picking/snapping、基础 authoring 和 egui painter。 |
 | Mechanical viewport | Partial | bounded extrusion mesh 已通过 `wgpu` 提交；详见[机械视口](mechanical-viewport.md)。 |
 | DXF exchange | Implemented | 有界、有损的 2D 子集；详见[DXF 交换契约](dxf-interchange.md)。 |
@@ -71,7 +71,7 @@ cadx/
 | Domain Pack | Planned | 没有 plugin ABI、typed pack payload、pack migration 或 pack lock。 |
 | Kernel-owned validation evidence | Partial | core 已对 candidate structure 和小型 constraint solver 生成 state-bound evidence；尚无 Pack/B-rep/rule evidence。 |
 | Prepared action 与对象并发 | Partial | 已有本地 prepare、typed object precondition、ABA tombstone 和 idempotency key；对象 ID 仍为 document-local `u64`，尚无 Pack operation/read-set contract。 |
-| `PromptChangeSet` 与补偿回滚 | Partial | Prompt/Run 归组和 conflict-aware compensating revert 已实现；补偿保留后续对象写入并记录冲突，但 task write authority 尚不可撤销，也没有 Pack lock gate。 |
+| `PromptChangeSet` 与补偿回滚 | Partial | Prompt/Run 归组、change-set write revocation 和 conflict-aware compensating revert 已实现；撤销后发送前检查和最终 commit gate 都拒绝继续写入，补偿保留后续对象写入并记录冲突；仍没有 Pack lock gate。 |
 | B-rep、stable topology 与 STEP | Planned | 当前没有 Open CASCADE adapter 或 feature regeneration graph。 |
 | Cloud event replication | Planned | 没有 CAS push、outbox/inbox 或 remote branch protocol。 |
 
@@ -140,7 +140,10 @@ identity、attempt、event、有序 action commit 和可持久化 `TaskExecution
 ChangeSet 下创建新 Run，pause/resume 和崩溃恢复继续原 Run，已经提交的 action 不会因后续失败
 而删除。`TaskAuthority::DirectWrite` 按 `Drafting`、`Mechanical`、
 `Architecture`、`Parameters`、`Import` 等 capability 检查 transaction；
-`ReviewOnly` 不能写入。
+`ReviewOnly` 不能写入。每个 ChangeSet 的原授权快照不会改写；用户撤销写权限时，Task 追加
+绑定 ChangeSet、当前 revision、已提交 action 数量和原因的 revocation 记录。开始、恢复、重试、
+远程发送前观察、action stage 和最终 commit gate 都检查当前 revocation。撤销前已成功的 action
+保留，撤销后的 in-flight Provider 输出不能提交；后续新 Prompt 获取新的独立授权快照。
 
 终态 ChangeSet 可以通过 `KernelFacade::revert_change_set` 请求回滚。Core 从目标 action 的 parent
 snapshot 重建每个写对象的基线，在请求 revision 上比较对象 tombstone/version：目标 action 后
@@ -148,9 +151,10 @@ snapshot 重建每个写对象的基线，在请求 revision 上比较对象 tom
 结构化 conflict report。依赖校验无法安全拆分的对象也保守地作为冲突保留。补偿使用原
 ChangeSet 的 authorization snapshot，仍经过普通 prepare、capability、candidate validation、
 evidence 和 commit gate；目标 commit 不删除，branch head 不向过去移动。请求只在目标 commit
-位于 active ancestry 时接受，并且同一 ChangeSet 当前只允许补偿一次。远程访问 grant 的撤销
-不会撤销既有 `TaskAuthority`；task write authority revocation 与 Pack-version gate 尚未实现，
-不能把 authorization snapshot 解释为完整企业策略。
+位于 active ancestry 时接受，并且同一 ChangeSet 当前只允许补偿一次。远程访问 grant 与
+ChangeSet 写权限是两个独立边界，撤销任一边界都不能由另一个边界绕过。当前 revocation 仍是
+粗粒度 ChangeSet write gate，尚无到期时间、对象范围、签名组织策略或 Pack-version gate，
+不能把它解释为完整目标 `CapabilityToken`。
 
 本地 `TaskPlanner` 当前执行过程是：
 
@@ -170,10 +174,11 @@ candidate validation failure、stale revision 与 object precondition conflict �
 初始 proposal 失败后最多自动尝试三个修复 proposal，第四次失败将 Run 标记为 Failed 并保留
 已成功 action。Action budget 可以在“等待下一次规划”边界暂停，保存/崩溃恢复继续同一个 Run。
 
-Remote Planner 尚未进入该多轮循环。它在 project grant 覆盖的当前 source revision 上生成
-bounded action list，之后只在本地逐个提交。grant 可以跨 revision、PromptChangeSet 和 Run
-继续授权相同范围，但每次 Provider 发送都会重新构造 disclosure 并追加精确审计。要让远程
-provider 在每个 action 后重规划，仍需实现多轮调度、逐轮失败反馈和跨轮总预算。
+Remote Planner 使用同一多轮状态机，但外发前多一道授权和审计边界。每轮从最新 snapshot
+构造 context，验证 project grant，持久化与该 payload hash 完全一致的 disclosure，然后只允许
+Provider 返回一个 action 或 complete。Action 在本地 materialize、prepare、验证和提交；成功、
+可修复 rejection 或暂停后都不会复用旧 observation。grant 可以跨 revision、PromptChangeSet
+和 Run 继续覆盖相同范围，但每次发送仍独立重授权与审计。
 
 ### Remote Planner
 
@@ -187,27 +192,32 @@ provider 在每个 action 后重规划，仍需实现多轮调度、逐轮失败
 - grant/revoke append-only policy ledger，以及到期或撤销后在 Provider 调用前拒绝；
 - 每次发送绑定 task/ChangeSet/Run、source revision、project/grant、categories、bytes、
   SHA-256 和发送时间的 disclosure audit；
+- 当前 context schema v4 披露 execution state，包括 action index、总/剩余 action 与 decision
+  budget，以及最近一次结构化 failure feedback；
 - HTTPS 要求和 loopback HTTP 例外；
-- action budget；
+- 独立于 Provider 配置、默认拒绝且每次发送动态重载的本机 endpoint/model egress allowlist；
+- 持久化的跨轮 action/decision 总预算，以及调用方每次运行的 action slice budget；
 - OpenAI Responses-compatible adapter；
-- 最大 256 KiB、64 action 的 strict remote-plan JSON DSL；
+- 最大 64 KiB、只接受单个 `action` 或 `complete` 的 strict remote-decision JSON DSL；
 - 完整 document 只在本地 plan materialization、simulation 和 typed transaction validation 使用；
-- 主线程通过启动握手，在允许 worker 调用 Provider 前持久化 hash-bound remote-send audit；
+- 主线程在创建一次性 `AuthorizedRemoteRound` 前完成重观察、授权检查和审计持久化；
 - credential 与 project/history 隔离。
 
 `RemoteTaskPlanner` 只能声明 selection request 并接收上述 DTO，网络 adapter 直接发送经过
 哈希和审批的 JSON，不能通过 trait 接触 `CadDocument`。Desktop 把 provider 调用放在后台
-worker，但 worker workspace 不会直接替换主 workspace。Worker 无持久副作用时只报告结果；
-否则 desktop 从 worker 提取 disclosure 和 typed action plan，再通过主 workspace 的
-`KernelFacade` 重放。无关人工 commit 会保留，触及同一对象时 task 失败且人工 commit 保留；
-base 不再位于 ancestry 或目标 task 已变化时才丢弃 stale result。Paused plan 已经是本地 typed
-action，恢复不再调用 Provider，也不需要再次验证远程 grant。已审计 worker 若异常退出且
-目标 task 未被用户修改，主 workspace 将 task 标记 Failed，而不是遗留无 plan 的 Running 状态。
+worker；worker 只消费不可 Clone 的一次性轮次并返回 opaque `RemoteRoundOutput`，不持有
+workspace，也不能提交。主线程从审计绑定的 observed snapshot 本地 materialize decision，再
+通过 `KernelFacade` stage/validate/commit。无关人工 commit 会保留，触及同一对象时形成
+`StaleObservation` feedback 并在下一轮重规划；目标 task 状态已变化时丢弃 stale output。达到
+本次 action slice budget 时在等待 Planner 的边界暂停，恢复后仍需重新观察、重新授权、重新审计
+并调用 Provider；持久总预算不会因调用方传入更大值而放宽。已审计 worker 若异常退出且目标
+task 未被用户修改，主 workspace 将 task 标记 Failed，而不是遗留无 decision 的 Running 状态；
+worker 线程无法启动时使用相同的失败收敛语义。
 
-当前 grant 与事件台账随 `.cadx` 持久化，grant 可到期或撤销，并且远程发送没有绕过 grant 的
-公开 Agent API。企业 endpoint allowlist、组织级签名策略、操作系统 credential store 和逐
-action 远程多轮仍未实现。因此 Remote Planner 仍标为 Partial，不能把当前项目级边界解释为
-完整的企业授权系统。
+当前 grant 与事件台账随 `.cadx` 持久化，grant 可到期或撤销，并且远程发送没有绕过 grant 或
+本机 egress allowlist 的公开 Agent API。allowlist 是当前 OS 用户可编辑的本机策略，组织级签名
+策略分发和操作系统 credential store 仍未实现。因此 Remote Planner 仍标为 Partial，不能把
+当前本机与项目级边界解释为完整企业授权系统。
 配置与 credential 细节见[配置](configuration.md)。
 
 ## 6. 验证边界
@@ -259,14 +269,21 @@ Native save/open、migration 和 recovery 的精确契约见
 [`.cadx` 原生工程格式](native-project-format.md)。目标 SQLite/WAL 工作库、内容寻址 blob
 和 `.cadx` 可移植封包属于 Roadmap，不是当前格式事实。
 
-当前 `.cadx` format v10 持久化 task/PromptChangeSet/AgentRun 层级、三层 commit 来源、
+当前 `.cadx` format v12 持久化 task/PromptChangeSet/AgentRun 层级、三层 commit 来源、
 run-bound idempotency key、commit preparation，以及 run execution 的 base/expected revision
 和下一 action preparation。v8 保存补偿目标、request revision、恢复对象、冲突与补偿 commit；
 v9 增加显式 batch/iterative strategy、逐 action observation、planning completion 和 repair feedback，
 并为可逆参数创建增加 `DeleteParameter` diff；v10 增加 stable project UUID、持久 remote grant
-台账和绑定 project/grant/发送时间的 context schema v3 audit。Loader 为 v0-v4 推导 legacy execution revision，为 v0-v5 推导
-commit/pending-action preparation，并把 v0-v6 legacy task 无损迁移为一个初始 ChangeSet/Run。
+台账和绑定 project/grant/发送时间的 context schema v3 audit；v11 增加不可放宽的持久
+`TaskPlanningBudget`，并将当前远程逐轮审计提升为包含 execution state 的 context schema v4；
+v12 增加每个 Task 的 append-only ChangeSet write-revocation ledger。
+Loader 为 v0-v4 推导 legacy execution revision，为 v0-v5 推导 commit/pending-action preparation，
+并把 v0-v6 legacy task 无损迁移为一个初始 ChangeSet/Run。
 Loader 为 v0-v9 生成新 project UUID 和空 remote policy，不会伪造旧工程不存在的 grant。
+Loader 为 v0-v10 的 batch execution 填入精确 action count/一次 decision，为 iterative execution
+填入旧 core 上限；v11 缺失或篡改 budget 直接拒绝。Loader 为 v0-v11 增加空 write-revocation
+ledger，不伪造旧工程中不存在的撤销；v12 缺失台账，或撤销记录的 ChangeSet、revision、已提交
+action 数量和原因不一致时直接拒绝。
 当前格式缺失或篡改层级 binding、commit ownership、preparation、对象 precondition、hash、
 idempotency key 或 checkpoint 都会拒绝。Run output 之间允许穿插无关 commit，但必须保持
 ancestry 和 action index 顺序；对象冲突不会静默覆盖。
@@ -348,11 +365,12 @@ Current 已有可持久化 `PromptChangeSet`、`AgentRun` 和补偿回滚，但 
   run identity、诊断、action 顺序、commit 来源、prepare 和 idempotency key 绑定到该层级。
 - 已引入 compatibility object precondition、idempotency key 和 action checkpoint；后续继续绑定
   Pack operation 和 global stable object ID。
-- 已为本地 `TaskPlanner` 实现 observe -> tool -> validate -> commit -> re-observe loop；远程路径
-  已具备可撤销 project grant 和逐次 disclosure audit，仍待迁移为逐 action 多轮并加入跨轮预算。
-- 本地 validation failure 和 object-version conflict 已结构化反馈并最多自动修复三次。
-- 已实现保留后续对象写入的 compensating revert、双向审计关联和 conflict report；后续把
-  authorization snapshot 扩展为可撤销 project policy，并绑定 Pack lock。
+- 已为本地与远程 Planner 实现 observe -> decision -> validate -> commit -> re-observe loop；远程
+  每轮在 Provider 调用前重新授权并记录 schema v4 disclosure audit，跨轮总预算持久化且不可放宽。
+- 本地与远程 validation failure 和 object-version conflict 已结构化反馈并最多自动修复三次。
+- 已实现保留后续对象写入的 compensating revert、双向审计关联、conflict report，以及不改写
+  原授权快照的 ChangeSet write-revocation ledger；后续把粗粒度 gate 扩展为带期限、Pack、
+  operation 和对象范围的 `CapabilityToken`，并绑定 Pack lock。
 
 ### Phase 4：Mechanical 深纵切
 

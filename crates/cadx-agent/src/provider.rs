@@ -303,6 +303,10 @@ pub trait TaskPlanner {
 pub trait RemoteTaskPlanner {
     fn config(&self) -> &ProviderConfig;
 
+    /// Revalidates provider egress immediately before a remote call. Network
+    /// implementations must not turn this into a cached decision.
+    fn authorize_egress(&self) -> Result<(), AgentError>;
+
     fn context_request(&self) -> RemoteContextRequest {
         RemoteContextRequest::default()
     }

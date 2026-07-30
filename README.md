@@ -20,7 +20,7 @@ cargo run -p cadx-app
 cargo run -p cadx-app -- --project path/to/model.cadx
 ```
 
-首次启动会在 `~/.cadx` 创建用户目录和 Provider 配置模板。配置、安全边界和当前支持的
+首次启动会在 `~/.cadx` 创建用户目录、Provider 配置模板和独立出口策略。配置、安全边界和当前支持的
 工作流见[配置指南](docs/configuration.md)与[当前实现](docs/implementation.md)。Native app
 当前要求系统能初始化 WGPU adapter，没有 Glow 或 CPU startup fallback。
 
@@ -28,11 +28,14 @@ cargo run -p cadx-app -- --project path/to/model.cadx
 选择保存在独立的 `~/.cadx/preferences.yaml` 中。
 远程 Planner 只能在项目级访问授权覆盖当前 endpoint、model、数据类别、能力、对象范围和
 payload 上限时发送；授权可设置到期时间并随工程持久化或显式撤销，每次发送仍记录精确的
-revision、payload 字节数与 SHA-256 审计。
+revision、payload 字节数与 SHA-256 审计。每次发送还必须通过默认拒绝的
+`~/.cadx/egress-policy.yaml` 本机 endpoint/model allowlist。
 Prompt 历史支持冲突感知补偿回滚：后续人工或其他 Agent 已修改的对象会保留并明确报告，
 未冲突对象通过新的可审计提交恢复。
 本地 Planner 按 `observe -> action -> validate -> commit -> re-observe` 循环执行；本地验证或
 对象版本冲突会形成结构化反馈并最多自动修复三次，已成功提交的 action 不会被后续失败抹去。
+远程 Planner 使用相同的逐轮提交边界：每次 Provider 调用前都重新观察、重新校验项目授权并
+持久化精确发送审计；Provider 每轮只能返回一个 action 或 complete，跨轮总预算随工程保存。
 
 ## 验证
 

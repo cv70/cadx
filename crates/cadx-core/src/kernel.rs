@@ -3,8 +3,8 @@ use std::fmt;
 use crate::{
     ActionFailureKind, AgentRunId, AgentRunIdentity, ChangeSetRevertReport, CommandTransaction,
     CommitId, DocumentSnapshot, PreparedAction, PromptChangeSetId, RemoteAccessGrantRequest,
-    RemoteGrantId, TaskAction, TaskAuthority, TaskEvent, TaskId, TaskPlanningBudget, TaskWorkspace,
-    ValidationReport, WorkspaceError,
+    RemoteGrantId, TaskAction, TaskAuthority, TaskAuthorizationRevocation, TaskEvent, TaskId,
+    TaskPlanningBudget, TaskWorkspace, ValidationReport, WorkspaceError,
 };
 
 /// The only public mutable entry point into an authoritative workspace.
@@ -52,6 +52,16 @@ impl<'workspace> KernelFacade<'workspace> {
     ) -> Result<(), WorkspaceError> {
         self.workspace
             .revoke_remote_access_grant(grant_id, revoked_at_unix_seconds)
+    }
+
+    pub fn revoke_task_authorization(
+        &mut self,
+        task_id: TaskId,
+        change_set_id: PromptChangeSetId,
+        reason: impl Into<String>,
+    ) -> Result<TaskAuthorizationRevocation, WorkspaceError> {
+        self.workspace
+            .revoke_task_authorization(task_id, change_set_id, reason)
     }
 
     pub fn begin_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
@@ -293,6 +303,11 @@ impl<'workspace> KernelFacade<'workspace> {
 
     pub fn migrate_legacy_planning_budgets(&mut self) {
         self.workspace.migrate_legacy_planning_budgets();
+    }
+
+    pub fn migrate_legacy_task_authorization_revocations(&mut self) -> Result<(), WorkspaceError> {
+        self.workspace
+            .migrate_legacy_task_authorization_revocations()
     }
 }
 

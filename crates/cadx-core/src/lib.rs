@@ -10,6 +10,7 @@ mod expression;
 mod history;
 mod kernel;
 mod object;
+mod pack;
 mod prepared;
 mod remote_policy;
 mod snapshot;
@@ -50,6 +51,12 @@ pub use history::{
 };
 pub use kernel::KernelFacade;
 pub use object::{ObjectId, ObjectPrecondition};
+pub use pack::{
+    LockedDependency, LockedDependencyKind, MAX_LOCKED_DEPENDENCIES, MAX_LOCKED_PACKS,
+    MAX_PACK_DESCRIPTORS, MAX_PACK_STRING_BYTES, PACK_ABI_VERSION, PACK_LOCK_VERSION,
+    PACK_MANIFEST_SCHEMA_VERSION, PackLock, PackLockError, PackManifest, PackOperationDescriptor,
+    PackQueryDescriptor, PackTrust, PackValidatorDescriptor,
+};
 pub use prepared::{ActionIdempotencyKey, PrepareError, PreparedAction, PreparedActionRecord};
 pub use remote_policy::{
     MAX_REMOTE_SELECTED_ENTITY_IDS, ProjectId, RemoteAccessCheck, RemoteAccessGrant,
@@ -63,8 +70,9 @@ pub use task::{
     ChangeSetRevertReport, ChangeSetStatus, CheckResult, CheckStatus, DesignTask,
     MAX_AUTOMATIC_REPAIR_ATTEMPTS, MAX_ITERATIVE_ACTIONS_PER_RUN, MAX_REMOTE_CONTEXT_BYTES,
     PromptChangeSet, REMOTE_CONTEXT_SCHEMA_VERSION, RemoteDataCategory, RevertConflict,
-    RevertConflictReason, StructuredGoal, TaskAction, TaskAuthority, TaskEvent, TaskExecution,
-    TaskExecutionStrategy, TaskPlanningBudget, TaskStatus, ValidationReport,
+    RevertConflictReason, StructuredGoal, TaskAction, TaskAuthority, TaskAuthorizationRevocation,
+    TaskEvent, TaskExecution, TaskExecutionStrategy, TaskPlanningBudget, TaskStatus,
+    ValidationReport,
 };
 pub use validation::{
     CORE_VALIDATOR_ID, CORE_VALIDATOR_VERSION, MAX_CANDIDATE_STATE_BYTES, ValidationEvidence,

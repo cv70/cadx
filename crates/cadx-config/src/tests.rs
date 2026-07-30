@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::paths::PROJECTS_DIRECTORY_NAME;
+use super::paths::{EGRESS_POLICY_FILE_NAME, PROJECTS_DIRECTORY_NAME};
 use super::settings::{CURRENT_CONFIG_VERSION, MAX_CONFIG_BYTES};
 use super::*;
 
@@ -14,6 +14,13 @@ provider:
   model: "test-model"
   api_key: "test-key"
   timeout_seconds: 30
+"#;
+
+const VALID_EGRESS_POLICY: &str = r#"version: 1
+allowed_providers:
+  - endpoint: "https://provider.example:443/v1///"
+    models:
+      - "test-model"
 "#;
 
 struct TemporaryDirectory {
@@ -172,15 +179,170 @@ fn initialization_creates_a_private_empty_key_template_idempotently() {
     assert_eq!(path, repeated_path);
     assert!(home.join(PROJECTS_DIRECTORY_NAME).is_dir());
     assert!(fs::read_to_string(&path).unwrap().contains("api_key: \"\""));
-    assert!(matches!(
-        CadxConfig::load(&path),
-        Err(ConfigError::InvalidProvider("provider API key is required"))
-    ));
+    let error = CadxConfig::load(&path).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            ConfigError::InvalidProvider("provider API key is required")
+        ),
+        "unexpected template error: {error:?}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
         assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn initialization_creates_a_private_default_egress_policy() {
+    let directory = TemporaryDirectory::new("egress-template");
+    let home = directory.path().join(".cadx");
+
+    let path = super::paths::initialize_egress_policy_at(&home).unwrap();
+    let repeated_path = super::paths::initialize_egress_policy_at(&home).unwrap();
+
+    assert_eq!(path, repeated_path);
+    assert_eq!(path.file_name().unwrap(), EGRESS_POLICY_FILE_NAME);
+    assert!(EgressPolicy::load(&path).is_ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn egress_policy_canonicalizes_scheme_host_default_port_and_trailing_path() {
+    let directory = TemporaryDirectory::new("egress-canonical");
+    let path = directory.path().join("egress-policy.yaml");
+    write_private_file(&path, VALID_EGRESS_POLICY.as_bytes());
+    let policy = EgressPolicy::load(&path).unwrap();
+
+    policy
+        .authorize("https://provider.example/v1", "test-model")
+        .unwrap();
+    policy
+        .authorize("https://PROVIDER.EXAMPLE:443/v1/", "test-model")
+        .unwrap();
+    for (endpoint, model) in [
+        ("http://provider.example/v1", "test-model"),
+        ("https://other-provider.example/v1", "test-model"),
+        ("https://provider.example:8443/v1", "test-model"),
+        ("https://provider.example/v2", "test-model"),
+        ("https://provider.example/v1", "other-model"),
+    ] {
+        assert!(policy.authorize(endpoint, model).is_err());
+    }
+}
+
+#[test]
+fn egress_policy_rejects_ambiguous_urls_and_invalid_rules() {
+    let directory = TemporaryDirectory::new("egress-invalid");
+    let path = directory.path().join("egress-policy.yaml");
+    for endpoint in [
+        "https://user@example.com/v1",
+        "https://example.com/v1?token=secret",
+        "https://example.com/v1#fragment",
+        "http://example.com/v1",
+        "https://example.com/%76%31",
+        " https://example.com/v1",
+    ] {
+        write_private_file(
+            &path,
+            format!(
+                "version: 1\nallowed_providers:\n  - endpoint: \"{endpoint}\"\n    models: [test-model]\n"
+            )
+            .as_bytes(),
+        );
+        assert!(matches!(
+            EgressPolicy::load(&path),
+            Err(ConfigError::InvalidEgressPolicy(_))
+        ));
+    }
+    write_private_file(
+        &path,
+        b"version: 1\nallowed_providers:\n  - endpoint: 'https://example.com/v1'\n    models: [test-model, test-model]\n",
+    );
+    assert!(matches!(
+        EgressPolicy::load(&path),
+        Err(ConfigError::InvalidEgressPolicy(_))
+    ));
+    write_private_file(
+        &path,
+        b"version: 1\nallowed_providers:\n  - endpoint: 'https://example.com/v1'\n    models: []\n",
+    );
+    assert!(matches!(
+        EgressPolicy::load(&path),
+        Err(ConfigError::InvalidEgressPolicy(_))
+    ));
+    write_private_file(
+        &path,
+        b"version: 1\nallowed_providers: []\nunexpected: true\n",
+    );
+    assert!(matches!(
+        EgressPolicy::load(&path),
+        Err(ConfigError::InvalidYaml(_))
+    ));
+}
+
+#[test]
+fn egress_policy_enforcer_reloads_after_policy_change_and_defaults_to_deny() {
+    let directory = TemporaryDirectory::new("egress-reload");
+    let path = directory.path().join("egress-policy.yaml");
+    write_private_file(&path, VALID_EGRESS_POLICY.as_bytes());
+    let enforcer = EgressPolicyEnforcer::at(&path);
+    enforcer
+        .authorize("https://provider.example/v1", "test-model")
+        .unwrap();
+
+    write_private_file(&path, b"version: 1\nallowed_providers: []\n");
+    assert!(matches!(
+        enforcer.authorize("https://provider.example/v1", "test-model"),
+        Err(ConfigError::ProviderEgressDenied { .. })
+    ));
+}
+
+#[test]
+fn egress_policy_rejects_oversized_nonregular_insecure_and_symlinked_files() {
+    let directory = TemporaryDirectory::new("egress-security");
+    let path = directory.path().join("egress-policy.yaml");
+    let mut oversized = VALID_EGRESS_POLICY.as_bytes().to_vec();
+    oversized.resize((MAX_EGRESS_POLICY_BYTES + 1) as usize, b' ');
+    write_private_file(&path, &oversized);
+    assert!(matches!(
+        EgressPolicy::load(&path),
+        Err(ConfigError::ConfigTooLarge { .. })
+    ));
+
+    let directory_path = directory.path().join("policy-directory");
+    fs::create_dir(&directory_path).unwrap();
+    assert!(matches!(
+        EgressPolicy::load(&directory_path),
+        Err(ConfigError::PathIsNotFile(_))
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        write_private_file(&path, VALID_EGRESS_POLICY.as_bytes());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            EgressPolicy::load(&path),
+            Err(ConfigError::InsecurePermissions(_))
+        ));
+
+        let target = directory.path().join("target-policy.yaml");
+        write_private_file(&target, VALID_EGRESS_POLICY.as_bytes());
+        let linked = directory.path().join("linked-policy.yaml");
+        symlink(&target, &linked).unwrap();
+        assert!(matches!(
+            EgressPolicy::load(&linked),
+            Err(ConfigError::PathIsSymlink(_))
+        ));
     }
 }
 

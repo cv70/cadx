@@ -9,12 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cadx_agent::{
     AgentError, AgentRunReport, ExecutionBudget, GenAiRemotePlanner, HeuristicPlanner,
-    ProviderConfig, ProviderDisclosure, TaskAgent,
+    ProviderConfig, ProviderDisclosure, RemoteRoundApply, RemoteRoundOutput, TaskAgent,
 };
 use cadx_config::UiLanguage;
-use cadx_config::{CadxConfig, default_config_path, default_project_path};
+use cadx_config::{
+    CadxConfig, default_config_path, default_egress_policy_path, default_project_path,
+};
 use cadx_core::{
-    AgentRunIdentity, CadCommand, CadDocument, CommandTransaction, ConstraintDiagnostic, Entity,
+    CadCommand, CadDocument, CommandTransaction, ConstraintDiagnostic, DesignTask, Entity,
     EntityKind, HistoryComparison, LayerId, Point2, PromptChangeSetId, RemoteGrantId,
     TaskAuthority, TaskId, TaskStatus, TaskWorkspace, ValidationReport,
 };
@@ -37,14 +39,28 @@ pub(crate) const DEFAULT_REMOTE_GRANT_DURATION_SECONDS: u64 = 24 * 60 * 60;
 
 pub(crate) struct RemoteAgentJob {
     task_id: TaskId,
-    base_workspace: TaskWorkspace,
+    grant_id: RemoteGrantId,
+    budget: ExecutionBudget,
+    remaining_actions: usize,
+    commit_ids: Vec<u64>,
+    audited_task: DesignTask,
+    agent: TaskAgent<GenAiRemotePlanner>,
     receiver: Receiver<RemoteAgentOutput>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 
 struct RemoteAgentOutput {
-    workspace: TaskWorkspace,
-    result: Result<AgentRunReport, String>,
+    result: Result<RemoteRoundOutput, String>,
+}
+
+struct RemoteRoundDispatch {
+    agent: TaskAgent<GenAiRemotePlanner>,
+    task_id: TaskId,
+    grant_id: RemoteGrantId,
+    budget: ExecutionBudget,
+    remaining_actions: usize,
+    commit_ids: Vec<u64>,
+    send_time: u64,
 }
 
 pub(crate) struct CadxApp {
@@ -56,6 +72,7 @@ pub(crate) struct CadxApp {
     pub(crate) direct_write: bool,
     pub(crate) remote_enabled: bool,
     pub(crate) remote_config_path: String,
+    pub(crate) remote_egress_policy_path: String,
     pub(crate) remote_disclosure: Option<ProviderDisclosure>,
     pub(crate) remote_grant_id: Option<RemoteGrantId>,
     pub(crate) remote_grant_duration_seconds: u64,
@@ -124,6 +141,7 @@ impl Default for CadxApp {
             direct_write: true,
             remote_enabled: false,
             remote_config_path: display_default_config_path(),
+            remote_egress_policy_path: display_default_egress_policy_path(),
             remote_disclosure: None,
             remote_grant_id: None,
             remote_grant_duration_seconds: DEFAULT_REMOTE_GRANT_DURATION_SECONDS,
@@ -343,6 +361,45 @@ impl CadxApp {
                 self.status = match self.language {
                     UiLanguage::English => format!("Cannot cancel task: {error}"),
                     UiLanguage::SimplifiedChinese => format!("无法取消任务：{error}"),
+                };
+            }
+        }
+    }
+
+    pub(crate) fn revoke_active_task_authorization(&mut self) {
+        let Some(task_id) = self.active_task else {
+            return;
+        };
+        let Some(change_set_id) = self
+            .workspace
+            .task(task_id)
+            .map(|task| task.active_change_set_id)
+        else {
+            return;
+        };
+        match self.workspace.kernel().revoke_task_authorization(
+            task_id,
+            change_set_id,
+            "Revoked by the local operator",
+        ) {
+            Ok(revocation) => {
+                self.clear_remote_context_review();
+                self.is_dirty = true;
+                self.status = match self.language {
+                    UiLanguage::English => format!(
+                        "Revoked write access for change set {change_set_id} at revision {}",
+                        revocation.revoked_at_revision
+                    ),
+                    UiLanguage::SimplifiedChinese => format!(
+                        "已在版本 {} 撤销变更集 {change_set_id} 的写权限",
+                        revocation.revoked_at_revision
+                    ),
+                };
+            }
+            Err(error) => {
+                self.status = match self.language {
+                    UiLanguage::English => format!("Cannot revoke task write access: {error}"),
+                    UiLanguage::SimplifiedChinese => format!("无法撤销任务写权限：{error}"),
                 };
             }
         }
@@ -1263,6 +1320,7 @@ impl CadxApp {
         )?
         .with_timeout(settings.provider.timeout())?
         .with_selected_entity_ids(self.selected_entity);
+        planner.authorize_egress()?;
         Ok(TaskAgent::new(planner))
     }
 
@@ -1280,26 +1338,6 @@ impl CadxApp {
         let Some(task_id) = self.ensure_active_task() else {
             return;
         };
-        let task_status = self.workspace.task(task_id).map(|task| task.status);
-        if matches!(task_status, Some(TaskStatus::Paused | TaskStatus::Running)) {
-            let result = self
-                .planner
-                .run_with_action_budget(&mut self.workspace, task_id, Some(max_actions_per_run))
-                .map_err(|error| error.to_string());
-            self.is_dirty = true;
-            self.finish_remote_agent_result(task_id, result);
-            return;
-        }
-        let Some(grant_id) = self.remote_grant_id else {
-            self.status = self
-                .language
-                .text(
-                    "Review the remote context and create a project grant before running the remote planner.",
-                    "运行远程规划器前请审查远程上下文并创建项目授权。",
-                )
-                .into();
-            return;
-        };
         let agent = match self.remote_agent() {
             Ok(agent) => agent,
             Err(error) => {
@@ -1312,8 +1350,8 @@ impl CadxApp {
                 return;
             }
         };
-        let send_time = match unix_time_now() {
-            Ok(send_time) => send_time,
+        let now = match unix_time_now() {
+            Ok(now) => now,
             Err(error) => {
                 self.status = match self.language {
                     UiLanguage::English => format!("Cannot run remote planner: {error}"),
@@ -1324,101 +1362,102 @@ impl CadxApp {
                 return;
             }
         };
-        let disclosure =
-            match agent.validate_remote_access_grant(&self.workspace, task_id, grant_id, send_time)
-            {
-                Ok(disclosure) => disclosure,
-                Err(error) => {
-                    self.status = match self.language {
-                        UiLanguage::English => {
-                            format!("Project remote-access grant is no longer valid: {error}")
-                        }
-                        UiLanguage::SimplifiedChinese => {
-                            format!("项目远程访问授权已失效：{error}")
-                        }
-                    };
-                    self.clear_remote_context_review();
-                    return;
-                }
-            };
+        self.run_remote_task_with_agent(agent, task_id, max_actions_per_run, now);
+    }
+
+    fn run_remote_task_with_agent(
+        &mut self,
+        agent: TaskAgent<GenAiRemotePlanner>,
+        task_id: TaskId,
+        max_actions_per_run: usize,
+        now: u64,
+    ) {
         let budget = ExecutionBudget {
             max_planned_actions: ExecutionBudget::default().max_planned_actions,
             max_actions_per_run,
         };
-        let mut worker_workspace = self.workspace.clone();
+        let disclosure = match agent.remote_round_disclosure(&self.workspace, task_id, budget) {
+            Ok(disclosure) => disclosure,
+            Err(error) => {
+                self.set_remote_error_status(task_id, &error.to_string());
+                return;
+            }
+        };
+        let Some(grant_id) = agent.matching_remote_access_grant(&self.workspace, &disclosure, now)
+        else {
+            self.status = self
+                .language
+                .text(
+                    "Review the current remote context and create a project grant before continuing.",
+                    "继续前请审查当前远程上下文并创建项目授权。",
+                )
+                .into();
+            self.remote_disclosure = Some(disclosure);
+            self.remote_grant_id = None;
+            return;
+        };
+        self.remote_grant_id = Some(grant_id);
+        if let Err(error) = self.dispatch_remote_round(RemoteRoundDispatch {
+            agent,
+            task_id,
+            grant_id,
+            budget,
+            remaining_actions: max_actions_per_run,
+            commit_ids: Vec::new(),
+            send_time: now,
+        }) {
+            self.set_remote_error_status(task_id, &error);
+        }
+    }
+
+    fn dispatch_remote_round(&mut self, dispatch: RemoteRoundDispatch) -> Result<(), String> {
+        let RemoteRoundDispatch {
+            agent,
+            task_id,
+            grant_id,
+            budget,
+            remaining_actions,
+            commit_ids,
+            send_time,
+        } = dispatch;
+        let round = agent
+            .prepare_authorized_remote_round(
+                &mut self.workspace,
+                task_id,
+                grant_id,
+                send_time,
+                budget,
+            )
+            .map_err(|error| error.to_string())?;
+        let audited_task = self
+            .workspace
+            .task(task_id)
+            .cloned()
+            .ok_or_else(|| format!("task {task_id} disappeared after remote audit"))?;
         let (sender, receiver) = mpsc::channel();
-        let (start_sender, start_receiver) = mpsc::sync_channel(0);
+        let worker_agent = agent.clone();
         let spawn = thread::Builder::new()
             .name(format!("cadx-remote-task-{task_id}"))
             .spawn(move || {
-                if start_receiver.recv().is_err() {
-                    return;
-                }
-                let result = agent
-                    .run_remote_with_grant(
-                        &mut worker_workspace,
-                        task_id,
-                        grant_id,
-                        send_time,
-                        budget,
-                    )
+                let result = worker_agent
+                    .plan_authorized_remote_round(round)
                     .map_err(|error| error.to_string());
-                let _ = sender.send(RemoteAgentOutput {
-                    workspace: worker_workspace,
-                    result,
-                });
+                let _ = sender.send(RemoteAgentOutput { result });
             });
         match spawn {
             Ok(handle) => {
-                let identity = AgentRunIdentity::remote(
-                    "cadx-agent.remote-planner",
-                    disclosure.config.endpoint.clone(),
-                    disclosure.config.model.clone(),
-                );
-                let audit_result = self
-                    .workspace
-                    .kernel()
-                    .begin_task_as(task_id, identity)
-                    .and_then(|()| {
-                        self.workspace.kernel().record_event(
-                            task_id,
-                            disclosure.granted_audit_event(grant_id, send_time),
-                        )
-                    });
-                if let Err(error) = audit_result {
-                    drop(start_sender);
-                    let _ = handle.join();
-                    self.status = match self.language {
-                        UiLanguage::English => {
-                            format!("Cannot record remote-send audit for task {task_id}: {error}")
-                        }
-                        UiLanguage::SimplifiedChinese => {
-                            format!("无法记录任务 {task_id} 的远程发送审计：{error}")
-                        }
-                    };
-                    return;
-                }
                 self.is_dirty = true;
-                let base_workspace = self.workspace.clone();
-                if start_sender.send(()).is_err() {
-                    let _ = handle.join();
-                    let message =
-                        "remote planner worker stopped before the audited request could start";
-                    let _ = self.workspace.kernel().fail_task(task_id, message);
-                    self.status = match self.language {
-                        UiLanguage::English => format!("Remote task {task_id} stopped: {message}"),
-                        UiLanguage::SimplifiedChinese => {
-                            format!("远程任务 {task_id} 在已审计请求启动前停止")
-                        }
-                    };
-                    return;
-                }
-                self.clear_remote_context_review();
+                self.remote_disclosure = None;
                 self.remote_agent_job = Some(RemoteAgentJob {
                     task_id,
-                    base_workspace,
+                    grant_id,
+                    budget,
+                    remaining_actions,
+                    commit_ids,
+                    audited_task,
+                    agent,
                     receiver,
-                    handle,
+                    handle: Some(handle),
                 });
                 self.status = match self.language {
                     UiLanguage::English => {
@@ -1428,16 +1467,12 @@ impl CadxApp {
                         format!("远程规划器正在处理任务 {task_id}")
                     }
                 };
+                Ok(())
             }
             Err(error) => {
-                self.status = match self.language {
-                    UiLanguage::English => {
-                        format!("Cannot start remote planner worker: {error}")
-                    }
-                    UiLanguage::SimplifiedChinese => {
-                        format!("无法启动远程规划器工作线程：{error}")
-                    }
-                };
+                let message = format!("cannot start remote planner worker: {error}");
+                self.fail_unchanged_remote_task(task_id, &audited_task, &message);
+                Err(message)
             }
         }
     }
@@ -1464,21 +1499,22 @@ impl CadxApp {
             }
             return;
         };
-        let Some(job) = self.remote_agent_job.take() else {
+        let Some(mut job) = self.remote_agent_job.take() else {
             return;
         };
-        let joined = job.handle.join().is_ok();
+        let joined = job
+            .handle
+            .take()
+            .is_some_and(|handle| handle.join().is_ok());
         match received {
-            Ok(output) => {
-                self.finish_remote_agent_output(job.task_id, job.base_workspace, output, joined)
-            }
+            Ok(output) => self.finish_remote_agent_output(job, output, joined),
             Err(error) => {
                 let failure = if joined {
                     error.clone()
                 } else {
                     "remote planner worker stopped unexpectedly".into()
                 };
-                self.fail_unchanged_remote_task(job.task_id, &job.base_workspace, &failure);
+                self.fail_unchanged_remote_task(job.task_id, &job.audited_task, &failure);
                 self.status = match (self.language, joined) {
                     (UiLanguage::English, true) => {
                         format!("Remote task {} stopped: {error}", job.task_id)
@@ -1499,15 +1535,15 @@ impl CadxApp {
 
     fn finish_remote_agent_output(
         &mut self,
-        task_id: TaskId,
-        base_workspace: TaskWorkspace,
+        mut job: RemoteAgentJob,
         output: RemoteAgentOutput,
         worker_joined: bool,
     ) {
+        let task_id = job.task_id;
         if !worker_joined {
             self.fail_unchanged_remote_task(
                 task_id,
-                &base_workspace,
+                &job.audited_task,
                 "remote planner worker stopped unexpectedly",
             );
             self.status = match self.language {
@@ -1520,125 +1556,154 @@ impl CadxApp {
             };
             return;
         }
-        self.clear_remote_context_review();
-        if output.workspace == base_workspace {
-            self.finish_remote_agent_result(task_id, output.result);
-            return;
-        }
-
-        let base_revision = base_workspace.revision();
-        let base_state_matches = self
-            .workspace
-            .history()
-            .is_ancestor(base_revision, self.workspace.revision())
-            .is_ok_and(|is_ancestor| is_ancestor)
-            && self
-                .workspace
-                .history()
-                .restore(base_revision)
-                .is_ok_and(|document| document == *base_workspace.document());
-        let task_unchanged = self.workspace.task(task_id) == base_workspace.task(task_id);
-        if !base_state_matches || !task_unchanged {
+        if self.workspace.task(task_id) != Some(&job.audited_task) {
             self.discard_stale_remote_output(task_id);
             return;
         }
-
-        let Some(worker_task) = output.workspace.task(task_id).cloned() else {
-            self.discard_stale_remote_output(task_id);
-            return;
-        };
-        let base_event_count = base_workspace
-            .task(task_id)
-            .map_or(0, |task| task.events().len());
-        let disclosure_events = worker_task
-            .events()
-            .iter()
-            .skip(base_event_count)
-            .filter(|event| matches!(event, cadx_core::TaskEvent::ProviderDisclosure { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        let base_status = base_workspace
-            .task(task_id)
-            .map(|task| task.status)
-            .unwrap_or(TaskStatus::Failed);
-        if base_status == TaskStatus::Queued {
-            let identity = worker_task
-                .active_run()
-                .map(|run| run.identity.clone())
-                .unwrap_or_else(|| AgentRunIdentity::local("recovered-worker"));
-            if let Err(error) = self.workspace.kernel().begin_task_as(task_id, identity) {
-                self.finish_remote_agent_result(task_id, Err(error.to_string()));
+        let output = match output.result {
+            Ok(output) => output,
+            Err(error) => {
+                self.fail_unchanged_remote_task(task_id, &job.audited_task, &error);
+                self.set_remote_error_status(task_id, &error);
                 return;
             }
-            self.is_dirty = true;
-            for event in disclosure_events {
-                if let Err(error) = self.workspace.kernel().record_event(task_id, event) {
-                    self.finish_remote_agent_result(task_id, Err(error.to_string()));
-                    return;
+        };
+        let applied = match job
+            .agent
+            .apply_remote_round_output(&mut self.workspace, output)
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                if self
+                    .workspace
+                    .task(task_id)
+                    .is_some_and(|task| task.status == TaskStatus::Running)
+                {
+                    let _ = self
+                        .workspace
+                        .kernel()
+                        .fail_task(task_id, error.to_string());
+                }
+                self.is_dirty = true;
+                self.set_remote_error_status(task_id, &error.to_string());
+                return;
+            }
+        };
+        self.is_dirty = true;
+        match applied {
+            RemoteRoundApply::Completed => {
+                let result =
+                    self.active_remote_report(task_id, TaskStatus::Completed, job.commit_ids);
+                self.finish_remote_agent_result(task_id, result);
+            }
+            RemoteRoundApply::ActionCommitted { commit_id } => {
+                job.commit_ids.push(commit_id);
+                job.remaining_actions = job.remaining_actions.saturating_sub(1);
+                if job.remaining_actions == 0 {
+                    let result = self
+                        .workspace
+                        .kernel()
+                        .pause_task(task_id, "Action budget reached")
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            self.active_remote_report(task_id, TaskStatus::Paused, job.commit_ids)
+                        });
+                    self.finish_remote_agent_result(task_id, result);
+                } else {
+                    self.continue_remote_round(job);
                 }
             }
-        } else if base_status != TaskStatus::Paused && base_status != TaskStatus::Running {
-            self.discard_stale_remote_output(task_id);
-            return;
-        }
-
-        let current_has_plan = self
-            .workspace
-            .task(task_id)
-            .and_then(cadx_core::DesignTask::execution)
-            .is_some();
-        if !current_has_plan {
-            let Some(execution) = worker_task.execution() else {
-                let message = output
-                    .result
-                    .err()
-                    .unwrap_or_else(|| "remote planner returned no durable action plan".into());
-                let _ = self.workspace.kernel().fail_task(task_id, message.clone());
-                self.is_dirty = true;
-                self.finish_remote_agent_result(task_id, Err(message));
-                return;
-            };
-            let Some(planning_revision) = execution.base_revision() else {
-                let message = "remote planner returned an unbound action plan".to_string();
-                let _ = self.workspace.kernel().fail_task(task_id, message.clone());
-                self.is_dirty = true;
-                self.finish_remote_agent_result(task_id, Err(message));
-                return;
-            };
-            if let Err(error) = self.workspace.kernel().set_task_plan(
-                task_id,
-                planning_revision,
-                execution.actions().to_vec(),
-            ) {
-                self.is_dirty = true;
-                self.finish_remote_agent_result(task_id, Err(error.to_string()));
-                return;
+            RemoteRoundApply::ActionRejected { feedback } => {
+                self.status = match self.language {
+                    UiLanguage::English => format!(
+                        "Remote action {} was rejected locally; requesting repair {}/3",
+                        feedback.action_index, feedback.repair_attempt
+                    ),
+                    UiLanguage::SimplifiedChinese => format!(
+                        "远程动作 {} 被本地拒绝；正在请求第 {}/3 次修复",
+                        feedback.action_index, feedback.repair_attempt
+                    ),
+                };
+                self.continue_remote_round(job);
             }
         }
+    }
 
-        let action_budget = output.result.as_ref().ok().and_then(|report| {
-            (report.status == TaskStatus::Paused).then_some(report.commit_ids.len())
-        });
-        let result = self
-            .planner
-            .run_with_action_budget(&mut self.workspace, task_id, action_budget)
-            .map_err(|error| error.to_string());
-        self.is_dirty = true;
-        self.finish_remote_agent_result(task_id, result);
+    fn continue_remote_round(&mut self, job: RemoteAgentJob) {
+        let send_time = match unix_time_now() {
+            Ok(send_time) => send_time,
+            Err(error) => {
+                let _ = self
+                    .workspace
+                    .kernel()
+                    .pause_task(job.task_id, "Cannot timestamp the next remote request");
+                self.set_remote_error_status(job.task_id, error);
+                return;
+            }
+        };
+        let task_id = job.task_id;
+        if let Err(error) = self.dispatch_remote_round(RemoteRoundDispatch {
+            agent: job.agent,
+            task_id,
+            grant_id: job.grant_id,
+            budget: job.budget,
+            remaining_actions: job.remaining_actions,
+            commit_ids: job.commit_ids,
+            send_time,
+        }) {
+            let _ = self
+                .workspace
+                .kernel()
+                .pause_task(task_id, "Remote authorization requires review");
+            self.is_dirty = true;
+            self.set_remote_error_status(task_id, &error);
+        }
     }
 
     fn fail_unchanged_remote_task(
         &mut self,
         task_id: TaskId,
-        base_workspace: &TaskWorkspace,
+        audited_task: &DesignTask,
         message: &str,
     ) {
-        if self.workspace.task(task_id) != base_workspace.task(task_id) {
+        if self.workspace.task(task_id) != Some(audited_task) {
             return;
         }
         if self.workspace.kernel().fail_task(task_id, message).is_ok() {
             self.is_dirty = true;
         }
+    }
+
+    fn active_remote_report(
+        &self,
+        task_id: TaskId,
+        status: TaskStatus,
+        commit_ids: Vec<u64>,
+    ) -> Result<AgentRunReport, String> {
+        let task = self
+            .workspace
+            .task(task_id)
+            .ok_or_else(|| format!("task {task_id} is missing"))?;
+        let change_set = task
+            .active_change_set()
+            .ok_or_else(|| format!("task {task_id} has no active change set"))?;
+        let run = change_set
+            .active_run()
+            .ok_or_else(|| format!("task {task_id} has no active run"))?;
+        Ok(AgentRunReport {
+            task_id,
+            change_set_id: change_set.id,
+            run_id: run.id,
+            status,
+            commit_ids,
+        })
+    }
+
+    fn set_remote_error_status(&mut self, task_id: TaskId, error: &str) {
+        self.status = match self.language {
+            UiLanguage::English => format!("Remote task {task_id} stopped: {error}"),
+            UiLanguage::SimplifiedChinese => format!("远程任务 {task_id} 已停止：{error}"),
+        };
     }
 
     fn finish_remote_agent_result(
@@ -1753,6 +1818,12 @@ fn display_default_config_path() -> String {
         .unwrap_or_else(|_| "~/.cadx/config.yaml".into())
 }
 
+fn display_default_egress_policy_path() -> String {
+    default_egress_policy_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "~/.cadx/egress-policy.yaml".into())
+}
+
 pub(crate) fn unix_time_now() -> Result<u64, &'static str> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1799,7 +1870,11 @@ impl eframe::App for CadxApp {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use cadx_agent::{RemoteContext, RemotePlanningDecision, RemoteTaskPlanner};
+    use cadx_config::EgressPolicyEnforcer;
 
     fn drafting_line_action(id: u64, y: f64) -> cadx_core::TaskAction {
         cadx_core::TaskAction {
@@ -1820,28 +1895,6 @@ mod tests {
                 },
             }]),
             validation: ValidationReport::default(),
-        }
-    }
-
-    fn provider_disclosure_event(source_revision: u64) -> cadx_core::TaskEvent {
-        cadx_core::TaskEvent::ProviderDisclosure {
-            endpoint: "https://provider.example/v1".into(),
-            model: "recorded-model".into(),
-            project_id: None,
-            grant_id: None,
-            sent_at_unix_seconds: None,
-            requested_capabilities: BTreeSet::from([cadx_core::Capability::Drafting]),
-            selected_entity_ids: Vec::new(),
-            includes_source_files: false,
-            payload_summary: "Task goal and bounded document statistics.".into(),
-            context_schema_version: cadx_core::REMOTE_CONTEXT_SCHEMA_VERSION,
-            source_revision,
-            data_categories: BTreeSet::from([
-                cadx_core::RemoteDataCategory::TaskGoal,
-                cadx_core::RemoteDataCategory::DocumentStatistics,
-            ]),
-            payload_bytes: 128,
-            payload_hash: "0".repeat(64),
         }
     }
 
@@ -1873,6 +1926,35 @@ mod tests {
         assert_eq!(task.active_change_set().unwrap().runs.len(), 2);
         assert_eq!(task.status, TaskStatus::Queued);
         assert!(app.status.contains("queued for retry"));
+        app.workspace.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn workbench_revokes_active_prompt_writes_and_marks_project_dirty() {
+        let mut app = CadxApp {
+            language: UiLanguage::SimplifiedChinese,
+            is_dirty: false,
+            ..Default::default()
+        };
+        app.create_task();
+        let task_id = app.active_task.unwrap();
+        let change_set_id = app.workspace.task(task_id).unwrap().active_change_set_id;
+
+        app.revoke_active_task_authorization();
+
+        let revocation = app
+            .workspace
+            .task(task_id)
+            .unwrap()
+            .active_authorization_revocation()
+            .unwrap();
+        assert_eq!(revocation.change_set_id, change_set_id);
+        assert!(app.is_dirty);
+        assert!(app.status.contains("撤销变更集"));
+        assert!(matches!(
+            app.workspace.kernel().begin_task(task_id),
+            Err(cadx_core::WorkspaceError::AuthorizationRevoked { .. })
+        ));
         app.workspace.validate_integrity().unwrap();
     }
 
@@ -2139,254 +2221,122 @@ mod tests {
         assert_eq!(app.mechanical_gpu_scene.counts(), (0, 0, 0));
     }
 
-    #[test]
-    fn current_remote_agent_output_is_replayed_without_installing_other_worker_state() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let base_workspace = app.workspace.clone();
-        let mut worker_workspace = base_workspace.clone();
-        let report = TaskAgent::new(HeuristicPlanner)
-            .run(&mut worker_workspace, task_id)
-            .unwrap();
-        worker_workspace.kernel().create_task(
-            "Worker-only task",
-            "This task must not escape the worker clone",
-            TaskAuthority::ReviewOnly,
-        );
-
-        app.finish_remote_agent_output(
-            task_id,
-            base_workspace,
-            RemoteAgentOutput {
-                workspace: worker_workspace,
-                result: Ok(report),
-            },
-            true,
-        );
-
-        assert_eq!(
-            app.workspace.tasks()[&task_id].status,
-            TaskStatus::Completed
-        );
-        assert_eq!(app.workspace.document().entities.len(), 3);
-        assert_eq!(app.workspace.tasks().len(), 1);
-        assert!(app.status.contains("saved 1 semantic commit"));
-        app.workspace.validate_integrity().unwrap();
+    #[derive(Clone)]
+    struct OneDecisionRemotePlanner {
+        config: ProviderConfig,
+        decision_json: String,
     }
 
-    #[test]
-    fn audited_remote_dispatch_replays_the_worker_plan_without_duplicate_disclosure() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let mut worker_workspace = app.workspace.clone();
-        let report = TaskAgent::new(HeuristicPlanner)
-            .run(&mut worker_workspace, task_id)
-            .unwrap();
+    impl RemoteTaskPlanner for OneDecisionRemotePlanner {
+        fn config(&self) -> &ProviderConfig {
+            &self.config
+        }
 
-        let source_revision = app.workspace.revision();
-        app.workspace.kernel().begin_task(task_id).unwrap();
-        app.workspace
-            .kernel()
-            .record_event(task_id, provider_disclosure_event(source_revision))
-            .unwrap();
-        let audited_base = app.workspace.clone();
+        fn authorize_egress(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
 
-        app.finish_remote_agent_output(
-            task_id,
-            audited_base,
-            RemoteAgentOutput {
-                workspace: worker_workspace,
-                result: Ok(report),
-            },
-            true,
-        );
-
-        let task = &app.workspace.tasks()[&task_id];
-        assert_eq!(task.status, TaskStatus::Completed);
-        assert_eq!(app.workspace.document().entities.len(), 3);
-        assert_eq!(
-            task.events()
-                .iter()
-                .filter(|event| matches!(event, cadx_core::TaskEvent::ProviderDisclosure { .. }))
-                .count(),
-            1
-        );
-        app.workspace.validate_integrity().unwrap();
+        fn plan_remote(
+            &self,
+            _context: RemoteContext,
+        ) -> Result<RemotePlanningDecision, AgentError> {
+            RemotePlanningDecision::decode_json(&self.decision_json)
+        }
     }
 
-    #[test]
-    fn remote_worker_error_without_workspace_effects_keeps_the_task_queued() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let base_workspace = app.workspace.clone();
-        let dirty_before = app.is_dirty;
-
-        app.finish_remote_agent_output(
-            task_id,
-            base_workspace.clone(),
-            RemoteAgentOutput {
-                workspace: base_workspace,
-                result: Err("provider unavailable".into()),
-            },
-            true,
-        );
-
-        assert_eq!(app.workspace.tasks()[&task_id].status, TaskStatus::Queued);
-        assert_eq!(app.is_dirty, dirty_before);
-        assert!(app.workspace.document().entities.is_empty());
-        assert!(app.status.contains("provider unavailable"));
-        app.workspace.validate_integrity().unwrap();
+    fn test_remote_config() -> ProviderConfig {
+        ProviderConfig {
+            endpoint: "https://provider.example/v1".into(),
+            model: "recorded-model".into(),
+            enabled_capabilities: BTreeSet::from([cadx_core::Capability::Drafting]),
+        }
     }
 
-    #[test]
-    fn remote_worker_crash_fails_an_unchanged_audited_task() {
-        let mut app = CadxApp::default();
+    fn audited_remote_job(
+        app: &mut CadxApp,
+        decision_json: &str,
+    ) -> (RemoteAgentJob, RemoteAgentOutput, tempfile::TempDir) {
         app.create_task();
         let task_id = app.active_task.unwrap();
-        let source_revision = app.workspace.revision();
-        app.workspace.kernel().begin_task(task_id).unwrap();
-        app.workspace
-            .kernel()
-            .record_event(task_id, provider_disclosure_event(source_revision))
-            .unwrap();
-        let audited_base = app.workspace.clone();
-
-        app.finish_remote_agent_output(
-            task_id,
-            audited_base.clone(),
-            RemoteAgentOutput {
-                workspace: audited_base,
-                result: Err("worker panic".into()),
-            },
-            false,
-        );
-
-        let task = &app.workspace.tasks()[&task_id];
-        assert_eq!(task.status, TaskStatus::Failed);
-        assert!(matches!(
-            task.events().last(),
-            Some(cadx_core::TaskEvent::Failed { message })
-                if message.contains("worker stopped unexpectedly")
-        ));
-        assert!(app.status.contains("worker stopped unexpectedly"));
-        assert!(app.workspace.document().entities.is_empty());
-        app.workspace.validate_integrity().unwrap();
-    }
-
-    #[test]
-    fn paused_remote_plan_resumes_locally_without_rechecking_a_project_grant() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        app.workspace.kernel().begin_task(task_id).unwrap();
-        let planning_revision = app.workspace.revision();
-        app.workspace
-            .kernel()
-            .set_task_plan(
-                task_id,
-                planning_revision,
-                vec![drafting_line_action(1, 0.0), drafting_line_action(2, 10.0)],
-            )
-            .unwrap();
-        app.workspace
-            .kernel()
-            .apply_next_task_action(task_id)
-            .unwrap();
-        app.workspace
-            .kernel()
-            .pause_task(task_id, "Awaiting the next run")
-            .unwrap();
-        app.remote_enabled = true;
-        app.clear_remote_context_review();
-
-        app.run_active_remote_task(1);
-
-        assert!(!app.remote_agent_running());
-        assert_eq!(
-            app.workspace.tasks()[&task_id].status,
-            TaskStatus::Completed
-        );
-        assert_eq!(app.workspace.document().entities.len(), 2);
-        assert!(app.is_dirty);
-        assert!(app.status.contains("Remote task"));
-        assert!(app.status.contains("saved 1 semantic commit"));
-        app.workspace.validate_integrity().unwrap();
-    }
-
-    #[test]
-    fn conflicting_remote_agent_output_never_overwrites_a_newer_user_edit() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let mut worker_workspace = app.workspace.clone();
-        let source_revision = app.workspace.revision();
-        app.workspace.kernel().begin_task(task_id).unwrap();
-        app.workspace
-            .kernel()
-            .record_event(task_id, provider_disclosure_event(source_revision))
-            .unwrap();
-        let base_workspace = app.workspace.clone();
-        let report = TaskAgent::new(HeuristicPlanner)
-            .run(&mut worker_workspace, task_id)
-            .unwrap();
-
-        app.viewport_tool = ViewportTool::Line;
-        app.commit_draw_gesture(Point2::new(0.0, 0.0), Point2::new(12.0, 0.0));
-        let user_head = app.workspace.history().head();
-
-        app.finish_remote_agent_output(
-            task_id,
-            base_workspace,
-            RemoteAgentOutput {
-                workspace: worker_workspace,
-                result: Ok(report),
-            },
-            true,
-        );
-
-        assert_eq!(app.workspace.history().head(), user_head);
-        assert_eq!(app.workspace.tasks()[&task_id].status, TaskStatus::Failed);
-        assert_eq!(app.workspace.document().entities.len(), 1);
-        assert!(matches!(
-            app.workspace.document().entities[&1].kind,
-            EntityKind::Line { .. }
-        ));
-        assert!(app.status.contains("Remote task"));
-        assert!(app.status.contains("stopped"));
-        app.workspace.validate_integrity().unwrap();
-    }
-
-    #[test]
-    fn remote_agent_output_merges_after_an_unrelated_user_edit() {
-        let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let mut worker_workspace = app.workspace.clone();
-        let source_revision = app.workspace.revision();
-        app.workspace.kernel().begin_task(task_id).unwrap();
-        app.workspace
-            .kernel()
-            .record_event(task_id, provider_disclosure_event(source_revision))
-            .unwrap();
-        let base_workspace = app.workspace.clone();
-        let report = TaskAgent::new(HeuristicPlanner)
-            .run(&mut worker_workspace, task_id)
-            .unwrap();
-
-        let user_entity = Entity {
-            id: 100,
-            layer: 1,
-            name: "User reference line".into(),
-            visible: true,
-            kind: EntityKind::Line {
-                start: Point2::new(0.0, 20.0),
-                end: Point2::new(12.0, 20.0),
-            },
-            parameter_refs: Default::default(),
+        let config = test_remote_config();
+        let planner = OneDecisionRemotePlanner {
+            config: config.clone(),
+            decision_json: decision_json.into(),
         };
+        let agent = TaskAgent::new(planner);
+        let disclosure = agent.remote_disclosure(&app.workspace, task_id).unwrap();
+        let grant_id = agent
+            .create_remote_access_grant(&mut app.workspace, task_id, &disclosure, 100, None)
+            .unwrap();
+        let budget = ExecutionBudget {
+            max_planned_actions: 16,
+            max_actions_per_run: 1,
+        };
+        let round = agent
+            .prepare_authorized_remote_round(&mut app.workspace, task_id, grant_id, 101, budget)
+            .unwrap();
+        let audited_task = app.workspace.task(task_id).unwrap().clone();
+        let output = agent.plan_authorized_remote_round(round).unwrap();
+        let policy_directory = tempfile::tempdir().unwrap();
+        let policy_path = policy_directory.path().join("egress-policy.yaml");
+        fs::write(
+            &policy_path,
+            b"version: 1\nallowed_providers:\n  - endpoint: 'https://provider.example/v1'\n    models: [recorded-model]\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let app_agent = TaskAgent::new(
+            GenAiRemotePlanner::new_with_egress_policy(
+                config,
+                "test-key",
+                EgressPolicyEnforcer::at(policy_path),
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = mpsc::channel();
+        (
+            RemoteAgentJob {
+                task_id,
+                grant_id,
+                budget,
+                remaining_actions: 1,
+                commit_ids: Vec::new(),
+                audited_task,
+                agent: app_agent,
+                receiver,
+                handle: None,
+            },
+            RemoteAgentOutput { result: Ok(output) },
+            policy_directory,
+        )
+    }
+
+    #[test]
+    fn one_remote_worker_decision_merges_after_an_unrelated_user_edit() {
+        let mut app = CadxApp::default();
+        let (job, output, _policy_directory) = audited_remote_job(
+            &mut app,
+            r#"{
+                "decision":"action",
+                "action":{
+                    "intent":"Create remote rectangle",
+                    "detail":"Create one editable rectangle.",
+                    "operation":{
+                        "kind":"create_rectangle",
+                        "name":"Remote rectangle",
+                        "origin":[0.0,0.0],
+                        "width":10.0,
+                        "height":5.0
+                    }
+                }
+            }"#,
+        );
+        let task_id = job.task_id;
         let expected_revision = app.workspace.revision();
         app.workspace
             .kernel()
@@ -2394,76 +2344,240 @@ mod tests {
                 expected_revision,
                 "Create unrelated user reference",
                 CommandTransaction::new(vec![CadCommand::CreateEntity {
-                    entity: user_entity,
+                    entity: Entity {
+                        id: 100,
+                        layer: 1,
+                        name: "User reference".into(),
+                        visible: true,
+                        kind: EntityKind::Line {
+                            start: Point2::new(0.0, 20.0),
+                            end: Point2::new(12.0, 20.0),
+                        },
+                        parameter_refs: Default::default(),
+                    },
                 }]),
                 ValidationReport::default(),
             )
             .unwrap();
-        let user_head = app.workspace.history().head();
+        let user_revision = app.workspace.revision();
 
-        app.finish_remote_agent_output(
-            task_id,
-            base_workspace,
-            RemoteAgentOutput {
-                workspace: worker_workspace,
-                result: Ok(report),
-            },
-            true,
-        );
+        app.finish_remote_agent_output(job, output, true);
 
-        let merged_head = app.workspace.history().head();
-        assert_ne!(merged_head, user_head);
-        assert_eq!(
-            app.workspace.history().commits[&merged_head].parent,
-            Some(user_head)
-        );
-        assert_eq!(
-            app.workspace.tasks()[&task_id].status,
-            TaskStatus::Completed
-        );
-        assert_eq!(app.workspace.document().entities.len(), 4);
+        let task = app.workspace.task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(app.workspace.document().entities.len(), 2);
         assert!(app.workspace.document().entities.contains_key(&100));
-        assert!(app.status.contains("saved 1 semantic commit"));
+        let remote_commit = task.output_commits().next().unwrap();
+        assert_eq!(
+            app.workspace.history().commits[&remote_commit].parent,
+            Some(user_revision)
+        );
+        assert_eq!(
+            app.workspace.history().commits[&remote_commit]
+                .preparation()
+                .unwrap()
+                .base_revision(),
+            0
+        );
+        assert!(app.status.contains("paused after 1 saved action"));
         app.workspace.validate_integrity().unwrap();
     }
 
     #[test]
-    fn remote_agent_output_is_discarded_when_the_target_task_changes() {
+    fn remote_complete_decision_finishes_the_audited_iterative_run() {
         let mut app = CadxApp::default();
-        app.create_task();
-        let task_id = app.active_task.unwrap();
-        let mut worker_workspace = app.workspace.clone();
-        let source_revision = app.workspace.revision();
-        app.workspace.kernel().begin_task(task_id).unwrap();
+        let (job, output, _policy_directory) = audited_remote_job(
+            &mut app,
+            r#"{"decision":"complete","summary":"The requested model is complete."}"#,
+        );
+        let task_id = job.task_id;
+
+        app.finish_remote_agent_output(job, output, true);
+
+        let task = app.workspace.task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(
+            task.events()
+                .iter()
+                .filter(|event| matches!(event, cadx_core::TaskEvent::ProviderDisclosure { .. }))
+                .count(),
+            1
+        );
+        assert!(app.status.contains("saved 0 semantic commit"));
+        app.workspace.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn remote_decision_is_discarded_after_the_user_changes_its_task_state() {
+        let mut app = CadxApp::default();
+        let (job, output, _policy_directory) =
+            audited_remote_job(&mut app, r#"{"decision":"complete","summary":"Done."}"#);
+        let task_id = job.task_id;
         app.workspace
             .kernel()
-            .record_event(task_id, provider_disclosure_event(source_revision))
-            .unwrap();
-        let base_workspace = app.workspace.clone();
-        let report = TaskAgent::new(HeuristicPlanner)
-            .run(&mut worker_workspace, task_id)
+            .fail_task(task_id, "User stopped the task")
             .unwrap();
 
-        app.workspace
-            .kernel()
-            .fail_task(task_id, "User canceled the remote task")
-            .unwrap();
-        let user_head = app.workspace.history().head();
+        app.finish_remote_agent_output(job, output, true);
 
-        app.finish_remote_agent_output(
-            task_id,
-            base_workspace,
-            RemoteAgentOutput {
-                workspace: worker_workspace,
-                result: Ok(report),
-            },
+        assert_eq!(
+            app.workspace.task(task_id).unwrap().status,
+            TaskStatus::Failed
+        );
+        assert!(app.status.contains("Discarded stale remote task"));
+        app.workspace.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn audited_remote_worker_failures_finish_without_a_dangling_round() {
+        let mut provider_error_app = CadxApp::default();
+        let (provider_error_job, mut provider_error_output, _provider_policy_directory) =
+            audited_remote_job(
+                &mut provider_error_app,
+                r#"{"decision":"complete","summary":"Done."}"#,
+            );
+        let provider_error_task = provider_error_job.task_id;
+        provider_error_output.result = Err("provider unavailable".into());
+
+        provider_error_app.finish_remote_agent_output(
+            provider_error_job,
+            provider_error_output,
             true,
         );
 
-        assert_eq!(app.workspace.history().head(), user_head);
-        assert_eq!(app.workspace.tasks()[&task_id].status, TaskStatus::Failed);
-        assert!(app.workspace.document().entities.is_empty());
-        assert!(app.status.contains("Discarded stale remote task"));
+        assert_eq!(
+            provider_error_app
+                .workspace
+                .task(provider_error_task)
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+        assert!(provider_error_app.status.contains("provider unavailable"));
+        provider_error_app.workspace.validate_integrity().unwrap();
+
+        let mut worker_error_app = CadxApp::default();
+        let (worker_error_job, worker_error_output, _worker_policy_directory) = audited_remote_job(
+            &mut worker_error_app,
+            r#"{"decision":"complete","summary":"Done."}"#,
+        );
+        let worker_error_task = worker_error_job.task_id;
+
+        worker_error_app.finish_remote_agent_output(worker_error_job, worker_error_output, false);
+
+        assert_eq!(
+            worker_error_app
+                .workspace
+                .task(worker_error_task)
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+        assert!(
+            worker_error_app
+                .status
+                .contains("worker stopped unexpectedly")
+        );
+        worker_error_app.workspace.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn remote_continuation_reauthorizes_after_grant_revocation() {
+        let mut app = CadxApp::default();
+        let (mut job, output, _policy_directory) = audited_remote_job(
+            &mut app,
+            r#"{
+                "decision":"action",
+                "action":{
+                    "intent":"Create remote rectangle",
+                    "detail":"Create one editable rectangle.",
+                    "operation":{
+                        "kind":"create_rectangle",
+                        "name":"Remote rectangle",
+                        "origin":[0.0,0.0],
+                        "width":10.0,
+                        "height":5.0
+                    }
+                }
+            }"#,
+        );
+        let task_id = job.task_id;
+        let grant_id = job.grant_id;
+        job.remaining_actions = 2;
+        job.budget.max_actions_per_run = 2;
+        app.workspace
+            .kernel()
+            .revoke_remote_access_grant(grant_id, 102)
+            .unwrap();
+
+        app.finish_remote_agent_output(job, output, true);
+
+        let task = app.workspace.task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.output_commits().count(), 1);
+        assert_eq!(app.workspace.document().entities.len(), 1);
+        assert_eq!(
+            task.events()
+                .iter()
+                .filter(|event| matches!(event, cadx_core::TaskEvent::ProviderDisclosure { .. }))
+                .count(),
+            1
+        );
+        assert!(!app.remote_agent_running());
+        assert!(app.status.contains("grant"));
+        app.workspace.validate_integrity().unwrap();
+    }
+
+    #[test]
+    fn paused_remote_run_requires_fresh_authorization_before_resuming() {
+        let mut app = CadxApp::default();
+        let (job, output, _policy_directory) = audited_remote_job(
+            &mut app,
+            r#"{
+                "decision":"action",
+                "action":{
+                    "intent":"Create remote rectangle",
+                    "detail":"Create one editable rectangle.",
+                    "operation":{
+                        "kind":"create_rectangle",
+                        "name":"Remote rectangle",
+                        "origin":[0.0,0.0],
+                        "width":10.0,
+                        "height":5.0
+                    }
+                }
+            }"#,
+        );
+        let task_id = job.task_id;
+        let grant_id = job.grant_id;
+        let resume_agent = job.agent.clone();
+        app.finish_remote_agent_output(job, output, true);
+        assert_eq!(
+            app.workspace.task(task_id).unwrap().status,
+            TaskStatus::Paused
+        );
+        app.workspace
+            .kernel()
+            .revoke_remote_access_grant(grant_id, 102)
+            .unwrap();
+
+        app.run_remote_task_with_agent(resume_agent, task_id, 1, 103);
+
+        let task = app.workspace.task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(
+            task.events()
+                .iter()
+                .filter(|event| matches!(event, cadx_core::TaskEvent::ProviderDisclosure { .. }))
+                .count(),
+            1
+        );
+        let disclosure = app.remote_disclosure.as_ref().unwrap();
+        assert_eq!(disclosure.source_revision, app.workspace.revision());
+        assert_eq!(disclosure.context.action_index, 1);
+        assert_eq!(app.remote_grant_id, None);
+        assert!(!app.remote_agent_running());
+        assert!(app.status.contains("Review"));
         app.workspace.validate_integrity().unwrap();
     }
 }

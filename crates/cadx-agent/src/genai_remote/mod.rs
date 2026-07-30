@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::error::AgentError;
 use crate::provider::{ProviderConfig, RemoteContext, RemoteContextRequest, RemoteTaskPlanner};
 use crate::remote_plan::{RemotePlanningDecision, decode_decision};
+use cadx_config::EgressPolicyEnforcer;
 use cadx_core::EntityId;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatOptions, ChatRequest, ChatResponseFormat};
@@ -72,6 +73,7 @@ capability. Use only operations whose capability is listed in the user context. 
 pub struct GenAiRemotePlanner {
     config: ProviderConfig,
     api_key: String,
+    egress_policy: EgressPolicyEnforcer,
     selected_entity_ids: Vec<EntityId>,
     timeout: Duration,
 }
@@ -82,6 +84,7 @@ impl fmt::Debug for GenAiRemotePlanner {
             .debug_struct("GenAiRemotePlanner")
             .field("config", &self.config)
             .field("api_key", &"REDACTED")
+            .field("egress_policy", &self.egress_policy.path())
             .field("selected_entity_ids", &self.selected_entity_ids)
             .field("timeout", &self.timeout)
             .finish()
@@ -92,6 +95,19 @@ impl GenAiRemotePlanner {
     /// Creates a planner with a credential loaded by the caller from local
     /// configuration. The planner never reads provider environment variables.
     pub fn new(config: ProviderConfig, api_key: impl Into<String>) -> Result<Self, AgentError> {
+        let egress_policy = EgressPolicyEnforcer::from_default_path().map_err(|error| {
+            AgentError::Provider(format!("cannot resolve provider egress policy: {error}"))
+        })?;
+        Self::new_with_egress_policy(config, api_key, egress_policy)
+    }
+
+    /// Creates a planner with an explicit policy source. The policy is still
+    /// reloaded on every authorization check before a provider call.
+    pub fn new_with_egress_policy(
+        config: ProviderConfig,
+        api_key: impl Into<String>,
+        egress_policy: EgressPolicyEnforcer,
+    ) -> Result<Self, AgentError> {
         config.validate()?;
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
@@ -100,6 +116,7 @@ impl GenAiRemotePlanner {
         Ok(Self {
             config,
             api_key,
+            egress_policy,
             selected_entity_ids: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
         })
@@ -133,10 +150,17 @@ impl GenAiRemotePlanner {
         &self.config
     }
 
+    pub fn authorize_egress(&self) -> Result<(), AgentError> {
+        self.egress_policy
+            .authorize(&self.config.endpoint, &self.config.model)
+            .map_err(|error| AgentError::Provider(format!("provider egress denied: {error}")))
+    }
+
     fn request_decision(
         &self,
         context: RemoteContext,
     ) -> Result<RemotePlanningDecision, AgentError> {
+        self.authorize_egress()?;
         let prompt = build_prompt(&context);
         let endpoint = normalized_endpoint(&self.config.endpoint);
         let model = self.config.model.clone();
@@ -186,6 +210,10 @@ fn request_response_body(
 impl RemoteTaskPlanner for GenAiRemotePlanner {
     fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    fn authorize_egress(&self) -> Result<(), AgentError> {
+        Self::authorize_egress(self)
     }
 
     fn context_request(&self) -> RemoteContextRequest {

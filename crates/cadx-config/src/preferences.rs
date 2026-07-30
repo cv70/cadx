@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ConfigError;
 use crate::paths::{
-    PREFERENCES_FILE_NAME, ensure_default_working_directory, private_create_new,
-    validate_private_config_file,
+    PREFERENCES_FILE_NAME, ensure_default_working_directory, open_private_config_file,
+    private_create_new, validate_private_config_file,
 };
 
 pub const CURRENT_PREFERENCES_VERSION: u32 = 1;
@@ -95,8 +95,7 @@ impl CadxPreferences {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        validate_private_config_file(path)?;
-        let metadata = fs::metadata(path).map_err(|error| ConfigError::io(path, error))?;
+        let (mut file, metadata) = open_private_config_file(path)?;
         if metadata.len() > MAX_PREFERENCES_BYTES {
             return Err(ConfigError::ConfigTooLarge {
                 path: path.into(),
@@ -104,8 +103,7 @@ impl CadxPreferences {
             });
         }
         let mut contents = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)
-            .map_err(|error| ConfigError::io(path, error))?
+        std::io::Read::by_ref(&mut file)
             .take(MAX_PREFERENCES_BYTES + 1)
             .read_to_end(&mut contents)
             .map_err(|error| ConfigError::io(path, error))?;

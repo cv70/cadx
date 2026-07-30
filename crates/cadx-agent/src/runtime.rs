@@ -129,9 +129,17 @@ where
         workspace: &TaskWorkspace,
         task_id: TaskId,
     ) -> Result<ProviderDisclosure, AgentError> {
+        self.remote_round_disclosure(workspace, task_id, ExecutionBudget::default())
+    }
+
+    pub fn remote_round_disclosure(
+        &self,
+        workspace: &TaskWorkspace,
+        task_id: TaskId,
+        budget: ExecutionBudget,
+    ) -> Result<ProviderDisclosure, AgentError> {
         let mut preview = workspace.clone();
-        let (_, disclosure) =
-            self.prepare_remote_round_context(&mut preview, task_id, ExecutionBudget::default())?;
+        let (_, disclosure) = self.prepare_remote_round_context(&mut preview, task_id, budget)?;
         Ok(disclosure)
     }
 
@@ -200,6 +208,7 @@ where
         unix_seconds: u64,
         budget: ExecutionBudget,
     ) -> Result<AuthorizedRemoteRound, AgentError> {
+        self.planner.authorize_egress()?;
         budget.validate()?;
         let mut preview = workspace.clone();
         let (_, preview_disclosure) =
@@ -235,6 +244,7 @@ where
         &self,
         round: AuthorizedRemoteRound,
     ) -> Result<RemoteRoundOutput, AgentError> {
+        self.planner.authorize_egress()?;
         if self.planner.config() != &round.config {
             return Err(AgentError::Provider(
                 "authorized remote round does not match this planner configuration".into(),
@@ -780,6 +790,8 @@ fn repairable_failure_kind(error: &WorkspaceError) -> Option<ActionFailureKind> 
         | WorkspaceError::ChangeSetNotRevertible(_)
         | WorkspaceError::ChangeSetAlreadyReverted(_)
         | WorkspaceError::ChangeSetNotOnActiveBranch { .. }
+        | WorkspaceError::AuthorizationRevoked { .. }
+        | WorkspaceError::AuthorizationAlreadyRevoked { .. }
         | WorkspaceError::Unauthorized(_)
         | WorkspaceError::HistoryNavigationBlocked(_)
         | WorkspaceError::PreparedInputMismatch { .. }

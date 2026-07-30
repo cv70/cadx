@@ -12,6 +12,7 @@ pub enum ConfigError {
     PathIsSymlink(PathBuf),
     PathIsNotDirectory(PathBuf),
     PathIsNotFile(PathBuf),
+    PathReplaced(PathBuf),
     InsecurePermissions(PathBuf),
     ConfigTooLarge {
         path: PathBuf,
@@ -20,6 +21,11 @@ pub enum ConfigError {
     InvalidYaml(PathBuf),
     UnsupportedVersion(u32),
     InvalidProvider(&'static str),
+    InvalidEgressPolicy(&'static str),
+    ProviderEgressDenied {
+        endpoint: String,
+        model: String,
+    },
 }
 
 impl ConfigError {
@@ -65,6 +71,11 @@ impl fmt::Display for ConfigError {
                     path.display()
                 )
             }
+            Self::PathReplaced(path) => write!(
+                formatter,
+                "CADX configuration path changed while it was being opened: {}",
+                path.display()
+            ),
             Self::InsecurePermissions(path) => write!(
                 formatter,
                 "CADX configuration path has permissions visible to other users: {}",
@@ -89,6 +100,11 @@ impl fmt::Display for ConfigError {
                 )
             }
             Self::InvalidProvider(message) => formatter.write_str(message),
+            Self::InvalidEgressPolicy(message) => formatter.write_str(message),
+            Self::ProviderEgressDenied { endpoint, model } => write!(
+                formatter,
+                "provider endpoint/model is not approved by the local egress policy: {endpoint} / {model}"
+            ),
         }
     }
 }

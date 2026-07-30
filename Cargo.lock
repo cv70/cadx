@@ -307,11 +307,13 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cadx-agent"
 version = "0.1.0"
 dependencies = [
+ "cadx-config",
  "cadx-core",
  "genai",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "url",
 ]
@@ -327,6 +329,7 @@ dependencies = [
  "cadx-io",
  "cadx-render",
  "eframe",
+ "tempfile",
 ]
 
 [[package]]

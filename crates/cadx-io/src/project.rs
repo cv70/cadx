@@ -11,7 +11,7 @@ use crate::archive::{
 };
 use crate::error::ProjectError;
 
-pub const CURRENT_PROJECT_FORMAT_VERSION: u32 = 11;
+pub const CURRENT_PROJECT_FORMAT_VERSION: u32 = 12;
 pub const PROJECT_EXTENSION: &str = "cadx";
 pub const RECOVERY_SUFFIX: &str = ".autosave.cadx";
 
@@ -114,6 +114,7 @@ pub fn load_workspace(path: impl AsRef<Path>) -> Result<ProjectLoad, ProjectErro
     let requires_legacy_execution_strategy_migration = source_format_version < 9;
     let requires_legacy_remote_policy_migration = source_format_version < 10;
     let requires_legacy_planning_budget_migration = source_format_version < 11;
+    let requires_legacy_task_authorization_migration = source_format_version < 12;
     let mut migrated = migrate_manifest(&mut manifest, workspace_bytes)?;
     let mut workspace = serde_json::from_slice::<TaskWorkspace>(workspace_bytes)?;
     if manifest.document_schema_version != workspace.document().schema_version {
@@ -142,6 +143,11 @@ pub fn load_workspace(path: impl AsRef<Path>) -> Result<ProjectLoad, ProjectErro
     if requires_legacy_planning_budget_migration {
         workspace.kernel().migrate_legacy_planning_budgets();
     }
+    if requires_legacy_task_authorization_migration {
+        workspace
+            .kernel()
+            .migrate_legacy_task_authorization_revocations()?;
+    }
     if requires_legacy_evidence_migration {
         workspace.kernel().migrate_legacy_to_current()?;
     } else if requires_legacy_execution_migration {
@@ -166,7 +172,8 @@ pub fn load_workspace(path: impl AsRef<Path>) -> Result<ProjectLoad, ProjectErro
     migrated |= requires_schema_migration
         || recovered_interrupted_task
         || requires_legacy_remote_policy_migration
-        || requires_legacy_planning_budget_migration;
+        || requires_legacy_planning_budget_migration
+        || requires_legacy_task_authorization_migration;
     manifest.document_schema_version = workspace.document().schema_version;
     Ok(ProjectLoad {
         workspace,

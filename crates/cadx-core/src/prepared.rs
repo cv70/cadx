@@ -10,8 +10,8 @@ use crate::{
     ObjectPrecondition, PromptChangeSetId, TaskId,
 };
 
-const IDEMPOTENCY_DOMAIN: &[u8] = b"CADX-ACTION-IDEMPOTENCY\0v1\0";
-const RUN_BOUND_IDEMPOTENCY_DOMAIN: &[u8] = b"CADX-ACTION-IDEMPOTENCY\0v2-run-bound\0";
+const IDEMPOTENCY_DOMAIN: &[u8] = b"CADX-ACTION-IDEMPOTENCY\0v3-pack-bound\0";
+const RUN_BOUND_IDEMPOTENCY_DOMAIN: &[u8] = b"CADX-ACTION-IDEMPOTENCY\0v3-run-and-pack-bound\0";
 const MAX_IDEMPOTENCY_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -20,6 +20,7 @@ pub struct ActionIdempotencyKey([u8; 32]);
 
 impl ActionIdempotencyKey {
     pub(crate) fn derive(
+        pack_lock_hash: [u8; 32],
         input_state_hash: [u8; 32],
         candidate_state_hash: [u8; 32],
         source: Option<ActionSource>,
@@ -37,6 +38,7 @@ impl ActionIdempotencyKey {
             } else {
                 IDEMPOTENCY_DOMAIN
             });
+        writer.hasher.update(pack_lock_hash);
         writer.hasher.update(input_state_hash);
         writer.hasher.update(candidate_state_hash);
         let task_id = source.map(|source| source.task_id);
@@ -79,6 +81,8 @@ impl fmt::Debug for ActionIdempotencyKey {
 pub struct PreparedActionRecord {
     base_revision: CommitId,
     preconditions: Vec<ObjectPrecondition>,
+    #[serde(default)]
+    pack_lock_hash: [u8; 32],
     input_state_hash: [u8; 32],
     candidate_state_hash: [u8; 32],
     idempotency_key: ActionIdempotencyKey,
@@ -95,6 +99,10 @@ impl PreparedActionRecord {
 
     pub const fn input_state_hash(&self) -> [u8; 32] {
         self.input_state_hash
+    }
+
+    pub const fn pack_lock_hash(&self) -> [u8; 32] {
+        self.pack_lock_hash
     }
 
     pub const fn candidate_state_hash(&self) -> [u8; 32] {
@@ -114,6 +122,7 @@ pub struct PreparedAction {
     source: Option<ActionSource>,
     transaction: CommandTransaction,
     preconditions: Vec<ObjectPrecondition>,
+    pack_lock_hash: [u8; 32],
     input_state_hash: [u8; 32],
     candidate_state_hash: [u8; 32],
     idempotency_key: ActionIdempotencyKey,
@@ -164,9 +173,16 @@ impl PreparedAction {
             return Err(PrepareError::ValidationFailed(evidence.summary()));
         }
         let preconditions = snapshot.preconditions_for(&transaction);
+        let pack_lock_hash = evidence.pack_lock_hash();
+        if input_evidence.pack_lock_hash() != pack_lock_hash {
+            return Err(PrepareError::ValidationUnavailable(
+                "candidate validation changed PackLock within one preparation".into(),
+            ));
+        }
         let input_state_hash = input_evidence.candidate_state_hash();
         let candidate_state_hash = evidence.candidate_state_hash();
         let idempotency_key = ActionIdempotencyKey::derive(
+            pack_lock_hash,
             input_state_hash,
             candidate_state_hash,
             source,
@@ -178,6 +194,7 @@ impl PreparedAction {
             source,
             transaction,
             preconditions,
+            pack_lock_hash,
             input_state_hash,
             candidate_state_hash,
             idempotency_key,
@@ -194,6 +211,10 @@ impl PreparedAction {
 
     pub const fn candidate_state_hash(&self) -> [u8; 32] {
         self.candidate_state_hash
+    }
+
+    pub const fn pack_lock_hash(&self) -> [u8; 32] {
+        self.pack_lock_hash
     }
 
     pub const fn input_state_hash(&self) -> [u8; 32] {
@@ -219,6 +240,7 @@ impl PreparedAction {
         PreparedActionRecord {
             base_revision: self.base_revision,
             preconditions: self.preconditions.clone(),
+            pack_lock_hash: self.pack_lock_hash,
             input_state_hash: self.input_state_hash,
             candidate_state_hash: self.candidate_state_hash,
             idempotency_key: self.idempotency_key,
@@ -235,6 +257,7 @@ impl PreparedAction {
             source: Some(source),
             transaction,
             preconditions: record.preconditions,
+            pack_lock_hash: record.pack_lock_hash,
             input_state_hash: record.input_state_hash,
             candidate_state_hash: record.candidate_state_hash,
             idempotency_key: record.idempotency_key,
@@ -250,6 +273,7 @@ impl fmt::Debug for PreparedAction {
             .field("source", &self.source)
             .field("command_count", &self.transaction.commands.len())
             .field("precondition_count", &self.preconditions.len())
+            .field("pack_lock_hash", &"[redacted]")
             .field("input_state_hash", &"[redacted]")
             .field("candidate_state_hash", &"[redacted]")
             .field("idempotency_key", &"[redacted]")

@@ -2276,3 +2276,106 @@ fn iterative_action_from_ancestor_observation_rejects_same_object_change() {
     );
     workspace.validate_integrity().unwrap();
 }
+
+#[test]
+fn revoking_change_set_authorization_blocks_pending_actions_without_losing_prior_work() {
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Revocable task authority"));
+    let task_id = workspace.kernel().create_task(
+        "Create two plates",
+        "Create two editable plates",
+        TaskAuthority::all_direct(),
+    );
+    let change_set_id = workspace.task(task_id).unwrap().active_change_set_id;
+    workspace.kernel().begin_task(task_id).unwrap();
+    let base_revision = workspace.revision();
+    workspace
+        .kernel()
+        .set_task_plan(
+            task_id,
+            base_revision,
+            vec![
+                TaskAction {
+                    intent: "Create first plate".into(),
+                    tool_name: "drafting.create_rectangle".into(),
+                    detail: "Create first plate".into(),
+                    transaction: CommandTransaction::new(vec![CadCommand::CreateEntity {
+                        entity: rectangle(1),
+                    }]),
+                    validation: ValidationReport::default(),
+                },
+                TaskAction {
+                    intent: "Create second plate".into(),
+                    tool_name: "drafting.create_rectangle".into(),
+                    detail: "Create second plate".into(),
+                    transaction: CommandTransaction::new(vec![CadCommand::CreateEntity {
+                        entity: rectangle(2),
+                    }]),
+                    validation: ValidationReport::default(),
+                },
+            ],
+        )
+        .unwrap();
+
+    let first_commit = workspace
+        .kernel()
+        .apply_next_task_action(task_id)
+        .unwrap()
+        .unwrap();
+    let revocation = workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Operator stopped model writes")
+        .unwrap();
+
+    assert_eq!(revocation.revoked_at_revision, first_commit);
+    assert_eq!(revocation.committed_action_count, 1);
+    assert_eq!(
+        workspace
+            .kernel()
+            .apply_next_task_action(task_id)
+            .unwrap_err(),
+        WorkspaceError::AuthorizationRevoked {
+            task_id,
+            change_set_id,
+        }
+    );
+    assert!(workspace.document().entities.contains_key(&1));
+    assert!(!workspace.document().entities.contains_key(&2));
+    assert_eq!(
+        workspace.task(task_id).unwrap().authorization_revocations(),
+        &[revocation]
+    );
+    workspace.validate_integrity().unwrap();
+
+    let decoded: TaskWorkspace =
+        serde_json::from_slice(&serde_json::to_vec(&workspace).unwrap()).unwrap();
+    assert_eq!(decoded, workspace);
+    decoded.validate_integrity().unwrap();
+}
+
+#[test]
+fn revoked_authorization_cannot_be_reused_by_resume_or_retry() {
+    let (mut workspace, task_id) = iterative_workspace_with_budget(1);
+    let change_set_id = workspace.task(task_id).unwrap().active_change_set_id;
+    workspace
+        .kernel()
+        .pause_task(task_id, "Operator pause")
+        .unwrap();
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Policy revoked")
+        .unwrap();
+
+    assert!(matches!(
+        workspace.kernel().resume_task(task_id),
+        Err(WorkspaceError::AuthorizationRevoked { .. })
+    ));
+    assert!(matches!(
+        workspace.kernel().revoke_task_authorization(
+            task_id,
+            change_set_id,
+            "Duplicate revocation"
+        ),
+        Err(WorkspaceError::AuthorizationAlreadyRevoked { .. })
+    ));
+    workspace.validate_integrity().unwrap();
+}

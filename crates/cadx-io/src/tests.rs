@@ -340,6 +340,7 @@ fn workspace_with_remote_audit() -> TaskWorkspace {
                     RemoteDataCategory::DocumentStatistics,
                     RemoteDataCategory::SelectionIdentifiers,
                     RemoteDataCategory::GrantedCapabilities,
+                    RemoteDataCategory::ExecutionState,
                 ]),
                 payload_bytes: 512,
                 payload_hash: "ab".repeat(32),
@@ -361,6 +362,7 @@ fn workspace_with_project_grant_audit() -> (TaskWorkspace, u64) {
         RemoteDataCategory::DocumentStatistics,
         RemoteDataCategory::SelectionIdentifiers,
         RemoteDataCategory::GrantedCapabilities,
+        RemoteDataCategory::ExecutionState,
     ]);
     let capabilities = BTreeSet::from([Capability::Drafting, Capability::Mechanical]);
     let grant_id = workspace
@@ -603,6 +605,132 @@ fn format_ten_workspace_migrates_explicit_planning_budgets() {
     );
     loaded.workspace.validate_integrity().unwrap();
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn format_eleven_workspace_migrates_empty_task_authorization_ledgers() {
+    let workspace = sample_workspace();
+    let task_id = *workspace.tasks().keys().next().unwrap();
+    let mut value = serde_json::to_value(&workspace).unwrap();
+    value["tasks"][task_id.to_string()]
+        .as_object_mut()
+        .unwrap()
+        .remove("authorization_revocations");
+    let path = write_workspace_value("format-eleven-task-authorization", &value, 11);
+
+    let loaded = load_workspace(&path).unwrap();
+
+    assert!(loaded.migrated);
+    assert_eq!(loaded.workspace, workspace);
+    assert!(
+        loaded.workspace.tasks()[&task_id]
+            .authorization_revocations()
+            .is_empty()
+    );
+    loaded.workspace.validate_integrity().unwrap();
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn format_eleven_workspace_rejects_current_task_authorization_events() {
+    let mut workspace = sample_workspace();
+    let task_id = *workspace.tasks().keys().next().unwrap();
+    let change_set_id = workspace.tasks()[&task_id].active_change_set_id;
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Current-format revocation")
+        .unwrap();
+    let value = serde_json::to_value(&workspace).unwrap();
+    let path = write_workspace_value("format-eleven-rejects-v12-ledger", &value, 11);
+
+    assert!(matches!(
+        load_workspace(&path).unwrap_err(),
+        ProjectError::Workspace(_)
+    ));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn native_project_round_trip_preserves_task_authorization_revocation() {
+    let mut workspace = sample_workspace();
+    let task_id = *workspace.tasks().keys().next().unwrap();
+    let change_set_id = workspace.tasks()[&task_id].active_change_set_id;
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Local operator revoked writes")
+        .unwrap();
+    let path = test_path("task-authorization-revocation-round-trip");
+
+    save_workspace(&workspace, &path).unwrap();
+    let loaded = load_workspace(&path).unwrap();
+
+    assert!(!loaded.migrated);
+    assert_eq!(loaded.workspace, workspace);
+    assert_eq!(
+        loaded.workspace.tasks()[&task_id].authorization_revocations()[0].committed_action_count,
+        1
+    );
+    loaded.workspace.validate_integrity().unwrap();
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn current_project_format_rejects_missing_or_tampered_task_authorization_ledger() {
+    let mut workspace = sample_workspace();
+    let task_id = *workspace.tasks().keys().next().unwrap();
+    let change_set_id = workspace.tasks()[&task_id].active_change_set_id;
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Local operator revoked writes")
+        .unwrap();
+    let mut corruptions = Vec::new();
+
+    let mut missing = serde_json::to_value(&workspace).unwrap();
+    missing["tasks"][task_id.to_string()]
+        .as_object_mut()
+        .unwrap()
+        .remove("authorization_revocations");
+    corruptions.push(("missing-task-authorization-ledger", missing));
+
+    let mut wrong_count = serde_json::to_value(&workspace).unwrap();
+    wrong_count["tasks"][task_id.to_string()]["authorization_revocations"][0]["committed_action_count"] =
+        Value::from(0);
+    corruptions.push(("wrong-task-authorization-count", wrong_count));
+
+    let mut missing_revision = serde_json::to_value(&workspace).unwrap();
+    missing_revision["tasks"][task_id.to_string()]["authorization_revocations"][0]["revoked_at_revision"] =
+        Value::from(999);
+    corruptions.push(("missing-task-authorization-revision", missing_revision));
+
+    let mut wrong_change_set = serde_json::to_value(&workspace).unwrap();
+    wrong_change_set["tasks"][task_id.to_string()]["authorization_revocations"][0]["change_set_id"] =
+        Value::from(999);
+    corruptions.push(("wrong-task-authorization-change-set", wrong_change_set));
+
+    let mut duplicate = serde_json::to_value(&workspace).unwrap();
+    let event = duplicate["tasks"][task_id.to_string()]["authorization_revocations"][0].clone();
+    duplicate["tasks"][task_id.to_string()]["authorization_revocations"]
+        .as_array_mut()
+        .unwrap()
+        .push(event);
+    corruptions.push(("duplicate-task-authorization-revocation", duplicate));
+
+    for (label, value) in corruptions {
+        let corrupted = serde_json::from_value::<TaskWorkspace>(value.clone()).unwrap();
+        let save_path = test_path(&format!("save-{label}"));
+        assert!(matches!(
+            save_workspace(&corrupted, &save_path).unwrap_err(),
+            ProjectError::Workspace(_)
+        ));
+        assert!(!save_path.exists());
+
+        let load_path = write_workspace_value(label, &value, CURRENT_PROJECT_FORMAT_VERSION);
+        assert!(matches!(
+            load_workspace(&load_path).unwrap_err(),
+            ProjectError::Workspace(_)
+        ));
+        fs::remove_file(load_path).unwrap();
+    }
 }
 
 #[test]
@@ -1240,7 +1368,17 @@ fn native_project_round_trip_preserves_hash_bound_remote_send_audit() {
     };
     assert_eq!(*context_schema_version, REMOTE_CONTEXT_SCHEMA_VERSION);
     assert_eq!(*source_revision, workspace.history().head());
-    assert_eq!(data_categories.len(), 5);
+    assert_eq!(
+        data_categories,
+        &BTreeSet::from([
+            RemoteDataCategory::TaskGoal,
+            RemoteDataCategory::DocumentMetadata,
+            RemoteDataCategory::DocumentStatistics,
+            RemoteDataCategory::SelectionIdentifiers,
+            RemoteDataCategory::GrantedCapabilities,
+            RemoteDataCategory::ExecutionState,
+        ])
+    );
     assert_eq!(*payload_bytes, 512);
     assert_eq!(payload_hash, &"ab".repeat(32));
     fs::remove_file(path).unwrap();

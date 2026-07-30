@@ -16,11 +16,17 @@
 
 Agent 通过 observe/query/tool 循环工作。初始观察只提供当前 revision、工程摘要、选择集、任务状态和可用能力；对象、关系、参数、约束、依赖、局部几何摘要、验证、历史和源文件片段通过有界查询按需获取。完整工程在授权范围内可查询，但不会默认作为一个 payload 发送。
 
-外部 provider 使用项目级持续授权。授权绑定 provider/endpoint allowlist、数据类别、查询能力、对象范围、payload 上限、有效期和撤销状态。每次实际发送仍记录数据类别、对象范围、字节数和 payload hash。写入另需任务级 `CapabilityToken`。
+外部 provider 使用两层授权。独立的本机 egress policy 以精确 endpoint/model allowlist 控制
+网络出口；项目级持续授权再绑定 project、endpoint/model、数据类别、查询能力、对象范围、
+payload 上限、有效期和撤销状态。Provider 配置不能自行扩大 egress policy。每次实际发送仍
+记录数据类别、对象范围、字节数和 payload hash。写入另需任务级 `CapabilityToken`。
 
 Agent 只调用版本化 `SemanticOperation`。AI 可以给出尺寸、方向、参考系、约束和受约束几何种子，由 Pack 和本地求解器生成可编辑模型；AI 不能提交最终 B-rep、网格、内部对象表、历史、验证 evidence 或签名。
 
-每次 action 提交后 Agent 重新观察最新 revision。对象前置条件失效时最多自动重规划三次，随后失败并请人处理。
+每次 action 提交后 Agent 重新观察最新 revision。每次规划 decision 最多返回一个 action 或
+complete；远程 decision 必须位于同一 observation 的发送审计之后。对象前置条件失效时最多
+自动重规划三次，随后失败并请人处理。Action 与 decision 总预算在 Run 建立时固定并持久化，
+pause/resume、崩溃恢复或调用方重试都不能扩大它。
 
 ## 接口影响
 
@@ -28,6 +34,9 @@ Agent 只调用版本化 `SemanticOperation`。AI 可以给出尺寸、方向、
 - `CapabilityToken` 明确任务、Pack、操作类别、对象范围、有效期和授权来源。
 - `SemanticOperation` 包含 ChangeSet、object-version 前置条件、typed payload 和幂等键。
 - provider disclosure/audit 记录实际发送内容的类别和 hash，但不能记录凭据。
+- egress policy 在写入发送审计前和实际 Provider 调用入口分别动态检查；撤销不受已有 grant 影响。
+- 远程每轮先重观察、再按当前 payload 重授权并持久化审计，之后才产生一个 decision；失败反馈
+  和剩余预算属于下一轮可披露的 execution state。
 - Agent Runtime 只接收不可变 snapshot 和查询结果，永远不持有可写文档引用。
 
 ## 替代方案
@@ -43,4 +52,7 @@ Agent 能逐步获取完成任务所需的完整上下文，同时限制单次�
 
 ## 安全限制
 
-项目级持续授权不是对任意数据的永久许可。新增数据类别、附件类型、provider 或 endpoint 必须重新授权。payload hash 能证明发送了什么版本的数据，但不能让第三方删除已经接收的数据；产品必须清楚展示 provider 的保留策略。
+项目级持续授权不是对任意数据的永久许可。新增数据类别、附件类型、provider 或 endpoint 必须
+重新授权；即使项目 grant 仍有效，本机 egress policy 也可以立即阻止后续发送。当前本机策略不
+等于组织签名策略，拥有 OS 用户权限的操作者可以修改它。payload hash 能证明发送了什么版本的
+数据，但不能让第三方删除已经接收的数据；产品必须清楚展示 provider 的保留策略。

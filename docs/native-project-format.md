@@ -3,16 +3,16 @@
 > 文档类型：文件格式契约
 > 状态：Implemented
 > 适用范围：Current
-> 权威内容：当前 `.cadx` format v10、document schema、迁移和 recovery sidecar
+> 权威内容：当前 `.cadx` format v12、document schema、迁移和 recovery sidecar
 > 返回：[文档索引](index.md)
 
 当前 CADX 将可编辑本地工程保存为 `.cadx` ZIP archive。本文只定义已经实现的
-format v10；目标工作存储向 SQLite/WAL 和内容寻址 blob 的演进见[目标架构](design.md)，
+format v12；目标工作存储向 SQLite/WAL 和内容寻址 blob 的演进见[目标架构](design.md)，
 不得用目标设计重新解释现有 archive。
 
 ## Archive 布局
 
-Format v10 必须且只能包含两个 regular file：
+Format v12 必须且只能包含两个 regular file：
 
 ```text
 manifest.json
@@ -30,8 +30,10 @@ workspace.json
 - branch 与 branch-local redo stack；
 - `DesignTask -> PromptChangeSet -> AgentRun` 层级，以及原始 Prompt、结构化目标、授权快照、
   运行身份、状态、诊断、事件和有序 action commit 引用；
+- 每个 Task 的 append-only ChangeSet write-authorization revocation ledger；
 - paused run 尚未执行的持久化 typed action，以及 plan 的 `base_revision`、当前
-  `expected_revision`、action checkpoint、`next_action_preparation` 和显式 execution strategy；
+  `expected_revision`、action checkpoint、`next_action_preparation`、显式 execution strategy
+  和不可放宽的 `planning_budget`；
 - iterative run 的逐 action re-observation、规划完成事件、结构化失败反馈和自动修复次数；
 - conflict-aware compensation 的目标 ChangeSet、请求 revision、恢复对象、结构化冲突、
   可选补偿 commit，以及 target/compensation 双向关联。
@@ -107,8 +109,36 @@ payload 上限、创建时间、可选到期时间和撤销时间。`Granted` ev
 远程上下文 schema v3 在 payload 中加入 project ID。每个新 `ProviderDisclosure` run event 同时
 绑定 project/grant ID 与发送时间，并继续保存 task/ChangeSet/Run 所在位置、source revision、
 endpoint/model、capability、selection、数据类别、payload bytes 和 SHA-256。完整 payload、
-Provider 响应和 credential 仍不进入 archive。Format v10 当前 workspace 缺少 project ID 或
+Provider 响应和 credential 仍不进入 archive。Format v10 archive 缺少 project ID 或
 policy、grant ledger 无法重放、发送事件引用不存在或不覆盖该披露的 grant 时直接拒绝。
+用户级 `egress-policy.yaml` 也不进入 archive；加载或复制工程只会恢复项目 grant，不能恢复、
+扩大或绕过当前机器的 endpoint/model 出口策略。每次新发送仍必须重新通过本机策略。
+
+Format v11 为每个 `TaskExecution` 增加持久化 `TaskPlanningBudget`。Batch execution 的
+`max_actions` 必须精确等于 action list 长度，`max_decisions` 必须为 1。Iterative execution 的
+`max_actions` 必须位于 `1..=256`，decision 上限固定为：
+
+```text
+max_decisions = max_actions * (MAX_AUTOMATIC_REPAIR_ATTEMPTS + 1) + 1
+```
+
+当前最大自动修复次数为 3，因此该上限同时覆盖每个 action 的初始 proposal、最多三个修复
+proposal，以及最终 complete decision。每次 `Reobserved` 消耗一个 decision 名额；暂停、保存、
+崩溃恢复或调用方传入更大的运行 budget 都不能扩大持久总上限。
+
+当前远程上下文 schema v4 增加 `ExecutionState` 数据类别，并在 payload 中绑定 action index、
+总/剩余 action 与 decision budget，以及可选的最近失败反馈。Remote iterative Run 的每个
+Provider decision 必须按 `Reobserved -> schema-v4 ProviderDisclosure -> action|complete` 顺序
+绑定同一 source revision；每个 observation 只能被一次发送审计和一个 decision 消费。缺失、
+重复、错序或绑定其他 revision 的审计均使当前 workspace 无效。完整 payload、Provider 响应和
+credential 仍不进入 archive。
+
+Format v12 为每个 `DesignTask` 增加 `authorization_revocations`。每条撤销记录绑定
+`change_set_id`、`revoked_at_revision`、撤销前已经提交的 `committed_action_count` 和非空原因。
+原 `PromptChangeSet.authorization` 保持不变，用于验证历史 commit 当时是否处于授权范围；当前
+有效性由 revocation ledger 派生。每个 ChangeSet 最多一条撤销，目标 ChangeSet 必须存在且原本
+具有 direct-write authority，revision 必须存在，撤销后该 ChangeSet 的 action commit 数不得再
+增加。撤销发生在已审计的远程调用之后时，Provider 输出仍必须在 stage/commit gate 被拒绝。
 
 它不得包含 credential 或 provider secret。
 
@@ -172,7 +202,7 @@ Loader 从不将 archive member 解压到文件系统。它执行以下检查：
 
 1. 只允许 `manifest.json` 和 `workspace.json`，拒绝 duplicate 或 extra entry。
 2. JSON deserialize 前限制 manifest 为 64 KiB、workspace 为 64 MiB。
-3. Format v1-v10 的 payload length 与 CRC-32 必须匹配 manifest。
+3. Format v1-v12 的 payload length 与 CRC-32 必须匹配 manifest。
 4. 迁移支持的 document schema。
 5. 重放所有 commit，核对每个 recorded diff、snapshot 和 candidate-state validation evidence。
 6. 对每个 replayed candidate 重新执行当前 core validator；evidence 缺失、版本不匹配、
@@ -191,22 +221,27 @@ Loader 从不将 archive member 解压到文件系统。它执行以下检查：
    transaction 和三层来源完全匹配。
 11. 验证 execution strategy 与审计事件：当前格式必须显式声明 batch/iterative；iterative
    completion、repair feedback、re-observation revision/action index 必须与 checkpoint 一致，
-   历史 revision 的实体计数必须可重算，修复次数不得超过三次。
-12. 验证 compensation audit：target/compensation 双向关联、request revision、active ancestry、
+   历史 revision 的实体计数必须可重算，修复次数不得超过三次；planning budget 必须匹配
+   strategy，累计 action 和 decision 不得超过持久上限。
+12. 验证 task write-revocation ledger：当前格式必须显式保存台账；ChangeSet 和 revision 必须
+   存在，原因非空，记录不得重复，`committed_action_count` 必须等于该 ChangeSet 的最终输出数。
+13. 验证 compensation audit：target/compensation 双向关联、request revision、active ancestry、
    对象基线与最后修改 revision、恢复/冲突全集、补偿 commit parent/source 和最终恢复状态必须
    一致；伪造 `Reverted`、冲突 revision、对象列表或 commit link 都拒绝。
-13. 验证 project identity 和 remote policy：grant 必须绑定当前 project，重放 append-only
+14. 验证 project identity 和 remote policy：grant 必须绑定当前 project，重放 append-only
    grant/revoke ledger 必须精确恢复当前 grant map 与 ID cursor。
-14. 验证 remote-send audit：hash-bound 记录必须引用存在的 source revision，使用支持的 context
+15. 验证 remote-send audit：hash-bound 记录必须引用存在的 source revision，使用支持的 context
    schema，包含非空数据类别、`1..=64 KiB` payload length 和 64 位十六进制 SHA-256；带 grant
    binding 的记录必须同时包含 project ID、grant ID 与发送时间，且该 grant 当时有效并覆盖
-   endpoint/model、数据类别、capability、selection 和 payload bytes。
-15. 验证 active document 等于 active branch head 的 replay 结果。
+   endpoint/model、数据类别、capability、selection 和 payload bytes。Remote iterative Run 还
+   必须为每次 observation 提供一个绑定相同 revision、包含 `ExecutionState` 的 schema-v4 审计。
+16. 验证 active document 等于 active branch head 的 replay 结果。
 
 中断时处于 running 的持久化 task：
 
-- 有 durable pending action 时恢复为 paused checkpoint；
-- 没有 durable plan 时标记 failed，不能含糊地自动恢复。
+- 有 `TaskExecution` 时恢复为 paused checkpoint；这包括 iterative Run 等待下一次 Planner
+  decision 的边界；
+- 尚未建立 durable execution 时标记 failed，不能含糊地自动恢复。
 
 任一步失败都拒绝打开工程。
 
@@ -214,7 +249,7 @@ Format v0 没有 manifest checksum，只能作为 migration source 读取。Form
 早于持久化 branch-local redo state，缺失的 redo map 初始化为空。Format v2 早于本地
 validation evidence；loader 只在读取 v0-v2 时，按完整 replayed candidate 重新生成 evidence。
 Format v3 archive 缺失 evidence 时直接拒绝，不走 legacy regeneration。所有旧格式都必须
-重新保存为 v10；高于当前 reader 的 format version 会被拒绝。
+重新保存为 v12；高于当前 reader 的 format version 会被拒绝。
 
 Format v3 早于 hash-bound remote-send audit。旧 `ProviderDisclosure` 缺失的
 `context_schema_version`、`source_revision`、`data_categories`、`payload_bytes` 和
@@ -254,6 +289,18 @@ Format v9 早于 stable project identity 和 remote policy。Loader 只对 v0-v9
 UUID 和空 grant map/event ledger；旧 remote audit 保留原 schema 与 binding 状态，不会被改写为
 由新 grant 授权。Format v10 缺失 `project_id` 或 `remote_access_policy`、grant 状态与 ledger
 不一致、ID cursor 非连续，或当前 schema v3 audit 的 project/grant binding 无效时直接拒绝。
+
+Format v10 早于显式 planning budget。Loader 只对 v0-v10 填充缺失 budget：batch 使用持久
+action list 的精确长度和一次 decision；iterative 使用旧 core 的 256 action 上限及由固定公式
+推导的 decision 上限。迁移不会依据调用方本次运行参数猜测更小上限，也不会把旧 batch Run
+改写为 iterative。Format v11 缺失 budget、action 上限越界、decision 公式不匹配、累计使用量
+超限，或 schema-v4 remote iterative audit 缺少 `ExecutionState`/逐轮绑定时直接拒绝。
+
+Format v11 早于 task write-authorization revocation ledger。Loader 只对 v0-v11 为每个 Task
+添加空台账，不会推断或伪造旧 archive 中不存在的撤销；旧 format 标记中夹带非空 v12 台账会
+被拒绝。Format v12 缺失台账、记录重复、引用
+不存在的 ChangeSet/revision、原因为空、撤销 ReviewOnly ChangeSet，或撤销记录的 action 数与
+最终 ChangeSet output 不一致时直接拒绝。
 
 ## Save 契约
 

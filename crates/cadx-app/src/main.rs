@@ -15,11 +15,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use app::{CadxApp, ensure_project_extension};
-use cadx_config::{CadxPreferences, UiLanguage, initialize_default_config_if_missing};
+use cadx_config::{CadxPreferences, UiLanguage, initialize_default_files_if_missing};
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
-    let configuration_error = initialize_default_config_if_missing().err();
+    let configuration_error = initialize_default_files_if_missing().err();
     let project_argument = parse_project_argument(std::env::args_os().skip(1));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 920.0]),

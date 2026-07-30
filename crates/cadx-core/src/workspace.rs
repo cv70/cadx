@@ -15,9 +15,9 @@ use crate::task::{
     ChangeSetActionCommit, ChangeSetCompensation, ChangeSetDiagnostic, ChangeSetRevertReport,
     ChangeSetStatus, DesignTask, MAX_AUTOMATIC_REPAIR_ATTEMPTS, MAX_ITERATIVE_ACTIONS_PER_RUN,
     MAX_REMOTE_CONTEXT_BYTES, MIN_HASH_BOUND_REMOTE_CONTEXT_SCHEMA_VERSION, PromptChangeSet,
-    REMOTE_CONTEXT_SCHEMA_VERSION, RevertConflict, RevertConflictReason, StructuredGoal,
-    TaskAction, TaskAuthority, TaskEvent, TaskExecution, TaskExecutionStrategy, TaskPlanningBudget,
-    TaskStatus, ValidationReport,
+    REMOTE_CONTEXT_SCHEMA_VERSION, RemoteDataCategory, RevertConflict, RevertConflictReason,
+    StructuredGoal, TaskAction, TaskAuthority, TaskAuthorizationRevocation, TaskEvent,
+    TaskExecution, TaskExecutionStrategy, TaskPlanningBudget, TaskStatus, ValidationReport,
 };
 use crate::{
     ActionSource, AgentRunId, CommitId, ObjectId, ObjectPrecondition, PrepareError, PreparedAction,
@@ -230,6 +230,50 @@ impl TaskWorkspace {
             .map_err(WorkspaceError::RemotePolicy)
     }
 
+    pub(crate) fn revoke_task_authorization(
+        &mut self,
+        task_id: TaskId,
+        change_set_id: PromptChangeSetId,
+        reason: impl Into<String>,
+    ) -> Result<TaskAuthorizationRevocation, WorkspaceError> {
+        let revoked_at_revision = self.revision();
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(WorkspaceError::InvalidWorkspace(
+                "task authorization revocation reason must not be empty".into(),
+            ));
+        }
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or(WorkspaceError::TaskMissing(task_id))?;
+        let change_set = task
+            .change_sets
+            .iter()
+            .find(|change_set| change_set.id == change_set_id)
+            .ok_or(WorkspaceError::ChangeSetMissing(change_set_id))?;
+        if matches!(change_set.authorization, TaskAuthority::ReviewOnly) {
+            return Err(WorkspaceError::Unauthorized(task_id));
+        }
+        if task.authorization_revocation(change_set_id).is_some() {
+            return Err(WorkspaceError::AuthorizationAlreadyRevoked {
+                task_id,
+                change_set_id,
+            });
+        }
+        let revocation = TaskAuthorizationRevocation {
+            change_set_id,
+            revoked_at_revision,
+            committed_action_count: change_set.output_commits().count(),
+            reason,
+        };
+        self.tasks
+            .get_mut(&task_id)
+            .expect("task and change set checked above")
+            .record_authorization_revocation(revocation.clone());
+        Ok(revocation)
+    }
+
     pub(crate) fn create_task(
         &mut self,
         title: impl Into<String>,
@@ -276,7 +320,9 @@ impl TaskWorkspace {
                     reverted_by: None,
                 }],
                 active_change_set_id: change_set_id,
+                authorization_revocations: Vec::new(),
                 legacy_layout: false,
+                legacy_missing_authorization_revocations: false,
             },
         );
         id
@@ -291,6 +337,7 @@ impl TaskWorkspace {
         task_id: TaskId,
         identity: AgentRunIdentity,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         let entity_count = self.store.document().entities.len();
         let task = self
             .tasks
@@ -357,6 +404,7 @@ impl TaskWorkspace {
     }
 
     pub(crate) fn resume_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         let task = self
             .tasks
             .get(&task_id)
@@ -445,6 +493,7 @@ impl TaskWorkspace {
         base_revision: CommitId,
         actions: Vec<TaskAction>,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         let current_revision = self.revision();
         if !self.store.is_ancestor(base_revision, current_revision)? {
             return Err(WorkspaceError::PreparedBaseNotAncestor {
@@ -528,6 +577,7 @@ impl TaskWorkspace {
         task_id: TaskId,
         revision: CommitId,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         if revision != self.revision() {
             return Err(WorkspaceError::StaleRevision {
                 expected: revision,
@@ -589,6 +639,7 @@ impl TaskWorkspace {
         observed_revision: CommitId,
         action: TaskAction,
     ) -> Result<(), WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         let current_revision = self.revision();
         if !self
             .store
@@ -960,6 +1011,12 @@ impl TaskWorkspace {
         let run = change_set.active_run().ok_or_else(|| {
             WorkspaceError::InvalidWorkspace(format!("task {task_id} does not have an active run"))
         })?;
+        if task.authorization_revocation(change_set.id).is_some() {
+            return Err(WorkspaceError::AuthorizationRevoked {
+                task_id,
+                change_set_id: change_set.id,
+            });
+        }
         if !change_set
             .authorization
             .permits(&transaction, self.store.document())
@@ -1075,6 +1132,23 @@ impl TaskWorkspace {
             WorkspaceError::InvalidWorkspace(format!("task {task_id} does not have an active run"))
         })?;
         Ok(ActionSource::for_run(task_id, change_set.id, run.id))
+    }
+
+    fn ensure_active_task_authorization_not_revoked(
+        &self,
+        task_id: TaskId,
+    ) -> Result<(), WorkspaceError> {
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or(WorkspaceError::TaskMissing(task_id))?;
+        if task.active_authorization_revocation().is_some() {
+            return Err(WorkspaceError::AuthorizationRevoked {
+                task_id,
+                change_set_id: task.active_change_set_id,
+            });
+        }
+        Ok(())
     }
 
     /// Applies a user-initiated edit through the same validated, replayable
@@ -1390,6 +1464,7 @@ impl TaskWorkspace {
         &mut self,
         task_id: TaskId,
     ) -> Result<AgentRunId, WorkspaceError> {
+        self.ensure_active_task_authorization_not_revoked(task_id)?;
         let task = self
             .tasks
             .get(&task_id)
@@ -1772,6 +1847,23 @@ impl TaskWorkspace {
         }
     }
 
+    /// Adds an empty task-authorization revocation ledger to pre-v12 tasks.
+    /// The loader may call this only after verifying an older manifest.
+    pub(crate) fn migrate_legacy_task_authorization_revocations(
+        &mut self,
+    ) -> Result<(), WorkspaceError> {
+        for task in self.tasks.values_mut() {
+            if !task.authorization_revocations().is_empty() {
+                return Err(WorkspaceError::InvalidWorkspace(format!(
+                    "legacy task {} contains a current-format authorization revocation ledger",
+                    task.id
+                )));
+            }
+            task.legacy_missing_authorization_revocations = false;
+        }
+        Ok(())
+    }
+
     fn migrate_to_current_with_legacy_fields(
         &mut self,
         regenerate_validation_evidence: bool,
@@ -1837,6 +1929,11 @@ impl TaskWorkspace {
                     "task {id} still uses the legacy execution layout"
                 )));
             }
+            if task.legacy_missing_authorization_revocations {
+                return Err(WorkspaceError::InvalidWorkspace(format!(
+                    "task {id} is missing its authorization revocation ledger"
+                )));
+            }
             if task.goal.trim().is_empty() || task.change_sets.is_empty() {
                 return Err(WorkspaceError::InvalidWorkspace(format!(
                     "task {id} must have a goal and at least one change set"
@@ -1848,6 +1945,45 @@ impl TaskWorkspace {
                     task.active_change_set_id
                 ))
             })?;
+            let mut revoked_change_sets = BTreeSet::new();
+            for revocation in task.authorization_revocations() {
+                if !revoked_change_sets.insert(revocation.change_set_id) {
+                    return Err(WorkspaceError::InvalidWorkspace(format!(
+                        "task {id} change set {} has duplicate authorization revocations",
+                        revocation.change_set_id
+                    )));
+                }
+                if revocation.reason.trim().is_empty()
+                    || !self
+                        .store
+                        .history()
+                        .commits
+                        .contains_key(&revocation.revoked_at_revision)
+                {
+                    return Err(WorkspaceError::InvalidWorkspace(format!(
+                        "task {id} has an invalid authorization revocation"
+                    )));
+                }
+                let revoked_change_set = task
+                    .change_sets
+                    .iter()
+                    .find(|change_set| change_set.id == revocation.change_set_id)
+                    .ok_or_else(|| {
+                        WorkspaceError::InvalidWorkspace(format!(
+                            "task {id} authorization revocation references missing change set {}",
+                            revocation.change_set_id
+                        ))
+                    })?;
+                if matches!(revoked_change_set.authorization, TaskAuthority::ReviewOnly)
+                    || revoked_change_set.output_commits().count()
+                        != revocation.committed_action_count
+                {
+                    return Err(WorkspaceError::InvalidWorkspace(format!(
+                        "task {id} authorization revocation does not match change set {}",
+                        revocation.change_set_id
+                    )));
+                }
+            }
             for (change_set_index, change_set) in task.change_sets.iter().enumerate() {
                 if change_set.task_id != *id
                     || change_set.id == PromptChangeSetId::MAX
@@ -2423,6 +2559,8 @@ impl TaskWorkspace {
             || model.trim().is_empty()
             || *includes_source_files
             || data_categories.is_empty()
+            || (*context_schema_version >= 4
+                && !data_categories.contains(&RemoteDataCategory::ExecutionState))
             || selected_entity_ids
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
@@ -2791,6 +2929,7 @@ impl TaskWorkspace {
                 let mut pending_observation = None;
                 let mut staged_observation = None;
                 let mut committed_action_count = 0;
+                let mut pending_remote_audit = false;
                 for event in &run.events {
                     match event {
                         TaskEvent::Reobserved {
@@ -2814,6 +2953,26 @@ impl TaskWorkspace {
                                 )));
                             }
                             pending_observation = Some((*revision, *action_index));
+                            pending_remote_audit = false;
+                        }
+                        TaskEvent::ProviderDisclosure {
+                            context_schema_version,
+                            source_revision,
+                            data_categories,
+                            ..
+                        } if run.identity.kind == crate::AgentKind::Remote => {
+                            if pending_remote_audit
+                                || pending_observation
+                                    .is_none_or(|(revision, _)| revision != *source_revision)
+                                || *context_schema_version != REMOTE_CONTEXT_SCHEMA_VERSION
+                                || !data_categories.contains(&RemoteDataCategory::ExecutionState)
+                            {
+                                return Err(WorkspaceError::InvalidWorkspace(format!(
+                                    "agent run {} has an unbound iterative remote-send audit",
+                                    run.id
+                                )));
+                            }
+                            pending_remote_audit = true;
                         }
                         TaskEvent::Planned { action_count } => {
                             let Some(observation) = pending_observation.take() else {
@@ -2828,12 +2987,30 @@ impl TaskWorkspace {
                                     run.id
                                 )));
                             }
+                            if run.identity.kind == crate::AgentKind::Remote
+                                && !pending_remote_audit
+                            {
+                                return Err(WorkspaceError::InvalidWorkspace(format!(
+                                    "agent run {} planned a remote action before its send audit",
+                                    run.id
+                                )));
+                            }
+                            pending_remote_audit = false;
                             staged_observation = Some(observation);
                         }
                         TaskEvent::ActionRejected { feedback, .. } => {
                             let expected = (feedback.observed_revision, feedback.action_index);
                             if pending_observation == Some(expected) {
+                                if run.identity.kind == crate::AgentKind::Remote
+                                    && !pending_remote_audit
+                                {
+                                    return Err(WorkspaceError::InvalidWorkspace(format!(
+                                        "agent run {} rejected a remote decision before its send audit",
+                                        run.id
+                                    )));
+                                }
                                 pending_observation = None;
+                                pending_remote_audit = false;
                             } else if staged_observation == Some(expected) {
                                 staged_observation = None;
                             } else {
@@ -2866,23 +3043,31 @@ impl TaskWorkspace {
                             if pending_observation.take() != Some((*revision, *action_count))
                                 || staged_observation.is_some()
                                 || *action_count != committed_action_count
+                                || (run.identity.kind == crate::AgentKind::Remote
+                                    && !pending_remote_audit)
                             {
                                 return Err(WorkspaceError::InvalidWorkspace(format!(
                                     "agent run {} completed outside its observed decision",
                                     run.id
                                 )));
                             }
+                            pending_remote_audit = false;
                         }
                         TaskEvent::Paused { .. }
                         | TaskEvent::Failed { .. }
-                        | TaskEvent::Cancelled { .. } => pending_observation = None,
+                        | TaskEvent::Cancelled { .. } => {
+                            pending_observation = None;
+                            pending_remote_audit = false;
+                        }
                         _ => {}
                     }
                 }
                 if committed_action_count != run.action_commits.len()
                     || (pending_observation.is_some()
                         && (run.status != AgentRunStatus::Running
-                            || !execution.is_awaiting_planner()))
+                            || !execution.is_awaiting_planner()
+                            || (run.identity.kind == crate::AgentKind::Remote
+                                && !pending_remote_audit)))
                     || (execution.is_awaiting_planner() && staged_observation.is_some())
                     || (execution.remaining_actions() > 0 && staged_observation.is_none())
                 {
@@ -3391,6 +3576,14 @@ pub enum WorkspaceError {
         commit_id: CommitId,
         current: CommitId,
     },
+    AuthorizationRevoked {
+        task_id: TaskId,
+        change_set_id: PromptChangeSetId,
+    },
+    AuthorizationAlreadyRevoked {
+        task_id: TaskId,
+        change_set_id: PromptChangeSetId,
+    },
     Unauthorized(TaskId),
     HistoryNavigationBlocked(TaskId),
     StaleRevision {
@@ -3467,6 +3660,20 @@ impl fmt::Display for WorkspaceError {
             } => write!(
                 formatter,
                 "change set {change_set_id} commit {commit_id} is not an ancestor of active revision {current}"
+            ),
+            Self::AuthorizationRevoked {
+                task_id,
+                change_set_id,
+            } => write!(
+                formatter,
+                "task {task_id} change set {change_set_id} write authorization was revoked"
+            ),
+            Self::AuthorizationAlreadyRevoked {
+                task_id,
+                change_set_id,
+            } => write!(
+                formatter,
+                "task {task_id} change set {change_set_id} write authorization is already revoked"
             ),
             Self::Unauthorized(id) => write!(
                 formatter,

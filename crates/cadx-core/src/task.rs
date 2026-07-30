@@ -554,6 +554,19 @@ pub struct ChangeSetActionCommit {
     pub commit_id: CommitId,
 }
 
+/// Append-only evidence that a previously granted ChangeSet write authority
+/// was withdrawn. The original authorization remains on the ChangeSet so
+/// historical commits can still be audited against the authority in force
+/// when they were admitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAuthorizationRevocation {
+    pub change_set_id: PromptChangeSetId,
+    pub revoked_at_revision: CommitId,
+    pub committed_action_count: usize,
+    pub reason: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionSource {
@@ -687,8 +700,11 @@ pub struct DesignTask {
     pub status: TaskStatus,
     pub change_sets: Vec<PromptChangeSet>,
     pub active_change_set_id: PromptChangeSetId,
+    pub(crate) authorization_revocations: Vec<TaskAuthorizationRevocation>,
     #[serde(skip)]
     pub(crate) legacy_layout: bool,
+    #[serde(skip)]
+    pub(crate) legacy_missing_authorization_revocations: bool,
 }
 
 impl DesignTask {
@@ -732,6 +748,30 @@ impl DesignTask {
             .iter()
             .flat_map(PromptChangeSet::output_commits)
     }
+
+    pub fn authorization_revocations(&self) -> &[TaskAuthorizationRevocation] {
+        &self.authorization_revocations
+    }
+
+    pub fn authorization_revocation(
+        &self,
+        change_set_id: PromptChangeSetId,
+    ) -> Option<&TaskAuthorizationRevocation> {
+        self.authorization_revocations
+            .iter()
+            .find(|revocation| revocation.change_set_id == change_set_id)
+    }
+
+    pub fn active_authorization_revocation(&self) -> Option<&TaskAuthorizationRevocation> {
+        self.authorization_revocation(self.active_change_set_id)
+    }
+
+    pub(crate) fn record_authorization_revocation(
+        &mut self,
+        revocation: TaskAuthorizationRevocation,
+    ) {
+        self.authorization_revocations.push(revocation);
+    }
 }
 
 #[derive(Deserialize)]
@@ -744,6 +784,7 @@ struct CurrentDesignTaskWire {
     status: TaskStatus,
     change_sets: Vec<PromptChangeSet>,
     active_change_set_id: PromptChangeSetId,
+    authorization_revocations: Option<Vec<TaskAuthorizationRevocation>>,
 }
 
 #[derive(Deserialize)]
@@ -783,6 +824,8 @@ impl<'de> Deserialize<'de> for DesignTask {
                 status: task.status,
                 change_sets: task.change_sets,
                 active_change_set_id: task.active_change_set_id,
+                legacy_missing_authorization_revocations: task.authorization_revocations.is_none(),
+                authorization_revocations: task.authorization_revocations.unwrap_or_default(),
                 legacy_layout: false,
             }),
             DesignTaskWire::Legacy(task) => {
@@ -843,7 +886,9 @@ impl<'de> Deserialize<'de> for DesignTask {
                         reverted_by: None,
                     }],
                     active_change_set_id: change_set_id,
+                    authorization_revocations: Vec::new(),
                     legacy_layout: true,
+                    legacy_missing_authorization_revocations: true,
                 })
             }
         }

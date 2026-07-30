@@ -3,18 +3,20 @@
 > 文档类型：操作指南
 > 状态：Implemented
 > 适用范围：Current
-> 权威内容：用户目录、界面偏好、模型 Provider 配置和凭据安全约束
+> 权威内容：用户目录、界面偏好、模型 Provider 配置、出口策略和凭据安全约束
 > 返回：[文档索引](index.md)
 
 CADX 使用 `~/.cadx` 作为用户级工作目录。Provider 设置只从
 `~/.cadx/config.yaml` 读取；endpoint、model、timeout 和 credential
-都不会从环境变量读取。
+都不会从环境变量读取。独立的 `~/.cadx/egress-policy.yaml` 决定哪些
+endpoint/model 可以真正发起网络请求，`config.yaml` 不能自行扩大该范围。
 
 桌面应用首次启动时创建以下目录：
 
 ```text
 ~/.cadx/
   config.yaml
+  egress-policy.yaml
   preferences.yaml
   projects/
 ```
@@ -58,8 +60,37 @@ provider:
 - `timeout_seconds` 缺省为 `45`，取值必须在 `1..=300` 秒。
 - 未知字段会被拒绝，避免拼写错误静默改变行为。
 
-远程 Planner 在展示上下文披露时读取一次配置，并在实际调用前再次读取。
-如果授权后修改 endpoint 或 model，已有项目 grant 不再覆盖新的披露，调用会被拒绝。
+远程 Planner 创建时读取配置，并把该 endpoint/model 绑定到披露、grant 检查和 Run identity。
+下一次创建 Planner 时若 endpoint 或 model 已修改，已有项目 grant 不再覆盖新的披露，调用会被拒绝。
+
+## Provider 出口策略
+
+`egress-policy.yaml` 是独立、默认拒绝的本机网络出口边界。首次启动生成的模板只允许默认
+OpenAI endpoint 和默认 model：
+
+```yaml
+version: 1
+
+allowed_providers:
+  - endpoint: "https://api.openai.com/v1"
+    models:
+      - "gpt-5.6-luna"
+```
+
+每条授权是精确的 endpoint/model 元组，不支持 host、path 或 model 通配符。空的
+`allowed_providers: []` 会拒绝所有远程请求。若使用其他 Provider 或 model，必须分别修改
+`config.yaml` 和 `egress-policy.yaml`；只修改前者不会获得联网权限。
+
+比较前会规范化 scheme、DNS host 大小写、默认端口和末尾 `/`，因此
+`https://EXAMPLE.com:443/v1/` 与 `https://example.com/v1` 等价。scheme、非默认端口和路径
+仍精确绑定。endpoint 必须使用 HTTPS；只有 `localhost`、`127.0.0.1` 和 `::1` 可以使用
+HTTP。userinfo、query、fragment、百分号编码路径、控制字符、空 model、model 首尾空白、
+重复规则、未知字段和未知版本均被拒绝。策略最多 64 KiB、128 个 endpoint/model 元组。
+
+TaskAgent 在生成持久发送审计前检查一次策略，消耗一次性发送轮次前再检查一次；真实 GenAI
+adapter 在 HTTP 入口还会重新加载并检查。因此策略删除、变为无效或撤销规则后，已存在的
+项目 grant 也不能继续发送。若策略恰在审计之后变化，本轮会合法终结为失败，但不会调用
+Provider；下一轮不会复用该审计。
 
 项目授权不是笼统的“允许联网”。每个持久 grant 精确绑定 project ID、endpoint/model、允许的
 数据类别与 capability、project summary 或 selected entity ID 范围、payload 上限、创建时间、
@@ -72,16 +103,25 @@ provider:
 capability、selected object ID、source revision、数据类别、payload bytes、payload SHA-256 和
 发送时间。实际发送的 `RemoteContext` 最大 64 KiB，最多包含 1024 个 selected entity ID，
 固定类别为 task goal、document metadata/statistics、selection identifiers 和 granted
-capabilities。当前不发送 geometry、attachment 或 source file。当前生成 context schema v3，
-其中包含稳定 project ID；迁移工程中的旧 schema audit 只按其原始版本保留验证，不能代替
-当前 grant。Desktop 先在主 workspace 中把同一披露作为 `.cadx` format v10 run event 持久化，
-再通过线程握手允许后台 worker 调用 Provider；完整 payload 和响应 transcript 不进入工程。
+capabilities，以及 execution state。Execution state 包含当前 action index、持久化 action/decision
+总预算及剩余额度，并在存在可修复失败时包含结构化反馈。当前不发送 geometry、attachment 或
+source file。
+
+当前生成 context schema v4，其中包含稳定 project ID 和上述 execution state。远程执行严格按
+轮进行：主线程重新观察当前 revision、重新检查 grant，并先把相同 payload 的 hash-bound
+`ProviderDisclosure` 写入 `.cadx` format v12 run event；随后一次性授权对象才允许后台 worker
+调用 Provider。Provider 每轮只能返回一个 `action` 或 `complete` decision；action 在主线程
+基于被观察的 snapshot 转换为本地 typed transaction，经本地权限、对象前置条件和 validator
+后提交，下一轮再重新观察。可修复 rejection 会进入下一轮 payload。完整 payload、Provider
+响应 transcript 和 credential 不进入工程。迁移工程中的旧 schema audit 只按其原始版本保留
+验证，不能代替当前 grant 或当前逐轮审计。
 
 ## 文件与凭据安全
 
 在 Unix 上，CADX 使用 `0700` 创建 `~/.cadx` 和 `~/.cadx/projects`，
-使用 `0600` 创建 `config.yaml` 和 `preferences.yaml`。应用拒绝这两个配置文件的符号
-链接，以及 group 或 other 可访问的配置文件和目录。偏好更新使用同目录私有临时文件、
+使用 `0600` 创建 `config.yaml`、`egress-policy.yaml` 和 `preferences.yaml`。应用拒绝这些
+文件的符号链接、非普通文件，以及 group 或 other 可访问的配置文件和目录。读取时还会比较
+检查对象与实际打开文件的 identity，拒绝检查期间发生的路径替换。偏好更新使用同目录私有临时文件、
 flush、原子 rename 和 parent-directory sync。
 
 API key 在 `Debug` 输出中始终脱敏，并且不得进入：
@@ -92,5 +132,6 @@ API key 在 `Debug` 输出中始终脱敏，并且不得进入：
 - endpoint URL；
 - 状态栏、普通日志或崩溃报告。
 
-企业 endpoint allowlist、组织级策略下发和操作系统 credential store 尚未实现。当前配置文件
-与项目 grant 边界是已实现行为，目标上下文授权模型见[目标架构](design.md)。
+当前已实现本机强制 endpoint/model allowlist；它不是带签名的组织策略，拥有当前 OS 用户权限的
+操作者仍可修改该文件。组织级签名策略下发、集中策略管理和操作系统 credential store 尚未实现。
+当前配置、出口策略与项目 grant 边界见[目标架构](design.md)。

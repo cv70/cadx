@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fs;
 
 use cadx_core::{
     CadCommand, CadDocument, Capability, CommandTransaction, Entity, EntityKind, Layer, Point2,
@@ -107,12 +108,8 @@ fn remote_json_is_materialized_as_a_local_typed_transaction() {
     )
     .unwrap();
     let document = CadDocument::new("Remote plan");
-    let PlanningDecision::Action(action) = materialize_decision(
-        decision,
-        &document,
-        &BTreeSet::from([Capability::Drafting]),
-    )
-    .unwrap()
+    let PlanningDecision::Action(action) =
+        materialize_decision(decision, &document, &BTreeSet::from([Capability::Drafting])).unwrap()
     else {
         panic!("expected one remote action");
     };
@@ -165,12 +162,8 @@ fn remote_plan_materialization_avoids_hidden_and_locked_layers() {
     )
     .unwrap();
 
-    let PlanningDecision::Action(action) = materialize_decision(
-        decision,
-        &document,
-        &BTreeSet::from([Capability::Drafting]),
-    )
-    .unwrap()
+    let PlanningDecision::Action(action) =
+        materialize_decision(decision, &document, &BTreeSet::from([Capability::Drafting])).unwrap()
     else {
         panic!("expected one remote action");
     };
@@ -352,4 +345,47 @@ fn planner_debug_output_redacts_the_configured_key() {
     let planner = GenAiRemotePlanner::new(config(), "test-provider-key").unwrap();
 
     assert!(!format!("{planner:?}").contains("test-provider-key"));
+}
+
+#[test]
+fn planner_enforces_egress_policy_before_attempting_a_network_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let policy_path = directory.path().join("egress-policy.yaml");
+    fs::write(&policy_path, b"version: 1\nallowed_providers: []\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let planner = GenAiRemotePlanner::new_with_egress_policy(
+        config(),
+        "test-provider-key",
+        EgressPolicyEnforcer::at(&policy_path),
+    )
+    .unwrap();
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Denied remote context"));
+    let task_id = workspace.kernel().create_task(
+        "Draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let observation = AgentObservation {
+        task: workspace.task(task_id).unwrap().clone(),
+        snapshot: workspace.snapshot(),
+    };
+    let (context, _) = prepare_remote_context(
+        config(),
+        RemoteContextRequest::default(),
+        workspace.project_id(),
+        &observation,
+    )
+    .unwrap();
+
+    let error = match planner.plan_remote(context) {
+        Ok(_) => panic!("denied egress unexpectedly attempted a provider request"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, AgentError::Provider(message) if message.contains("egress denied")));
 }

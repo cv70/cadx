@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CadDocument, CheckResult, CheckStatus, ConstraintSolverSettings, ValidationReport,
+    CadDocument, CheckResult, CheckStatus, ConstraintSolverSettings, PackLock, ValidationReport,
     solve_constraints,
 };
 
@@ -24,6 +24,8 @@ const STATE_HASH_DOMAIN: &[u8] = b"CADX-CANDIDATE-STATE\0canonical-json-v1\0";
 pub struct ValidationEvidence {
     validator_id: String,
     validator_version: u32,
+    #[serde(default)]
+    pack_lock_hash: [u8; 32],
     candidate_state_hash: [u8; 32],
     report: ValidationReport,
 }
@@ -41,12 +43,16 @@ impl ValidationEvidence {
         self.candidate_state_hash
     }
 
+    pub const fn pack_lock_hash(&self) -> [u8; 32] {
+        self.pack_lock_hash
+    }
+
+    pub fn pack_lock_hash_hex(&self) -> String {
+        encode_hash(self.pack_lock_hash)
+    }
+
     pub fn candidate_state_hash_hex(&self) -> String {
-        let mut encoded = String::with_capacity(self.candidate_state_hash.len() * 2);
-        for byte in self.candidate_state_hash {
-            write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        encoded
+        encode_hash(self.candidate_state_hash)
     }
 
     pub fn checks(&self) -> &[CheckResult] {
@@ -80,11 +86,14 @@ impl ValidationEvidence {
     }
 
     pub(crate) fn is_current(&self) -> bool {
-        self.validator_id == CORE_VALIDATOR_ID && self.validator_version == CORE_VALIDATOR_VERSION
+        self.validator_id == CORE_VALIDATOR_ID
+            && self.validator_version == CORE_VALIDATOR_VERSION
+            && self.pack_lock_hash == PackLock::current().hash()
     }
 }
 
 pub(crate) fn validate_candidate(document: &CadDocument) -> Result<ValidationEvidence, String> {
+    let pack_lock_hash = PackLock::current().hash();
     let mut hasher = Sha256::new();
     hasher.update(STATE_HASH_DOMAIN);
     let mut writer = BoundedHashWriter {
@@ -119,6 +128,7 @@ pub(crate) fn validate_candidate(document: &CadDocument) -> Result<ValidationEvi
             return Ok(ValidationEvidence {
                 validator_id: CORE_VALIDATOR_ID.into(),
                 validator_version: CORE_VALIDATOR_VERSION,
+                pack_lock_hash,
                 candidate_state_hash,
                 report: ValidationReport { checks },
             });
@@ -163,9 +173,18 @@ pub(crate) fn validate_candidate(document: &CadDocument) -> Result<ValidationEvi
     Ok(ValidationEvidence {
         validator_id: CORE_VALIDATOR_ID.into(),
         validator_version: CORE_VALIDATOR_VERSION,
+        pack_lock_hash,
         candidate_state_hash,
         report: ValidationReport { checks },
     })
+}
+
+fn encode_hash(hash: [u8; 32]) -> String {
+    let mut encoded = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
 }
 
 struct BoundedHashWriter {

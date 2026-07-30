@@ -1,7 +1,7 @@
 use cadx_config::UiLanguage;
 use cadx_core::{
     AgentKind, ChangeSetStatus, DocumentDiff, EntityKind, HistoryComparison, ObjectId,
-    RevertConflict, RevertConflictReason, TaskStatus, Units,
+    RevertConflict, RevertConflictReason, TaskAuthority, TaskStatus, Units,
 };
 use eframe::egui::{self, Color32};
 
@@ -161,6 +161,15 @@ impl CadxApp {
                         .small()
                         .color(Color32::GRAY),
                     );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}: {}",
+                            language.text("Egress policy", "出口策略"),
+                            self.remote_egress_policy_path
+                        ))
+                        .small()
+                        .color(Color32::GRAY),
+                    );
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
@@ -309,6 +318,24 @@ impl CadxApp {
                         TaskStatus::Queued | TaskStatus::Running | TaskStatus::Paused
                     )
                 });
+                let active_authorization_revocation = self
+                    .active_task
+                    .and_then(|task_id| self.workspace.task(task_id))
+                    .and_then(cadx_core::DesignTask::active_authorization_revocation)
+                    .cloned();
+                let can_revoke_task_authorization = self
+                    .active_task
+                    .and_then(|task_id| self.workspace.task(task_id))
+                    .is_some_and(|task| {
+                        matches!(
+                            task.active_change_set().map(|change_set| &change_set.authorization),
+                            Some(TaskAuthority::DirectWrite { .. })
+                        ) && task.active_authorization_revocation().is_none()
+                            && matches!(
+                                task.status,
+                                TaskStatus::Queued | TaskStatus::Running | TaskStatus::Paused
+                            )
+                    });
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -370,7 +397,40 @@ impl CadxApp {
                     {
                         self.cancel_active_task();
                     }
+                    if ui
+                        .add_enabled(
+                            can_revoke_task_authorization,
+                            egui::Button::new(
+                                language.text("Revoke write access", "撤销写权限"),
+                            ),
+                        )
+                        .on_hover_text(language.text(
+                            "Immediately block further model commits from this Prompt",
+                            "立即阻止此 Prompt 继续提交模型更改",
+                        ))
+                        .clicked()
+                    {
+                        self.revoke_active_task_authorization();
+                    }
                 });
+                if let Some(revocation) = active_authorization_revocation {
+                    ui.label(
+                        egui::RichText::new(match language {
+                            UiLanguage::English => format!(
+                                "Write access revoked at revision {} after {} action(s)",
+                                revocation.revoked_at_revision,
+                                revocation.committed_action_count
+                            ),
+                            UiLanguage::SimplifiedChinese => format!(
+                                "写权限已在版本 {} 撤销，此前提交 {} 个 action",
+                                revocation.revoked_at_revision,
+                                revocation.committed_action_count
+                            ),
+                        })
+                        .small()
+                        .color(Color32::from_rgb(235, 170, 96)),
+                    );
+                }
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
@@ -1243,9 +1303,17 @@ fn remote_payload_summary(
     let context = &disclosure.context;
     match language {
         UiLanguage::English => format!(
-            "Task goal and document metadata; entity count: {}; {} selected entity identifier(s); geometry, attachments, and source files: {}.",
+            "Task goal, document metadata, and execution state; entity count: {}; {} selected identifier(s); {} committed action(s), {} action slot(s) and {} decision(s) remain; failure feedback: {}; geometry, attachments, and source files: {}.",
             context.entity_count,
             context.selected_entity_ids.len(),
+            context.action_index,
+            context.remaining_action_budget,
+            context.remaining_decision_budget,
+            if context.includes_failure_feedback {
+                "included"
+            } else {
+                "not included"
+            },
             if context.includes_source_files {
                 "included"
             } else {
@@ -1253,9 +1321,17 @@ fn remote_payload_summary(
             }
         ),
         UiLanguage::SimplifiedChinese => format!(
-            "任务目标和文档元数据；仅发送实体数量 {}；{} 个已选择实体标识；几何、附件和源文件：{}。",
+            "任务目标、文档元数据和执行状态；仅发送实体数量 {}；{} 个已选择实体标识；已提交 {} 个动作，剩余 {} 个动作名额和 {} 次决策；失败反馈：{}；几何、附件和源文件：{}。",
             context.entity_count,
             context.selected_entity_ids.len(),
+            context.action_index,
+            context.remaining_action_budget,
+            context.remaining_decision_budget,
+            if context.includes_failure_feedback {
+                "已包含"
+            } else {
+                "未包含"
+            },
             if context.includes_source_files {
                 "已包含"
             } else {

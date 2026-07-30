@@ -14,10 +14,11 @@ CADX 当前使用 Rust `1.95` 和 Rust 2024 Edition。仓库中的
 修改工程契约前，运行完整验证：
 
 ```sh
-cargo fmt --check
-cargo test --workspace
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --workspace --release
+git diff --check
 ```
 
 CI 在 Ubuntu、macOS 和 Windows 上运行这些门禁。原生窗口、字体和 GPU driver
@@ -35,23 +36,35 @@ CI 在 Ubuntu、macOS 和 Windows 上运行这些门禁。原生窗口、字体�
   transaction；导出只读取 immutable document，报告语义损失并原子替换目标文件。
 - provider credential 不得进入源码、endpoint URL、task event、history、native
   project、普通日志或状态文本。
+- 真实 provider 网络调用必须同时通过独立 `egress-policy.yaml` 和项目 grant；策略必须在
+  remote-send audit 前检查，并在实际 HTTP 入口动态重检。不得从 `config.yaml`、环境变量或
+  已缓存的策略结果推导出口授权。
 - authorization、recovery、persistence、interchange、geometry 或 provider 行为变化时，
   必须增加聚焦的回归测试。
 - recovery 写入不得阻塞 UI thread；退出前必须等待正在进行的 writer，primary save
   成功前不得删除 sidecar。
 - remote provider 调用不得阻塞 UI thread；主线程必须先验证未过期且未撤销的 project grant，
   并持久化绑定当前 payload、project/grant 和发送时间的 hash-bound remote-send audit，后台
-  收到启动确认后才能操作 workspace clone 和调用 Provider。Worker
-  workspace 不得直接安装；主线程只能通过 `KernelFacade` 重放目标 task 的 typed plan，
-  保留无关 commit、拒绝对象冲突，并在 base/task 真正过期时丢弃结果。
+  worker 只能消费一次性授权轮次并返回一个 opaque decision，不能持有或返回 workspace。
+  主线程只能基于审计绑定的 snapshot 本地 materialize，并通过 `KernelFacade` stage、验证和
+  commit；保留无关 commit、拒绝对象冲突，并在目标 task 已变化时丢弃结果。
 - project grant 或 remote-send audit 的 wire 变更必须提升 native format，并覆盖 grant ledger
   重放、到期/撤销、跨 revision 重授权、provider 调用前拒绝和审计绑定篡改测试。
+- egress policy schema、URL canonicalization 或 Provider adapter 变化必须覆盖默认拒绝、
+  endpoint/model/path/port 精确绑定、未知字段、大小、权限、符号链接、热撤销及审计前拒绝。
 - Task action commit 必须同时绑定 task、PromptChangeSet 和 AgentRun；pause/resume 不得创建新
   Run，只有显式 retry 可以创建下一 attempt。任何 wire 变更都必须覆盖旧层级迁移、ID/active
   binding、action 顺序和 commit ownership 篡改拒绝。
+- ChangeSet write revocation 必须保留原授权快照并由独立台账派生当前有效性；发送前、恢复、
+  retry、stage 和最终 commit gate 都不得复用已撤销授权。测试必须覆盖 in-flight remote output、
+  已提交 action 保留、旧格式空台账迁移和当前格式台账篡改拒绝。
 - 本地 iterative Planner 每个 decision 最多返回一个 action；成功提交后必须重新观察。可修复
   failure 必须持久化结构化反馈且最多自动修复三次，测试必须覆盖 revision 序列、上限耗尽、
   同对象人工并发、暂停恢复和 execution strategy 篡改拒绝。
+- 远程 iterative Planner 每次 `Reobserved` 后必须恰有一个当前 schema 的
+  `ProviderDisclosure`，随后才能消费一个 `action` 或 `complete` decision；Provider 调用数必须
+  与审计数一致。测试必须覆盖逐轮 source revision/hash、失败反馈 payload、删除审计、跨轮持久
+  budget，以及每轮重新授权。
 - ChangeSet 回滚必须追加补偿而不是移动 branch head；后续修改对象必须保留并进入冲突报告。
   测试必须覆盖无冲突、部分冲突、全部冲突、旧格式迁移和补偿审计篡改拒绝。
 - `Current` 文档必须与代码同步；目标设计只能写入 `Target` 文档或 ADR，不能伪装成

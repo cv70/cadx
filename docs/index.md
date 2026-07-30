@@ -20,7 +20,7 @@ persistence 和受限 Agent runtime 的可运行纵切。
 
 ### 操作与开发
 
-- [配置](configuration.md)：用户目录、Provider YAML 和凭据约束。
+- [配置](configuration.md)：用户目录、Provider YAML、出口策略和凭据约束。
 - [开发指南](development.md)：构建、测试、变更规则和发布门禁。
 
 ### 当前格式与交换契约

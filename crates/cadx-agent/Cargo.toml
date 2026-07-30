@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cadx-config = { path = "../cadx-config" }
 cadx-core = { path = "../cadx-core" }
 serde.workspace = true
 serde_json.workspace = true
@@ -12,6 +13,9 @@ url.workspace = true
 genai.workspace = true
 tokio.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

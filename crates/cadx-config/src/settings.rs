@@ -1,14 +1,12 @@
 use std::fmt;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
-use url::Url;
-
 use crate::ConfigError;
-use crate::paths::{ensure_default_working_directory, validate_private_config_file};
+use crate::egress::{canonicalize_model, canonicalize_provider_endpoint};
+use crate::paths::{ensure_default_working_directory, open_private_config_file};
+use serde::Deserialize;
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -101,29 +99,8 @@ impl ProviderSettings {
                 "provider timeout_seconds must be between 1 and 300",
             ));
         }
-        let endpoint = Url::parse(&self.endpoint).map_err(|_| {
-            ConfigError::InvalidProvider("provider endpoint must be an absolute URL")
-        })?;
-        if endpoint.host_str().is_none() {
-            return Err(ConfigError::InvalidProvider(
-                "provider endpoint must include a host",
-            ));
-        }
-        if !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(ConfigError::InvalidProvider(
-                "provider endpoint must not contain credentials or query data",
-            ));
-        }
-        let local_http = matches!(endpoint.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && local_http) {
-            return Err(ConfigError::InvalidProvider(
-                "provider endpoint must use HTTPS, except for a loopback HTTP endpoint",
-            ));
-        }
+        canonicalize_provider_endpoint(&self.endpoint).map_err(ConfigError::InvalidProvider)?;
+        canonicalize_model(&self.model).map_err(ConfigError::InvalidProvider)?;
         Ok(())
     }
 }
@@ -133,8 +110,7 @@ fn default_provider_timeout_seconds() -> u64 {
 }
 
 fn load_config(path: &Path) -> Result<CadxConfig, ConfigError> {
-    validate_private_config_file(path)?;
-    let metadata = std::fs::metadata(path).map_err(|error| ConfigError::io(path, error))?;
+    let (mut file, metadata) = open_private_config_file(path)?;
     if metadata.len() > MAX_CONFIG_BYTES {
         return Err(ConfigError::ConfigTooLarge {
             path: path.into(),
@@ -142,8 +118,7 @@ fn load_config(path: &Path) -> Result<CadxConfig, ConfigError> {
         });
     }
     let mut contents = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)
-        .map_err(|error| ConfigError::io(path, error))?
+    file.by_ref()
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut contents)
         .map_err(|error| ConfigError::io(path, error))?;

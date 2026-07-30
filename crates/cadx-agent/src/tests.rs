@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use cadx_core::{
@@ -508,7 +508,9 @@ fn stale_action_is_replanned_from_the_new_revision_without_losing_human_geometry
 struct RecordedRemotePlanner {
     config: ProviderConfig,
     action_count: usize,
+    egress_allowed: Arc<AtomicBool>,
     plan_calls: Arc<AtomicUsize>,
+    payloads: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl RemoteTaskPlanner for RecordedRemotePlanner {
@@ -516,12 +518,18 @@ impl RemoteTaskPlanner for RecordedRemotePlanner {
         &self.config
     }
 
-    fn plan_remote(
-        &self,
-        context: RemoteContext,
-    ) -> Result<RemotePlanningDecision, AgentError> {
+    fn authorize_egress(&self) -> Result<(), AgentError> {
+        if self.egress_allowed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(AgentError::Provider("test egress policy denied".into()))
+        }
+    }
+
+    fn plan_remote(&self, context: RemoteContext) -> Result<RemotePlanningDecision, AgentError> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         let payload = serde_json::from_str::<serde_json::Value>(context.payload_json()).unwrap();
+        self.payloads.lock().unwrap().push(payload.clone());
         let action_index = payload["execution"]["action_index"].as_u64().unwrap() as usize;
         let decision = if action_index < self.action_count {
             serde_json::json!({
@@ -556,7 +564,9 @@ fn recorded_remote_planner(action_count: usize) -> RecordedRemotePlanner {
             enabled_capabilities: BTreeSet::from([Capability::Drafting]),
         },
         action_count,
+        egress_allowed: Arc::new(AtomicBool::new(true)),
         plan_calls: Arc::new(AtomicUsize::new(0)),
+        payloads: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
@@ -577,6 +587,189 @@ fn remote_disclosure_preflight_is_side_effect_free_and_does_not_call_the_provide
     assert_eq!(disclosure.project_id, workspace.project_id());
     assert_eq!(workspace, before);
     assert_eq!(workspace.tasks()[&task_id].status, TaskStatus::Queued);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn egress_revocation_rejects_a_round_before_audit_and_provider_call() {
+    let planner = recorded_remote_planner(1);
+    let allowed = Arc::clone(&planner.egress_allowed);
+    let calls = Arc::clone(&planner.plan_calls);
+    let agent = TaskAgent::new(planner);
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Egress pre-audit gate"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    let before = workspace.clone();
+    allowed.store(false, Ordering::SeqCst);
+
+    let error = agent
+        .prepare_authorized_remote_round(
+            &mut workspace,
+            task_id,
+            grant_id,
+            101,
+            ExecutionBudget::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AgentError::Provider("test egress policy denied".into())
+    );
+    assert_eq!(workspace, before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn task_authorization_revocation_blocks_remote_round_before_audit_and_provider_call() {
+    let planner = recorded_remote_planner(1);
+    let calls = Arc::clone(&planner.plan_calls);
+    let agent = TaskAgent::new(planner);
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Task authorization gate"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let change_set_id = workspace.tasks()[&task_id].active_change_set_id;
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Operator revoked model writes")
+        .unwrap();
+
+    let error = agent
+        .prepare_authorized_remote_round(
+            &mut workspace,
+            task_id,
+            grant_id,
+            101,
+            ExecutionBudget::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AgentError::Workspace(WorkspaceError::AuthorizationRevoked {
+            task_id,
+            change_set_id,
+        })
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(workspace.tasks()[&task_id].status, TaskStatus::Queued);
+    assert!(
+        workspace.tasks()[&task_id]
+            .events()
+            .iter()
+            .all(|event| !matches!(event, TaskEvent::ProviderDisclosure { .. }))
+    );
+    workspace.validate_integrity().unwrap();
+}
+
+#[test]
+fn task_authorization_revocation_blocks_an_already_audited_remote_output() {
+    let planner = recorded_remote_planner(1);
+    let calls = Arc::clone(&planner.plan_calls);
+    let agent = TaskAgent::new(planner);
+    let mut workspace = TaskWorkspace::new(CadDocument::new("In-flight task authorization"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let change_set_id = workspace.tasks()[&task_id].active_change_set_id;
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    let round = agent
+        .prepare_authorized_remote_round(
+            &mut workspace,
+            task_id,
+            grant_id,
+            101,
+            ExecutionBudget::default(),
+        )
+        .unwrap();
+    workspace
+        .kernel()
+        .revoke_task_authorization(task_id, change_set_id, "Operator revoked model writes")
+        .unwrap();
+
+    let output = agent.plan_authorized_remote_round(round).unwrap();
+    let error = agent
+        .apply_remote_round_output(&mut workspace, output)
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AgentError::Workspace(WorkspaceError::AuthorizationRevoked {
+            task_id,
+            change_set_id,
+        })
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(workspace.document().entities.is_empty());
+    assert!(
+        workspace
+            .history()
+            .commits
+            .keys()
+            .all(|commit_id| *commit_id == 0)
+    );
+    workspace
+        .kernel()
+        .fail_task(task_id, error.to_string())
+        .unwrap();
+    workspace.validate_integrity().unwrap();
+}
+
+#[test]
+fn egress_revocation_after_audit_still_blocks_the_provider_call() {
+    let planner = recorded_remote_planner(1);
+    let allowed = Arc::clone(&planner.egress_allowed);
+    let calls = Arc::clone(&planner.plan_calls);
+    let agent = TaskAgent::new(planner);
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Egress send gate"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    let round = agent
+        .prepare_authorized_remote_round(
+            &mut workspace,
+            task_id,
+            grant_id,
+            101,
+            ExecutionBudget::default(),
+        )
+        .unwrap();
+    allowed.store(false, Ordering::SeqCst);
+
+    let error = match agent.plan_authorized_remote_round(round) {
+        Ok(_) => panic!("revoked egress unexpectedly reached the provider"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        AgentError::Provider("test egress policy denied".into())
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -863,7 +1056,9 @@ fn project_grant_is_bound_to_the_approved_provider_endpoint_and_model() {
         let planner = RecordedRemotePlanner {
             config,
             action_count: 1,
+            egress_allowed: Arc::new(AtomicBool::new(true)),
             plan_calls: Arc::new(AtomicUsize::new(0)),
+            payloads: Arc::new(Mutex::new(Vec::new())),
         };
         let calls = Arc::clone(&planner.plan_calls);
         let agent = TaskAgent::new(planner);
@@ -981,6 +1176,155 @@ fn granted_remote_plan_is_audited_and_still_uses_local_transactions() {
 }
 
 #[test]
+fn every_remote_decision_is_reobserved_audited_and_receives_latest_feedback() {
+    let planner = recorded_remote_planner(1);
+    let calls = Arc::clone(&planner.plan_calls);
+    let payloads = Arc::clone(&planner.payloads);
+    let agent = TaskAgent::new(planner);
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Remote round contract"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create one drafting entity",
+        TaskAuthority::all_direct(),
+    );
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    let budget = ExecutionBudget::default();
+
+    let first_round = agent
+        .prepare_authorized_remote_round(&mut workspace, task_id, grant_id, 101, budget)
+        .unwrap();
+    let first_output = agent.plan_authorized_remote_round(first_round).unwrap();
+    let revision = workspace.revision();
+    workspace
+        .kernel()
+        .apply_user_transaction(
+            revision,
+            "Human creates the observed entity ID",
+            CommandTransaction::new(vec![CadCommand::CreateEntity {
+                entity: entity(
+                    1,
+                    "Human line",
+                    EntityKind::Line {
+                        start: Point2::new(0.0, 0.0),
+                        end: Point2::new(10.0, 0.0),
+                    },
+                ),
+            }]),
+            ValidationReport::default(),
+        )
+        .unwrap();
+    let RemoteRoundApply::ActionRejected { feedback } = agent
+        .apply_remote_round_output(&mut workspace, first_output)
+        .unwrap()
+    else {
+        panic!("the stale first-round action must be rejected");
+    };
+    assert_eq!(feedback.kind, ActionFailureKind::StaleObservation);
+    assert_eq!(feedback.observed_revision, 0);
+
+    let report = agent
+        .run_remote_with_grant(&mut workspace, task_id, grant_id, 102, budget)
+        .unwrap();
+
+    assert_eq!(report.status, TaskStatus::Completed);
+    assert_eq!(report.commit_ids.len(), 1);
+    assert_eq!(workspace.document().entities.len(), 2);
+    let audits = workspace.tasks()[&task_id]
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            TaskEvent::ProviderDisclosure {
+                source_revision,
+                payload_hash,
+                ..
+            } => Some((*source_revision, payload_hash.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(audits.len(), calls.load(Ordering::SeqCst));
+    assert_eq!(
+        audits
+            .iter()
+            .map(|(revision, _)| *revision)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        audits
+            .iter()
+            .map(|(_, hash)| hash)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3
+    );
+    let payloads = payloads.lock().unwrap();
+    assert_eq!(payloads.len(), audits.len());
+    assert_eq!(payloads[0]["execution"]["action_index"], 0);
+    assert!(payloads[0]["execution"]["last_failure"].is_null());
+    assert_eq!(payloads[1]["source_revision"], 1);
+    assert_eq!(
+        payloads[1]["execution"]["last_failure"]["kind"],
+        "stale_observation"
+    );
+    assert_eq!(
+        payloads[1]["execution"]["last_failure"]["repair_attempt"],
+        1
+    );
+    assert_eq!(payloads[2]["source_revision"], 2);
+    assert_eq!(payloads[2]["execution"]["action_index"], 1);
+    assert!(payloads[2]["execution"]["last_failure"].is_null());
+    workspace.validate_integrity().unwrap();
+}
+
+#[test]
+fn missing_iterative_remote_send_audit_is_rejected_by_workspace_integrity() {
+    let agent = TaskAgent::new(recorded_remote_planner(1));
+    let mut workspace = TaskWorkspace::new(CadDocument::new("Missing round audit"));
+    let task_id = workspace.kernel().create_task(
+        "Remote draft",
+        "Create a drafting concept",
+        TaskAuthority::all_direct(),
+    );
+    let disclosure = agent.remote_disclosure(&workspace, task_id).unwrap();
+    let grant_id = agent
+        .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
+        .unwrap();
+    agent
+        .run_remote_with_grant(
+            &mut workspace,
+            task_id,
+            grant_id,
+            101,
+            ExecutionBudget::default(),
+        )
+        .unwrap();
+    let mut serialized = serde_json::to_value(&workspace).unwrap();
+    let events = serialized["tasks"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap()["change_sets"][0]["runs"][0]["events"]
+        .as_array_mut()
+        .unwrap();
+    let audit_index = events
+        .iter()
+        .position(|event| event.get("ProviderDisclosure").is_some())
+        .unwrap();
+    events.remove(audit_index);
+    let workspace = serde_json::from_value::<TaskWorkspace>(serialized).unwrap();
+
+    assert!(matches!(
+        workspace.validate_integrity(),
+        Err(WorkspaceError::InvalidWorkspace(_))
+    ));
+}
+
+#[test]
 fn tampered_remote_send_audit_is_rejected_by_workspace_integrity() {
     let agent = TaskAgent::new(recorded_remote_planner(1));
     let mut workspace = TaskWorkspace::new(CadDocument::new("Audit integrity"));
@@ -1044,7 +1388,7 @@ fn persisted_remote_action_budget_blocks_later_rounds_without_being_widened() {
         .create_remote_access_grant(&mut workspace, task_id, &disclosure, 100, None)
         .unwrap();
 
-    let error = agent
+    let first = agent
         .run_remote_with_grant(
             &mut workspace,
             task_id,
@@ -1053,6 +1397,22 @@ fn persisted_remote_action_budget_blocks_later_rounds_without_being_widened() {
             ExecutionBudget {
                 max_planned_actions: 1,
                 max_actions_per_run: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.status, TaskStatus::Paused);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(workspace.document().entities.len(), 1);
+
+    let error = agent
+        .run_remote_with_grant(
+            &mut workspace,
+            task_id,
+            grant_id,
+            102,
+            ExecutionBudget {
+                max_planned_actions: 16,
+                max_actions_per_run: 8,
             },
         )
         .unwrap_err();
