@@ -1,0 +1,31 @@
+[package]
+name = "cadx-desktop"
+description = "Native egui desktop adapter and composition root for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cadx"
+path = "src/main.rs"
+
+[dependencies]
+cadx-app.workspace = true
+cadx-analysis.workspace = true
+cadx-ai.workspace = true
+cadx-config.workspace = true
+cadx-core.workspace = true
+cadx-io.workspace = true
+cadx-i18n.workspace = true
+cadx-kernel-truck.workspace = true
+cadx-render.workspace = true
+eframe.workspace = true
+egui.workspace = true
+iconflow.workspace = true
+rfd.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

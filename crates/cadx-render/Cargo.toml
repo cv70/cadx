@@ -1,0 +1,18 @@
+[package]
+name = "cadx-render"
+description = "egui and wgpu 3D viewport renderer for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-core.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+glam.workspace = true
+
+[lints]
+workspace = true

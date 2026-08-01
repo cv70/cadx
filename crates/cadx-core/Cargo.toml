@@ -1,0 +1,17 @@
+[package]
+name = "cadx-core"
+description = "Kernel-neutral parametric document and CAD contracts for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-sketch.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

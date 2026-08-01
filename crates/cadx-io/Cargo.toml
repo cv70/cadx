@@ -1,0 +1,18 @@
+[package]
+name = "cadx-io"
+description = "Validated manufacturing and CAD exchange formats for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-core.workspace = true
+lib3mf.workspace = true
+ruststep.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

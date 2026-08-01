@@ -1,0 +1,18 @@
+[package]
+name = "cadx-app"
+description = "Kernel-validated application use cases and document sessions for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cadx-kernel-truck.workspace = true
+
+[lints]
+workspace = true

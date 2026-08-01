@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cadx-core",
+    "crates/cadx-analysis",
+    "crates/cadx-sketch",
+    "crates/cadx-app",
+    "crates/cadx-config",
+    "crates/cadx-io",
+    "crates/cadx-kernel-truck",
+    "crates/cadx-ai",
+    "crates/cadx-i18n",
+    "crates/cadx-render",
+    "crates/cadx-desktop",
+]
+default-members = ["crates/cadx-desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cadx/cadx"
+
+[workspace.dependencies]
+cadx-core = { path = "crates/cadx-core" }
+cadx-analysis = { path = "crates/cadx-analysis" }
+cadx-sketch = { path = "crates/cadx-sketch" }
+cadx-app = { path = "crates/cadx-app" }
+cadx-config = { path = "crates/cadx-config" }
+cadx-io = { path = "crates/cadx-io" }
+cadx-kernel-truck = { path = "crates/cadx-kernel-truck" }
+cadx-ai = { path = "crates/cadx-ai" }
+cadx-i18n = { path = "crates/cadx-i18n" }
+cadx-render = { path = "crates/cadx-render" }
+bytemuck = { version = "1.25", features = ["derive"] }
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+genai = "0.7.0-beta.15"
+glam = { version = "0.33.2", features = ["bytemuck"] }
+home = "0.5.11"
+iconflow = { version = "1", features = ["pack-lucide"] }
+lib3mf = { version = "0.1.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ruststep = "0.4.0"
+tempfile = "3.27"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+rfd = "0.17"
+truck-meshalgo = { version = "0.4", default-features = false, features = ["tessellation"] }
+truck-modeling = "0.6"
+truck-shapeops = "0.4"
+truck-stepio = "0.3"
+truck-topology = "0.6"
+wgpu = "30.0.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"

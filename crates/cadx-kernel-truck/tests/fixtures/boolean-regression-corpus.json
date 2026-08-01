@@ -1,0 +1,57 @@
+{
+  "version": 2,
+  "cases": [
+    {
+      "id": "boxes-disjoint-intersection",
+      "operation": "intersect",
+      "left": { "size": [10.0, 10.0, 10.0], "position": [0.0, 0.0, 0.0] },
+      "right": { "size": [10.0, 10.0, 10.0], "position": [30.0, 0.0, 0.0] },
+      "policy": {
+        "absolute_mm": 0.05,
+        "relative": 1e-9,
+        "maximum_mm": 0.2,
+        "retry_multiplier": 2.0,
+        "max_attempts": 3,
+        "healing": "after_failure"
+      },
+      "expected": {
+        "outcome": "failure",
+        "stage": "broad_phase",
+        "reason": "disjoint_operands",
+        "tolerances_mm": [0.05],
+        "operand_healing": ["not_attempted"],
+        "result_healing": ["not_attempted"]
+      }
+    },
+    {
+      "id": "boxes-coincident-union",
+      "operation": "union",
+      "left": { "size": [10.0, 10.0, 10.0], "position": [0.0, 0.0, 0.0] },
+      "right": { "size": [10.0, 10.0, 10.0], "position": [0.0, 0.0, 0.0] },
+      "policy": {
+        "absolute_mm": 0.05,
+        "relative": 1e-9,
+        "maximum_mm": 0.2,
+        "retry_multiplier": 2.0,
+        "max_attempts": 3,
+        "healing": "after_failure"
+      },
+      "expected": { "outcome": "success", "faces": 6 }
+    },
+    {
+      "id": "boxes-face-touch-union",
+      "operation": "union",
+      "left": { "size": [10.0, 10.0, 10.0], "position": [0.0, 0.0, 0.0] },
+      "right": { "size": [10.0, 10.0, 10.0], "position": [10.0, 0.0, 0.0] },
+      "policy": {
+        "absolute_mm": 0.05,
+        "relative": 1e-9,
+        "maximum_mm": 0.2,
+        "retry_multiplier": 2.0,
+        "max_attempts": 3,
+        "healing": "after_failure"
+      },
+      "expected": { "outcome": "success", "faces": 10 }
+    }
+  ]
+}
