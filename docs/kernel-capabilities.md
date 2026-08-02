@@ -4,8 +4,8 @@
 that changes command availability. It prevents desktop and AI adapters from
 assuming that every `CadKernel` has Truck's exact feature set.
 
-The default capability value disables chamfer and fillet. A kernel must opt in
-explicitly. Each edge-modifier declaration records:
+The default capability value disables chamfer, fillet, and product interference
+analysis. A kernel must opt in explicitly. Each edge-modifier declaration records:
 
 - whether the operation and multi-edge selections are supported;
 - whether all edges must belong to one source feature;
@@ -24,9 +24,14 @@ with linear convex edges and planar support faces. Chamfer declares
 `unsupported` because exact cylinder intersections and vertex corner patches
 are not yet available.
 
+Truck also declares `interference_analysis: true`. This advertises the
+read-only report operation, not a document command. The report retains its own
+per-pair method, precision, and failure evidence; see
+[`interference-analysis.md`](interference-analysis.md).
+
 `DocumentSession` exposes the declaration without leaking a concrete kernel.
-The desktop uses it to disable absent operations and unsupported multi-edge
-selection counts. AI receives the complete value in read-only context and is
+The desktop uses it to disable absent operations, unsupported multi-edge
+selection counts, and unavailable analysis tools. AI receives the complete value in read-only context and is
 instructed to plan only within the declared contract.
 
 A capability is not proof that a particular selection is valid. Persistent

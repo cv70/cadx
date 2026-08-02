@@ -14,6 +14,10 @@ use cadx_analysis::{MeasurementEntity, analyze_scene};
 use cadx_app::{DocumentSession, DocumentState};
 use cadx_config::{ConfigStore, Preferences, ProviderConfig, Settings};
 use cadx_core::{
+    assembly::{
+        Assembly, AssemblyMate, AssemblyMateKind, AssemblyMateLimits, AssemblyTransform,
+        ComponentOccurrenceId, StepEntityRef,
+    },
     diagnostics::{
         BooleanDiagnostic, BooleanFailureReason, BooleanFailureStage, EdgeModifierDiagnostic,
         EdgeModifierFailureReason, EdgeModifierFailureStage, EdgeModifierParameter,
@@ -26,7 +30,8 @@ use cadx_core::{
     },
     kernel::{
         CadKernel, EdgeCountSupport, EdgeModifierCapability, EvaluatedScene, ExchangeKernel,
-        SketchSolveDiagnostic,
+        InterferenceAnalysis, InterferenceFailureReason, InterferenceFailureStage,
+        InterferencePairOutcome, SketchSolveDiagnostic,
     },
     topology::{EdgeRef, FaceRef, VertexRef},
 };
@@ -62,6 +67,7 @@ pub struct CadxApp {
     loft_dialog: Option<LoftDialogState>,
     boolean_dialog: Option<BooleanDialogState>,
     edge_modifier_dialog: Option<EdgeModifierDialogState>,
+    interference_dialog: Option<InterferenceDialogState>,
     last_boolean_failure: Option<BooleanDiagnostic>,
     last_edge_modifier_failure: Option<EdgeModifierDiagnostic>,
     last_sketch_failure: Option<SketchConstraintDiagnostic>,
@@ -97,6 +103,27 @@ type StatusMessage = LocalizedText;
 struct ConversationEntry {
     speaker: Speaker,
     content: LocalizedText,
+}
+
+struct InterferenceDialogState {
+    result: Result<InterferenceAnalysis, String>,
+}
+
+#[derive(Clone)]
+struct AssemblyInspectorContext {
+    assembly_id: u64,
+    assembly_name: String,
+    occurrence_id: ComponentOccurrenceId,
+    occurrence_name: String,
+    parent_occurrence_id: Option<ComponentOccurrenceId>,
+    occurrence_transform: AssemblyTransform,
+    occurrence_suppressed: bool,
+    occurrence_effectively_suppressed: bool,
+    occurrence_source: Option<StepEntityRef>,
+    definition_name: Option<String>,
+    definition_source: Option<StepEntityRef>,
+    mate: Option<AssemblyMate>,
+    next_mate_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +357,7 @@ impl CadxApp {
             loft_dialog: None,
             boolean_dialog: None,
             edge_modifier_dialog: None,
+            interference_dialog: None,
             last_boolean_failure: None,
             last_edge_modifier_failure: None,
             last_sketch_failure: None,
@@ -964,6 +992,18 @@ impl CadxApp {
                                     self.loft_dialog = None;
                                     self.boolean_dialog = None;
                                 }
+                                ui.separator();
+                                if tool_button(
+                                    ui,
+                                    "scan-search",
+                                    translator.text("tool.interference"),
+                                    translator.text("tool.interference"),
+                                    capabilities.interference_analysis,
+                                )
+                                .clicked()
+                                {
+                                    self.run_interference_analysis();
+                                }
                             }
                             ToolbarTab::View => {
                                 if tool_button(
@@ -1089,9 +1129,39 @@ impl CadxApp {
                     .id_salt("feature_tree")
                     .max_height(tree_height)
                     .show(ui, |ui| {
+                        let assemblies = self.session.document().assemblies.clone();
                         let features = self.session.document().features.clone();
-                        for feature in features {
-                            self.feature_row(ui, &feature, &translator);
+                        let owned = assemblies
+                            .iter()
+                            .flat_map(|assembly| &assembly.occurrences)
+                            .flat_map(|occurrence| &occurrence.feature_ids)
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>();
+                        for assembly in &assemblies {
+                            egui::CollapsingHeader::new(&assembly.name)
+                                .id_salt(("assembly", assembly.id))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let roots = assembly
+                                        .roots()
+                                        .map(|occurrence| occurrence.id)
+                                        .collect::<Vec<_>>();
+                                    for root in roots {
+                                        self.assembly_occurrence_row(
+                                            ui,
+                                            assembly,
+                                            root,
+                                            false,
+                                            &translator,
+                                        );
+                                    }
+                                });
+                        }
+                        for feature in features
+                            .into_iter()
+                            .filter(|feature| !owned.contains(&feature.id))
+                        {
+                            self.feature_row(ui, &feature, &translator, false);
                         }
                     });
 
@@ -1136,7 +1206,86 @@ impl CadxApp {
             });
     }
 
-    fn feature_row(&mut self, ui: &mut egui::Ui, feature: &Feature, translator: &Translator) {
+    fn assembly_occurrence_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        assembly: &Assembly,
+        occurrence_id: ComponentOccurrenceId,
+        ancestor_suppressed: bool,
+        translator: &Translator,
+    ) {
+        let Some(occurrence) = assembly.occurrence(occurrence_id) else {
+            return;
+        };
+        let definition_name = assembly
+            .definition(occurrence.definition_id)
+            .map_or("", |definition| definition.name.as_str());
+        let label = if occurrence.name == definition_name || definition_name.is_empty() {
+            occurrence.name.clone()
+        } else {
+            format!("{}  [{}]", occurrence.name, definition_name)
+        };
+        let directly_suppressed = occurrence.suppressed;
+        let effectively_suppressed = ancestor_suppressed || directly_suppressed;
+        let assembly_id = assembly.id;
+        let occurrence_id = occurrence.id;
+        let state_id = ui.make_persistent_id(("occurrence", assembly_id, occurrence_id));
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            state_id,
+            occurrence.parent_id.is_none(),
+        )
+        .show_header(ui, |ui| {
+            let mut suppressed = directly_suppressed;
+            let response = ui
+                .checkbox(&mut suppressed, "")
+                .on_hover_text(translator.text("tool.suppress_occurrence"));
+            if response.changed() {
+                let _ = self.execute(
+                    vec![ModelCommand::SetOccurrenceSuppressed {
+                        assembly_id,
+                        occurrence_id,
+                        suppressed,
+                    }],
+                    StatusMessage::Key("status.occurrence_suppression"),
+                );
+            }
+            let text = egui::RichText::new(label).size(11.0);
+            ui.label(if effectively_suppressed {
+                text.color(appearance::TEXT_FAINT).strikethrough()
+            } else {
+                text.color(appearance::TEXT)
+            });
+        })
+        .body(|ui| {
+            for feature_id in &occurrence.feature_ids {
+                if let Some(feature) = self.session.document().feature(*feature_id).cloned() {
+                    self.feature_row(ui, &feature, translator, true);
+                }
+            }
+            let children = assembly
+                .children(occurrence.id)
+                .map(|child| child.id)
+                .collect::<Vec<_>>();
+            for child in children {
+                self.assembly_occurrence_row(
+                    ui,
+                    assembly,
+                    child,
+                    effectively_suppressed,
+                    translator,
+                );
+            }
+        });
+    }
+
+    fn feature_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        feature: &Feature,
+        translator: &Translator,
+        assembly_owned: bool,
+    ) {
         ui.horizontal(|ui| {
             let (icon_name, primitive_key) = match feature.primitive {
                 Primitive::Box { .. } => ("box", "primitive.box"),
@@ -1193,7 +1342,15 @@ impl CadxApp {
             if icon_button(ui, "copy", translator.text("tool.duplicate"), true, false).clicked() {
                 self.duplicate_feature(feature.id);
             }
-            if icon_button(ui, "trash-2", translator.text("tool.delete"), true, false).clicked() {
+            if icon_button(
+                ui,
+                "trash-2",
+                translator.text("tool.delete"),
+                !assembly_owned,
+                false,
+            )
+            .clicked()
+            {
                 let _ = self.execute(
                     vec![ModelCommand::Delete { id: feature.id }],
                     StatusMessage::Key("status.deleted"),
@@ -1209,6 +1366,38 @@ impl CadxApp {
         feature: &Feature,
         translator: &Translator,
     ) {
+        let assembly_context = self
+            .session
+            .document()
+            .assembly_occurrence_for_feature(feature.id)
+            .map(|(assembly, occurrence)| {
+                let definition = assembly.definition(occurrence.definition_id);
+                AssemblyInspectorContext {
+                    assembly_id: assembly.id,
+                    assembly_name: assembly.name.clone(),
+                    occurrence_id: occurrence.id,
+                    occurrence_name: occurrence.name.clone(),
+                    parent_occurrence_id: occurrence.parent_id,
+                    occurrence_transform: occurrence.transform,
+                    occurrence_suppressed: occurrence.suppressed,
+                    occurrence_effectively_suppressed: assembly
+                        .effective_suppression()
+                        .ok()
+                        .and_then(|effective| effective.get(&occurrence.id).copied())
+                        .unwrap_or(occurrence.suppressed),
+                    occurrence_source: occurrence.source,
+                    definition_name: definition.map(|definition| definition.name.clone()),
+                    definition_source: definition.and_then(|definition| definition.source),
+                    mate: assembly.mate_for_child(occurrence.id).cloned(),
+                    next_mate_id: assembly
+                        .mates
+                        .iter()
+                        .map(|mate| mate.id)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1),
+                }
+            });
         if let Some(reference) = self
             .selected_edges
             .last()
@@ -1348,6 +1537,270 @@ impl CadxApp {
             );
         }
 
+        if let Some(context) = &assembly_context {
+            ui.add_space(10.0);
+            property_label(ui, translator.text("property.assembly"), None);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  #{}",
+                    context.assembly_name, context.assembly_id
+                ))
+                .size(10.0)
+                .color(appearance::TEXT_MUTED),
+            );
+            property_label(ui, translator.text("property.occurrence"), None);
+            let source = context
+                .occurrence_source
+                .map(|source| format!("  STEP #{}", source.entity_id))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  #{}{}",
+                    context.occurrence_name, context.occurrence_id, source
+                ))
+                .size(10.0)
+                .color(appearance::ACCENT),
+            );
+            property_label(ui, translator.text("property.suppression"), None);
+            let mut suppressed = context.occurrence_suppressed;
+            if ui
+                .checkbox(&mut suppressed, translator.text("property.suppressed"))
+                .changed()
+            {
+                let _ = self.execute(
+                    vec![ModelCommand::SetOccurrenceSuppressed {
+                        assembly_id: context.assembly_id,
+                        occurrence_id: context.occurrence_id,
+                        suppressed,
+                    }],
+                    StatusMessage::Key("status.occurrence_suppression"),
+                );
+            }
+            if context.occurrence_effectively_suppressed && !context.occurrence_suppressed {
+                ui.label(
+                    egui::RichText::new(translator.text("property.suppressed_by_ancestor"))
+                        .size(10.0)
+                        .color(appearance::TEXT_MUTED),
+                );
+            }
+            property_label(ui, translator.text("property.component_definition"), None);
+            let source = context
+                .definition_source
+                .map(|source| format!("  STEP #{}", source.entity_id))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}{}",
+                    context.definition_name.as_deref().unwrap_or(""),
+                    source
+                ))
+                .size(10.0)
+                .color(appearance::TEXT_MUTED),
+            );
+
+            if let Some(mate) = &context.mate {
+                property_label(ui, translator.text("property.assembly_mate"), None);
+                let kind = translator.text(assembly_mate_kind_key(&mate.kind));
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}  #{}, {kind}", mate.name, mate.id))
+                            .size(10.0)
+                            .color(appearance::ACCENT),
+                    );
+                    if icon_button(
+                        ui,
+                        "trash-2",
+                        translator.text("tool.delete_assembly_mate"),
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        let _ = self.execute(
+                            vec![ModelCommand::DeleteAssemblyMate {
+                                assembly_id: context.assembly_id,
+                                mate_id: mate.id,
+                            }],
+                            StatusMessage::Key("status.deleted_assembly_mate"),
+                        );
+                    }
+                });
+                if let Some(axis) = assembly_mate_axis(&mate.kind) {
+                    property_label(ui, translator.text("property.mate_axis"), None);
+                    let [x, y, z] = axis.map(|value| format!("{value:.4}"));
+                    ui.label(
+                        egui::RichText::new(format!("X {x}   Y {y}   Z {z}"))
+                            .monospace()
+                            .size(9.0)
+                            .color(appearance::TEXT_MUTED),
+                    );
+                }
+                if !matches!(mate.kind, AssemblyMateKind::Fixed) {
+                    let (minimum, maximum, suffix, units_key) = match &mate.kind {
+                        AssemblyMateKind::Revolute { limits_deg, .. } => {
+                            let limits = limits_deg.unwrap_or(AssemblyMateLimits {
+                                min: -360_000.0,
+                                max: 360_000.0,
+                            });
+                            (limits.min, limits.max, "°", "property.units_deg")
+                        }
+                        AssemblyMateKind::Slider { limits_mm, .. } => {
+                            let limits = limits_mm.unwrap_or(AssemblyMateLimits {
+                                min: -100_000.0,
+                                max: 100_000.0,
+                            });
+                            (limits.min, limits.max, " mm", "property.units_mm")
+                        }
+                        AssemblyMateKind::Fixed => unreachable!(),
+                    };
+                    property_label(
+                        ui,
+                        translator.text("property.mate_state"),
+                        Some(translator.text(units_key)),
+                    );
+                    let mut state = mate.state;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut state)
+                                .speed(0.25)
+                                .range(minimum..=maximum)
+                                .suffix(suffix),
+                        )
+                        .changed()
+                    {
+                        let _ = self.execute(
+                            vec![ModelCommand::SetAssemblyMateState {
+                                assembly_id: context.assembly_id,
+                                mate_id: mate.id,
+                                state,
+                            }],
+                            StatusMessage::Key("status.moved_assembly_mate"),
+                        );
+                    }
+                }
+                assembly_mate_frame_ui(
+                    ui,
+                    translator.text("property.parent_anchor_frame"),
+                    mate.parent_frame,
+                );
+                assembly_mate_frame_ui(
+                    ui,
+                    translator.text("property.child_anchor_frame"),
+                    mate.child_frame,
+                );
+            } else if let (Some(parent_occurrence_id), Some(mate_id)) =
+                (context.parent_occurrence_id, context.next_mate_id)
+            {
+                property_label(ui, translator.text("property.assembly_mate"), None);
+                let mut create = None;
+                ui.menu_button(translator.text("tool.add_assembly_mate"), |ui| {
+                    if ui.button(translator.text("mate.fixed")).clicked() {
+                        create = Some((
+                            translator.text("mate.fixed").to_owned(),
+                            AssemblyMateKind::Fixed,
+                        ));
+                        ui.close();
+                    }
+                    ui.separator();
+                    for (key, axis) in mate_axis_options() {
+                        if ui
+                            .button(translator.format("mate.revolute_axis", &[("axis", key)]))
+                            .clicked()
+                        {
+                            create = Some((
+                                translator.text("mate.revolute").to_owned(),
+                                AssemblyMateKind::Revolute {
+                                    axis,
+                                    limits_deg: None,
+                                },
+                            ));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    for (key, axis) in mate_axis_options() {
+                        if ui
+                            .button(translator.format("mate.slider_axis", &[("axis", key)]))
+                            .clicked()
+                        {
+                            create = Some((
+                                translator.text("mate.slider").to_owned(),
+                                AssemblyMateKind::Slider {
+                                    axis,
+                                    limits_mm: None,
+                                },
+                            ));
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some((name, kind)) = create {
+                    let _ = self.execute(
+                        vec![ModelCommand::CreateAssemblyMate {
+                            assembly_id: context.assembly_id,
+                            mate: AssemblyMate {
+                                id: mate_id,
+                                name,
+                                parent_occurrence_id,
+                                child_occurrence_id: context.occurrence_id,
+                                parent_frame: context.occurrence_transform,
+                                child_frame: AssemblyTransform::IDENTITY,
+                                kind,
+                                state: 0.0,
+                            },
+                        }],
+                        StatusMessage::Key("status.created_assembly_mate"),
+                    );
+                }
+            }
+
+            property_label(ui, translator.text("property.local_placement"), None);
+            property_label(
+                ui,
+                translator.text("property.local_position"),
+                Some(translator.text("property.units_mm")),
+            );
+            let mut local_position = context.occurrence_transform.translation;
+            let position_changed = ui
+                .add_enabled_ui(context.mate.is_none(), |ui| {
+                    vec3_editor(ui, &mut local_position, -100_000.0..=100_000.0)
+                })
+                .inner;
+            if position_changed {
+                let _ = self.execute(
+                    vec![ModelCommand::SetOccurrenceTransform {
+                        assembly_id: context.assembly_id,
+                        occurrence_id: context.occurrence_id,
+                        position: local_position,
+                        rotation: context.occurrence_transform.euler_xyz_degrees(),
+                    }],
+                    StatusMessage::Key("status.moved_occurrence"),
+                );
+            }
+            property_label(
+                ui,
+                translator.text("property.local_rotation"),
+                Some(translator.text("property.units_deg")),
+            );
+            let mut local_rotation = context.occurrence_transform.euler_xyz_degrees();
+            let rotation_changed = ui
+                .add_enabled_ui(context.mate.is_none(), |ui| {
+                    vec3_editor_with_suffix(ui, &mut local_rotation, -360.0..=360.0, "°")
+                })
+                .inner;
+            if rotation_changed {
+                let _ = self.execute(
+                    vec![ModelCommand::SetOccurrenceTransform {
+                        assembly_id: context.assembly_id,
+                        occurrence_id: context.occurrence_id,
+                        position: context.occurrence_transform.translation,
+                        rotation: local_rotation,
+                    }],
+                    StatusMessage::Key("status.moved_occurrence"),
+                );
+            }
+        }
+
         if !matches!(
             feature.primitive,
             Primitive::DatumPlane { .. } | Primitive::DatumPoint { .. }
@@ -1364,7 +1817,12 @@ impl CadxApp {
                 Some(translator.text("property.units_mm")),
             );
             let mut position = feature.translation.as_array();
-            if vec3_editor(ui, &mut position, -100_000.0..=100_000.0) {
+            let position_changed = ui
+                .add_enabled_ui(assembly_context.is_none(), |ui| {
+                    vec3_editor(ui, &mut position, -100_000.0..=100_000.0)
+                })
+                .inner;
+            if position_changed {
                 let _ = self.execute(
                     vec![ModelCommand::Move {
                         id: feature.id,
@@ -1383,7 +1841,8 @@ impl CadxApp {
                 );
                 let mut angle = feature.rotation.z;
                 if ui
-                    .add(
+                    .add_enabled(
+                        assembly_context.is_none(),
                         egui::DragValue::new(&mut angle)
                             .speed(1.0)
                             .range(-360.0..=360.0)
@@ -1406,7 +1865,12 @@ impl CadxApp {
                     Some(translator.text("property.units_deg")),
                 );
                 let mut rotation = feature.rotation.as_array();
-                if vec3_editor_with_suffix(ui, &mut rotation, -360.0..=360.0, "°") {
+                let rotation_changed = ui
+                    .add_enabled_ui(assembly_context.is_none(), |ui| {
+                        vec3_editor_with_suffix(ui, &mut rotation, -360.0..=360.0, "°")
+                    })
+                    .inner;
+                if rotation_changed {
                     let _ = self.execute(
                         vec![ModelCommand::Rotate {
                             id: feature.id,
@@ -2631,13 +3095,63 @@ impl CadxApp {
                     );
                 }
             }
-            Primitive::ImportedStep { source, shell_id } => {
+            Primitive::ImportedStep {
+                source,
+                data_section,
+                shell_id,
+                void_shells,
+                length_unit,
+            } => {
+                property_label(ui, translator.text("property.data_section"), None);
+                ui.label(
+                    egui::RichText::new(format!("{}", data_section.saturating_add(1)))
+                        .monospace()
+                        .size(10.0)
+                        .color(appearance::TEXT_MUTED),
+                );
                 property_label(ui, translator.text("property.shell_id"), None);
                 ui.label(
                     egui::RichText::new(format!("#{shell_id}"))
                         .monospace()
                         .size(10.0)
                         .color(appearance::ACCENT),
+                );
+                property_label(ui, translator.text("property.void_shells"), None);
+                let void_shells = if void_shells.is_empty() {
+                    translator.text("property.none").to_owned()
+                } else {
+                    void_shells
+                        .iter()
+                        .map(|boundary| {
+                            format!(
+                                "#{} {}",
+                                boundary.shell_id,
+                                if boundary.orientation { ".T." } else { ".F." }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                ui.label(
+                    egui::RichText::new(void_shells)
+                        .monospace()
+                        .size(10.0)
+                        .color(appearance::TEXT_MUTED),
+                );
+                property_label(ui, translator.text("property.source_unit"), None);
+                let assumed = if length_unit.declared {
+                    ""
+                } else {
+                    translator.text("property.unit_assumed")
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} ({} mm/unit){assumed}",
+                        length_unit.name, length_unit.millimeters_per_unit
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(appearance::TEXT_MUTED),
                 );
                 property_label(ui, translator.text("property.source_size"), None);
                 ui.label(
@@ -2878,6 +3392,196 @@ impl CadxApp {
         } else {
             self.boolean_dialog = open.then_some(state);
         }
+    }
+
+    fn run_interference_analysis(&mut self) {
+        let result = self
+            .session
+            .analyze_interference()
+            .map_err(|error| error.to_string());
+        self.status = match &result {
+            Ok(report) if report.failed_pair_count > 0 => {
+                let failed = report.failed_pair_count.to_string();
+                StatusMessage::Text(
+                    self.translator
+                        .format("status.interference_incomplete", &[("failed", &failed)]),
+                )
+            }
+            Ok(report) if report.has_interference() => {
+                let count = report.interfering_pair_count.to_string();
+                StatusMessage::Text(
+                    self.translator
+                        .format("status.interference_found", &[("count", &count)]),
+                )
+            }
+            Ok(_) => StatusMessage::Key("status.interference_clear"),
+            Err(error) => StatusMessage::Text(error.clone()),
+        };
+        self.interference_dialog = Some(InterferenceDialogState { result });
+    }
+
+    fn interference_dialog(&mut self, context: &egui::Context) {
+        let Some(state) = self.interference_dialog.take() else {
+            return;
+        };
+        let translator = self.translator.clone();
+        let mut open = true;
+        let mut selected = None;
+        egui::Window::new(translator.text("interference.title"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(context, |ui| match &state.result {
+                Err(error) => {
+                    ui.label(
+                        egui::RichText::new(error)
+                            .size(10.0)
+                            .color(appearance::DANGER),
+                    );
+                }
+                Ok(report) => {
+                    let (summary_key, summary_color) = if report.failed_pair_count > 0 {
+                        ("interference.summary_incomplete", appearance::WARNING)
+                    } else if report.has_interference() {
+                        ("interference.summary_found", appearance::DANGER)
+                    } else {
+                        ("interference.summary_clear", appearance::ACCENT)
+                    };
+                    ui.label(
+                        egui::RichText::new(translator.text(summary_key))
+                            .size(12.0)
+                            .strong()
+                            .color(summary_color),
+                    );
+                    ui.add_space(6.0);
+                    let candidates = report.candidate_feature_ids.len().to_string();
+                    let pairs = report.total_pair_count.to_string();
+                    let broad = report.broad_phase_pair_count.to_string();
+                    let clear = report.clear_pair_count.to_string();
+                    let clashes = report.interfering_pair_count.to_string();
+                    let failed = report.failed_pair_count.to_string();
+                    ui.label(
+                        egui::RichText::new(translator.format(
+                            "interference.counts",
+                            &[
+                                ("candidates", &candidates),
+                                ("pairs", &pairs),
+                                ("broad", &broad),
+                                ("clear", &clear),
+                                ("clashes", &clashes),
+                                ("failed", &failed),
+                            ],
+                        ))
+                        .monospace()
+                        .size(9.0)
+                        .color(appearance::TEXT_MUTED),
+                    );
+                    let volume_tolerance = format!("{:.9}", report.volume_tolerance_mm3);
+                    ui.label(
+                        egui::RichText::new(translator.format(
+                            "interference.volume_tolerance",
+                            &[("volume", &volume_tolerance)],
+                        ))
+                        .monospace()
+                        .size(9.0)
+                        .color(appearance::TEXT_FAINT),
+                    );
+                    if report.pairs.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(translator.text("interference.no_broad_pairs"))
+                                .size(10.0)
+                                .color(appearance::TEXT_MUTED),
+                        );
+                        return;
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("interference_pairs")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for pair in &report.pairs {
+                                let [left_id, right_id] = pair.feature_ids;
+                                let feature_label = |id| {
+                                    self.session.document().feature(id).map_or_else(
+                                        || format!("#{id}"),
+                                        |feature| format!("{} #{id}", feature.name),
+                                    )
+                                };
+                                let left = feature_label(left_id);
+                                let right = feature_label(right_id);
+                                let (icon, color, detail) = match &pair.outcome {
+                                    InterferencePairOutcome::Clear { volume_mm3, .. } => (
+                                        "circle-check",
+                                        appearance::ACCENT,
+                                        translator.format(
+                                            "interference.pair_clear",
+                                            &[("volume", &format!("{volume_mm3:.6}"))],
+                                        ),
+                                    ),
+                                    InterferencePairOutcome::Interfering { volume_mm3, .. } => (
+                                        "triangle-alert",
+                                        appearance::DANGER,
+                                        translator.format(
+                                            "interference.pair_found",
+                                            &[("volume", &format!("{volume_mm3:.6}"))],
+                                        ),
+                                    ),
+                                    InterferencePairOutcome::Failed {
+                                        stage,
+                                        reason,
+                                        detail,
+                                    } => (
+                                        "circle-x",
+                                        appearance::WARNING,
+                                        translator.format(
+                                            "interference.pair_failed",
+                                            &[
+                                                (
+                                                    "stage",
+                                                    translator.text(interference_stage_key(*stage)),
+                                                ),
+                                                (
+                                                    "reason",
+                                                    translator
+                                                        .text(interference_reason_key(*reason)),
+                                                ),
+                                                ("detail", detail),
+                                            ],
+                                        ),
+                                    ),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(appearance::icon(icon, 13.0).color(color));
+                                    if ui
+                                        .selectable_label(
+                                            self.selected == Some(left_id),
+                                            egui::RichText::new(format!("{left} / {right}"))
+                                                .size(10.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        selected = Some(left_id);
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(detail)
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(appearance::TEXT_MUTED),
+                                );
+                                ui.add_space(5.0);
+                            }
+                        });
+                }
+            });
+        if let Some(id) = selected {
+            self.selected = Some(id);
+            self.clear_topology_selection();
+            self.sync_viewport();
+        }
+        self.interference_dialog = open.then_some(state);
     }
 
     fn loft_dialog(&mut self, context: &egui::Context) {
@@ -3856,6 +4560,26 @@ const fn boolean_stage_key(stage: BooleanFailureStage) -> &'static str {
     }
 }
 
+const fn interference_stage_key(stage: InterferenceFailureStage) -> &'static str {
+    match stage {
+        InterferenceFailureStage::KernelOperation => "interference.stage.kernel_operation",
+        InterferenceFailureStage::ResultValidation => "interference.stage.result_validation",
+        InterferenceFailureStage::VolumeIntegration => "interference.stage.volume_integration",
+    }
+}
+
+const fn interference_reason_key(reason: InterferenceFailureReason) -> &'static str {
+    match reason {
+        InterferenceFailureReason::KernelRejected => "interference.reason.kernel_rejected",
+        InterferenceFailureReason::KernelPanic => "interference.reason.kernel_panic",
+        InterferenceFailureReason::InvalidResultTopology => {
+            "interference.reason.invalid_result_topology"
+        }
+        InterferenceFailureReason::EmptyMesh => "interference.reason.empty_mesh",
+        InterferenceFailureReason::NonFiniteVolume => "interference.reason.non_finite_volume",
+    }
+}
+
 impl eframe::App for CadxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.keyboard_shortcuts(ui.ctx());
@@ -3868,6 +4592,7 @@ impl eframe::App for CadxApp {
         self.loft_dialog(ui.ctx());
         self.boolean_dialog(ui.ctx());
         self.edge_modifier_dialog(ui.ctx());
+        self.interference_dialog(ui.ctx());
         self.measurement_panel(ui.ctx());
         self.sketch_dimension_dialog(ui.ctx());
         if self.ai_pending {
@@ -3908,6 +4633,49 @@ fn tool_button(
         .min_size(egui::vec2(0.0, 30.0)),
     )
     .on_hover_text(tooltip)
+}
+
+fn assembly_mate_kind_key(kind: &AssemblyMateKind) -> &'static str {
+    match kind {
+        AssemblyMateKind::Fixed => "mate.fixed",
+        AssemblyMateKind::Revolute { .. } => "mate.revolute",
+        AssemblyMateKind::Slider { .. } => "mate.slider",
+    }
+}
+
+fn assembly_mate_axis(kind: &AssemblyMateKind) -> Option<[f64; 3]> {
+    match kind {
+        AssemblyMateKind::Fixed => None,
+        AssemblyMateKind::Revolute { axis, .. } | AssemblyMateKind::Slider { axis, .. } => {
+            Some(*axis)
+        }
+    }
+}
+
+fn mate_axis_options() -> [(&'static str, [f64; 3]); 3] {
+    [
+        ("X", [1.0, 0.0, 0.0]),
+        ("Y", [0.0, 1.0, 0.0]),
+        ("Z", [0.0, 0.0, 1.0]),
+    ]
+}
+
+fn assembly_mate_frame_ui(ui: &mut egui::Ui, label: &str, frame: AssemblyTransform) {
+    property_label(ui, label, None);
+    let [x, y, z] = frame.translation.map(|value| format!("{value:.3}"));
+    let [rx, ry, rz] = frame.euler_xyz_degrees().map(|value| format!("{value:.2}"));
+    ui.label(
+        egui::RichText::new(format!("X {x}  Y {y}  Z {z} mm"))
+            .monospace()
+            .size(9.0)
+            .color(appearance::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!("X {rx}°  Y {ry}°  Z {rz}°"))
+            .monospace()
+            .size(9.0)
+            .color(appearance::TEXT_MUTED),
+    );
 }
 
 fn loft_sections_compatible(

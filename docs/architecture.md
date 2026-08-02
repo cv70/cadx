@@ -9,11 +9,11 @@ filesystem implementations.
 | Layer | Crate | Responsibility |
 | --- | --- | --- |
 | Geometry foundation | `cadx-sketch` | Exact kernel-neutral Line/Arc/rational-quadratic/cubic regions, curve validation, and capability-routed deterministic projection or bounded nonlinear constraints |
-| Domain and ports | `cadx-core` | Parametric document, commands, invariants, persistent topology references, kernel-neutral meshes, kernel ports, pure document codec |
+| Domain and ports | `cadx-core` | Parametric document, explicit assembly definitions and occurrences, commands, invariants, persistent topology references, kernel-neutral meshes, kernel ports, pure document codec |
 | Analysis | `cadx-analysis` | Read-only geometric, measurement, and physical analysis over evaluated scenes: topology relationships, bounds, area, volume, mass, center of mass, and inertia |
-| Application | `cadx-app` | Kernel-validated transactions, document session, revisions, undo/redo, clean-state tracking |
+| Application | `cadx-app` | Kernel-validated transactions, STEP import planning, document session, revisions, undo/redo, clean-state tracking |
 | Configuration | `cadx-config` | Typed YAML models and the injectable `~/.cadx` store |
-| Infrastructure | `cadx-kernel-truck` | Truck B-Rep evaluation, STEP reconstruction, booleans, tessellation, exact STEP encoding |
+| Infrastructure | `cadx-kernel-truck` | Truck B-Rep evaluation, STEP reconstruction, booleans, product interference, tessellation, exact STEP encoding |
 | Infrastructure | `cadx-io` | Atomic `.cadx` IO and validated STEP import/export, STL, and 3MF adapters |
 | Infrastructure | `cadx-ai` | Provider-neutral AI contract and explicit rust-genai adapter configuration |
 | Presentation | `cadx-render` | Kernel-neutral egui/wgpu viewport rendering and picking |
@@ -71,6 +71,47 @@ geometry, never a fake solid. The renderer draws these values as line overlays,
 includes them in frame-all bounds, and supports feature picking on the overlay.
 See [`reference-geometry.md`](reference-geometry.md).
 
+`cadx-core::assembly` keeps reusable component definitions, hierarchical
+occurrences, full-frame fixed/revolute/slider mates, source entity identities,
+and rigid local placements independent of feature history and kernel objects.
+Validation proves hierarchy, single-driver kinematics, ownership, and
+feature/world-transform consistency. `cadx-app::plan_step_import` expands
+each STEP body occurrence into a concrete imported feature, composes nested
+placements, and creates the complete product structure in the same atomic
+transaction. Direct occurrence placement and mate state commands update the
+local occurrence and every materialized descendant world transform before
+kernel evaluation; driven children reject conflicting direct placement.
+`SetOccurrenceSuppressed`
+persists a direct occurrence state whose effect is inherited by descendants.
+Core rejects an active feature that depends on a suppressed body. Truck skips
+those bodies before B-Rep reconstruction, so viewport, picking, analysis, mesh
+exchange, and exact STEP export consume the same unsuppressed product state.
+A kernel-neutral
+feature-instance lookup identifies each ordered definition body. Truck uses it
+to reconstruct eligible repeated imported STEP bodies once per evaluation or
+export attempt, then topologically clones, transforms, tessellates, and names
+each occurrence independently. It additionally emits kernel-neutral local mesh
+definitions and rigid render instances for compatible repeated native or
+imported bodies. WGPU uploads each definition once and draws its occurrences
+from an instance buffer, while world-space `EvaluatedPart` meshes remain
+available to analysis, picking, and exchange. Exact STEP export builds a
+kernel-private ownership plan from the same feature-instance identity,
+inverse-transforms one representative solid per active definition/body slot,
+and emits AP242 product definitions plus local occurrence relationships.
+Standalone visible bodies remain independent products, suppressed subtrees are
+excluded, and incompatible repeated definitions fail before serialization. See
+[`assemblies.md`](assemblies.md).
+
+Product interference is a separate read-only `CadKernel` operation because
+exact B-Reps cannot cross the inward-owned core port. Truck rebuilds the
+document once, selects unsuppressed terminal solid products independently of
+visibility, excludes pairs within one multi-body occurrence, performs AABB
+broad-phase culling, and retains typed clear, interfering, or failed evidence
+for every surviving pair. Exact intersection topology stays native; volume
+integration declares its chord-tolerance tessellation precision. The desktop
+runs the report on demand, and AI receives a fresh optional copy as read-only
+context. See [`interference-analysis.md`](interference-analysis.md).
+
 Chamfer and fillet features apply the same rule to ordered `EdgeRef` sets: the
 application stores topological intent, while Truck resolves every edge against
 one source solid before constructing a real B-Rep modifier during staged
@@ -91,9 +132,10 @@ kernel, files, or the renderer. Material changes use the same command boundary.
 Analysis is computed from the committed evaluated scene and never becomes an
 alternate source of geometry truth.
 
-`CadKernelCapabilities` exposes operation availability and edge-modifier
+`CadKernelCapabilities` exposes operation availability, interference analysis,
+and edge-modifier
 geometry restrictions without leaking a concrete backend. Its default disables
-modifiers until an adapter opts in. The desktop uses it for command
+all optional operations until an adapter opts in. The desktop uses it for command
 availability and AI receives it as read-only planning context; staged kernel
 validation remains authoritative for each actual selection. See
 [`kernel-capabilities.md`](kernel-capabilities.md).
@@ -213,8 +255,20 @@ The constraint semantics and file-compatibility contract are documented in
 - `cadx-core::persistence` is a pure, versioned JSON codec with validation.
 - `cadx-io` owns document paths, reads, and atomic writes.
 - Imported STEP features embed their validated physical-file source and the
-  source shell entity id. This keeps a CADX document portable while leaving
-  STEP parsing and Truck geometry conversion behind their respective adapters.
+  source DATA-section index, outer-shell identity, oriented void-shell list,
+  and length-unit interpretation. This keeps a CADX document portable,
+  dimensionally deterministic, and faithful to `BREP_WITH_VOIDS` ownership
+  while leaving STEP parsing and Truck geometry conversion behind their
+  respective adapters. STEP presentation styles are reduced to a feature color
+  only when the mapping is complete and unambiguous. Export partitions
+  disjoint outer shells from contained voids before regenerating entity-level
+  styles from the same generic feature metadata. AP242 product definitions,
+  occurrences, canonical relationship links, and local placements are reduced
+  into the kernel-neutral assembly domain on import. Export derives the inverse
+  mapping without leaking Truck solids: compatible definition bodies become
+  component-local exact B-Reps, occurrences retain local rigid placements, and
+  standalone bodies remain independent products. See
+  [`step-import.md`](step-import.md) and [`assemblies.md`](assemblies.md).
 - `cadx-config::ConfigStore` owns `config.yaml` and `preferences.yaml` below an
   explicit root. Production discovers exactly `~/.cadx`; tests inject a root.
 - Provider configuration and software preferences are never sourced from

@@ -11,7 +11,7 @@ use cadx_analysis::{MeasurementResult, SceneAnalysis};
 use cadx_core::{
     diagnostics::{BooleanDiagnostic, EdgeModifierDiagnostic, SketchConstraintDiagnostic},
     domain::{CadDocument, FeatureId, ModelCommand, SketchDimensionKind},
-    kernel::{CadKernelCapabilities, SketchSolveDiagnostic},
+    kernel::{CadKernelCapabilities, InterferenceAnalysis, SketchSolveDiagnostic},
     topology::{EdgeRef, FaceRef, VertexRef},
 };
 
@@ -52,6 +52,8 @@ pub struct AiContext {
     /// Directly editable driving dimensions on the selected committed sketch.
     pub selected_sketch_dimensions: Vec<AiSketchDimension>,
     pub scene_analysis: SceneAnalysis,
+    /// Optional exact-B-Rep product interference evidence for this snapshot.
+    pub interference_analysis: Option<InterferenceAnalysis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +153,12 @@ mod tests {
                 total_volume_mm3: 42.0,
                 ..SceneAnalysis::default()
             },
+            interference_analysis: Some(InterferenceAnalysis {
+                candidate_feature_ids: vec![7, 8],
+                total_pair_count: 1,
+                clear_pair_count: 1,
+                ..InterferenceAnalysis::default()
+            }),
         };
         let encoded = serde_json::to_value(&context).unwrap();
         assert_eq!(
@@ -175,6 +183,10 @@ mod tests {
         );
         assert_eq!(encoded["selected_sketch_dimensions"][0]["kind"], "length");
         assert_eq!(encoded["selected_sketch_dimensions"][0]["value"], 12.5);
+        assert_eq!(
+            encoded["interference_analysis"]["candidate_feature_ids"],
+            serde_json::json!([7, 8])
+        );
     }
 }
 

@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::domain::{CadDocument, DocumentError, Primitive, SketchPlane, Vec3};
 
 pub const FORMAT_NAME: &str = "cadx.document";
-pub const CURRENT_VERSION: u32 = 22;
+pub const CURRENT_VERSION: u32 = 26;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DocumentEnvelope {
@@ -993,13 +993,299 @@ mod tests {
             .apply(crate::domain::ModelCommand::ImportStep {
                 name: "imported bracket".into(),
                 source:
-                    "ISO-10303-21;\nDATA;\n#42=CLOSED_SHELL('',());\nENDSEC;\nEND-ISO-10303-21;"
+                    "ISO-10303-21;\nDATA;\n#42=CLOSED_SHELL('',());\n#43=CLOSED_SHELL('',());\nENDSEC;\nEND-ISO-10303-21;"
                         .into(),
+                data_section: 0,
                 shell_id: 42,
+                void_shells: vec![crate::domain::StepShellBoundary {
+                    shell_id: 43,
+                    orientation: true,
+                }],
+                length_unit: crate::domain::StepLengthUnit::millimeter(),
+                color: Some([0.15, 0.3, 0.75, 1.0]),
                 position: [1.0, 2.0, 3.0],
             })
             .unwrap();
         assert_eq!(decode(&encode(&source).unwrap()).unwrap(), source);
+    }
+
+    #[test]
+    fn reads_v22_imports_with_assumed_millimeter_units() {
+        let mut source = CadDocument::default();
+        source
+            .apply(crate::domain::ModelCommand::ImportStep {
+                name: "legacy supplier body".into(),
+                source:
+                    "ISO-10303-21;\nDATA;\n#42=CLOSED_SHELL('',(#99));\nENDSEC;\nEND-ISO-10303-21;"
+                        .into(),
+                data_section: 0,
+                shell_id: 42,
+                void_shells: Vec::new(),
+                length_unit: crate::domain::StepLengthUnit::millimeter(),
+                color: None,
+                position: [0.0; 3],
+            })
+            .unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&encode(&source).unwrap()).unwrap();
+        legacy["version"] = 22.into();
+        let primitive = legacy["document"]["features"][0]["primitive"]
+            .as_object_mut()
+            .unwrap();
+        primitive.remove("data_section");
+        primitive.remove("void_shells");
+        primitive.remove("length_unit");
+
+        let decoded = decode(&legacy.to_string()).unwrap();
+        assert!(matches!(
+            &decoded.features[0].primitive,
+            Primitive::ImportedStep {
+                data_section: 0,
+                void_shells,
+                length_unit,
+                ..
+            } if void_shells.is_empty()
+                && length_unit == &crate::domain::StepLengthUnit::assumed_millimeter()
+        ));
+    }
+
+    #[test]
+    fn round_trip_preserves_assembly_definitions_and_occurrences() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+            StepEntityRef,
+        };
+        use crate::domain::ModelCommand;
+
+        let mut source = CadDocument::default();
+        let body = source
+            .apply(ModelCommand::CreateBox {
+                name: "placed body".into(),
+                size: [2.0; 3],
+                position: [10.0, 0.0, 0.0],
+            })
+            .unwrap()
+            .unwrap();
+        source
+            .apply(ModelCommand::CreateAssembly {
+                name: "supplier fixture".into(),
+                definitions: vec![ComponentDefinition {
+                    id: 1,
+                    name: "supplier part".into(),
+                    kind: ComponentKind::Part,
+                    source: Some(StepEntityRef {
+                        data_section: 0,
+                        entity_id: 42,
+                    }),
+                }],
+                occurrences: vec![ComponentOccurrence {
+                    id: 1,
+                    name: "supplier part:1".into(),
+                    definition_id: 1,
+                    parent_id: None,
+                    suppressed: true,
+                    transform: AssemblyTransform {
+                        translation: [10.0, 0.0, 0.0],
+                        ..AssemblyTransform::IDENTITY
+                    },
+                    feature_ids: vec![body],
+                    source: Some(StepEntityRef {
+                        data_section: 0,
+                        entity_id: 84,
+                    }),
+                }],
+            })
+            .unwrap();
+
+        let encoded = encode(&source).unwrap();
+        assert_eq!(decode(&encoded).unwrap(), source);
+
+        let mut v25: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        v25["version"] = 25.into();
+        v25["document"]["assemblies"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("mates");
+        assert_eq!(decode(&v25.to_string()).unwrap(), source);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy["version"] = 24.into();
+        legacy["document"]["assemblies"][0]["occurrences"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("suppressed");
+        assert!(!decode(&legacy.to_string()).unwrap().assemblies[0].occurrences[0].suppressed);
+    }
+
+    #[test]
+    fn round_trip_preserves_assembly_mates() {
+        use crate::assembly::{
+            AssemblyMate, AssemblyMateKind, AssemblyMateLimits, AssemblyTransform,
+            ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+        use crate::domain::ModelCommand;
+
+        let mut source = CadDocument::default();
+        let body = source
+            .apply(ModelCommand::CreateBox {
+                name: "carriage".into(),
+                size: [2.0; 3],
+                position: [10.0, 0.0, 0.0],
+            })
+            .unwrap()
+            .unwrap();
+        source
+            .apply(ModelCommand::CreateAssembly {
+                name: "linear stage".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "stage".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "carriage".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "stage:1".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "carriage:1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [10.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![body],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        source
+            .apply(ModelCommand::CreateAssemblyMate {
+                assembly_id: 1,
+                mate: AssemblyMate {
+                    id: 7,
+                    name: "travel".into(),
+                    parent_occurrence_id: 1,
+                    child_occurrence_id: 2,
+                    parent_frame: AssemblyTransform {
+                        translation: [8.0, 0.0, 0.0],
+                        ..AssemblyTransform::IDENTITY
+                    },
+                    child_frame: AssemblyTransform::IDENTITY,
+                    kind: AssemblyMateKind::Slider {
+                        axis: [1.0, 0.0, 0.0],
+                        limits_mm: Some(AssemblyMateLimits {
+                            min: 0.0,
+                            max: 20.0,
+                        }),
+                    },
+                    state: 2.0,
+                },
+            })
+            .unwrap();
+
+        let encoded = encode(&source).unwrap();
+        assert!(encoded.contains("\"type\": \"slider\""));
+        assert_eq!(decode(&encoded).unwrap(), source);
+    }
+
+    #[test]
+    fn reads_v23_documents_without_assembly_fields() {
+        let source = CadDocument::demo();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&encode(&source).unwrap()).unwrap();
+        legacy["version"] = 23.into();
+        let document = legacy["document"].as_object_mut().unwrap();
+        document.remove("assemblies");
+        document.remove("next_assembly_id");
+
+        assert_eq!(decode(&legacy.to_string()).unwrap(), source);
+    }
+
+    #[test]
+    fn rejects_persisted_active_dependency_on_suppressed_occurrence() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+        use crate::domain::{BooleanOperation, ModelCommand};
+
+        let mut source = CadDocument::default();
+        let ids = source
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "assembly body".into(),
+                    size: [2.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "tool".into(),
+                    size: [2.0; 3],
+                    position: [1.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        source
+            .apply(ModelCommand::CreateAssembly {
+                name: "fixture".into(),
+                definitions: vec![ComponentDefinition {
+                    id: 1,
+                    name: "body".into(),
+                    kind: ComponentKind::Part,
+                    source: None,
+                }],
+                occurrences: vec![ComponentOccurrence {
+                    id: 1,
+                    name: "body:1".into(),
+                    definition_id: 1,
+                    parent_id: None,
+                    suppressed: false,
+                    transform: AssemblyTransform::IDENTITY,
+                    feature_ids: vec![ids[0]],
+                    source: None,
+                }],
+            })
+            .unwrap();
+        let dependent = source
+            .apply(ModelCommand::CreateBoolean {
+                name: "dependent".into(),
+                operation: BooleanOperation::Union,
+                left: ids[0],
+                right: ids[1],
+            })
+            .unwrap()
+            .unwrap();
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_str(&encode(&source).unwrap()).unwrap();
+        persisted["document"]["assemblies"][0]["occurrences"][0]["suppressed"] = true.into();
+        assert!(matches!(
+            decode(&persisted.to_string()),
+            Err(PersistenceError::InvalidDocument(
+                DocumentError::SuppressedFeatureDependency {
+                    feature,
+                    dependency,
+                }
+            )) if feature == dependent && dependency == ids[0]
+        ));
     }
 
     #[test]
@@ -1226,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_v22_loft_sections() {
+    fn round_trip_preserves_loft_sections() {
         use crate::domain::{ModelCommand, Primitive, SketchPlane};
 
         let mut source = CadDocument::default();
@@ -1255,7 +1541,7 @@ mod tests {
             .unwrap();
 
         let encoded = encode(&source).unwrap();
-        assert!(encoded.contains("\"version\": 22"));
+        assert!(encoded.contains(&format!("\"version\": {CURRENT_VERSION}")));
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, source);
         assert!(matches!(

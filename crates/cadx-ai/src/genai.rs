@@ -76,7 +76,21 @@ multi-edge, support-surface, convexity, and shared-vertex restrictions apply. Wh
 absent, use the conservative contract of one convex linear edge between two planar faces. Do not
 propose edge modifiers outside the declared contract or variable radii. Material density is always in kg/m^3;
 only assign one when the user supplies it or explicitly names a known material.
-Measurements, sketch solve/failure diagnostics, boolean and edge-modifier failure diagnostics, mass, center of mass, and inertia in the computed context are read-only results.
+Measurements, sketch solve/failure diagnostics, boolean and edge-modifier failure diagnostics, mass, center of mass, inertia, and product interference reports in the computed context are read-only results.
+Assembly occurrences must be repositioned with set_occurrence_transform using
+the persisted assembly_id and occurrence_id, local position in millimeters, and
+local XYZ Euler rotation in degrees. A non-root occurrence may instead have one
+driving assembly mate to its actual hierarchy parent. Create it with a unique
+mate id, full rigid parent and child anchor frames, and fixed, revolute, or
+slider kind. Mate axes are normalized and expressed in the parent anchor frame;
+revolute state and limits use degrees, slider state and limits use millimeters,
+and fixed state is zero. Change only the scalar state with set_assembly_mate_state.
+Delete the mate before directly repositioning a driven occurrence. Use
+set_occurrence_suppressed to suppress or restore an occurrence and its complete
+descendant subtree. Suppression preserves mate state and is distinct from
+feature visibility. It is rejected when an active feature depends on a body in
+the suppressed subtree. Never use move or rotate on an assembly-owned feature;
+occurrence and mate commands update the product structure atomically.
 Use selected_sketch_diagnostic degrees_of_freedom, rank, and redundant_constraints
 and selected_sketch_dimensions zero-based constraint indices, kinds, and values
 to refine a sketch without treating redundancy as inconsistency. For a rejected
@@ -478,6 +492,65 @@ fn cad_plan_tool() -> Tool {
                             },
                             {
                                 "type": "object",
+                                "description": "Set one assembly occurrence's absolute local rigid placement and update its materialized descendant bodies atomically",
+                                "properties": {
+                                    "op": { "const": "set_occurrence_transform" },
+                                    "assembly_id": { "type": "integer", "minimum": 1 },
+                                    "occurrence_id": { "type": "integer", "minimum": 1 },
+                                    "position": { "$ref": "#/$defs/vec3" },
+                                    "rotation": { "$ref": "#/$defs/vec3" }
+                                },
+                                "required": ["op", "assembly_id", "occurrence_id", "position", "rotation"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "description": "Create one deterministic mate on an existing parent-child occurrence edge and solve its descendant bodies atomically",
+                                "properties": {
+                                    "op": { "const": "create_assembly_mate" },
+                                    "assembly_id": { "type": "integer", "minimum": 1 },
+                                    "mate": { "$ref": "#/$defs/assembly_mate" }
+                                },
+                                "required": ["op", "assembly_id", "mate"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "description": "Set a revolute angle in degrees or slider displacement in millimeters and solve descendants atomically",
+                                "properties": {
+                                    "op": { "const": "set_assembly_mate_state" },
+                                    "assembly_id": { "type": "integer", "minimum": 1 },
+                                    "mate_id": { "type": "integer", "minimum": 1 },
+                                    "state": { "type": "number" }
+                                },
+                                "required": ["op", "assembly_id", "mate_id", "state"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "description": "Delete a mate while retaining its child's last solved local placement",
+                                "properties": {
+                                    "op": { "const": "delete_assembly_mate" },
+                                    "assembly_id": { "type": "integer", "minimum": 1 },
+                                    "mate_id": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["op", "assembly_id", "mate_id"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "description": "Suppress or restore one assembly occurrence and its complete descendant subtree without changing feature visibility",
+                                "properties": {
+                                    "op": { "const": "set_occurrence_suppressed" },
+                                    "assembly_id": { "type": "integer", "minimum": 1 },
+                                    "occurrence_id": { "type": "integer", "minimum": 1 },
+                                    "suppressed": { "type": "boolean" }
+                                },
+                                "required": ["op", "assembly_id", "occurrence_id", "suppressed"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
                                 "properties": {
                                     "op": { "const": "resize_box" },
                                     "id": { "type": "integer", "minimum": 1 },
@@ -748,6 +821,82 @@ fn cad_plan_tool() -> Tool {
                     "items": { "type": "number" },
                     "minItems": 3,
                     "maxItems": 3
+                },
+                "mat3": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/vec3" },
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "description": "Right-handed orthonormal row-major rotation matrix"
+                },
+                "rigid_transform": {
+                    "type": "object",
+                    "properties": {
+                        "translation": { "$ref": "#/$defs/vec3" },
+                        "rotation": { "$ref": "#/$defs/mat3" }
+                    },
+                    "required": ["translation", "rotation"],
+                    "additionalProperties": false
+                },
+                "mate_limits": {
+                    "type": "object",
+                    "properties": {
+                        "min": { "type": "number" },
+                        "max": { "type": "number" }
+                    },
+                    "required": ["min", "max"],
+                    "additionalProperties": false
+                },
+                "assembly_mate_kind": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": { "type": { "const": "fixed" } },
+                            "required": ["type"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "revolute" },
+                                "axis": {
+                                    "$ref": "#/$defs/vec3",
+                                    "description": "Normalized axis in the parent anchor frame"
+                                },
+                                "limits_deg": { "$ref": "#/$defs/mate_limits" }
+                            },
+                            "required": ["type", "axis"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "slider" },
+                                "axis": {
+                                    "$ref": "#/$defs/vec3",
+                                    "description": "Normalized axis in the parent anchor frame"
+                                },
+                                "limits_mm": { "$ref": "#/$defs/mate_limits" }
+                            },
+                            "required": ["type", "axis"],
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "assembly_mate": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "minimum": 1 },
+                        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+                        "parent_occurrence_id": { "type": "integer", "minimum": 1 },
+                        "child_occurrence_id": { "type": "integer", "minimum": 1 },
+                        "parent_frame": { "$ref": "#/$defs/rigid_transform" },
+                        "child_frame": { "$ref": "#/$defs/rigid_transform" },
+                        "kind": { "$ref": "#/$defs/assembly_mate_kind" },
+                        "state": { "type": "number" }
+                    },
+                    "required": ["id", "name", "parent_occurrence_id", "child_occurrence_id", "parent_frame", "child_frame", "kind", "state"],
+                    "additionalProperties": false
                 },
                 "positiveVec3": {
                     "type": "array",
@@ -1265,6 +1414,12 @@ mod tests {
                     center_of_mass_mm: Some([1.0, 2.0, 3.0]),
                     ..SceneAnalysis::default()
                 },
+                interference_analysis: Some(cadx_core::kernel::InterferenceAnalysis {
+                    candidate_feature_ids: vec![4, 5],
+                    total_pair_count: 1,
+                    interfering_pair_count: 1,
+                    ..cadx_core::kernel::InterferenceAnalysis::default()
+                }),
             }),
         })
         .unwrap();
@@ -1273,6 +1428,8 @@ mod tests {
         assert!(prompt.contains("total_mass_kg"));
         assert!(prompt.contains("center_of_mass_mm"));
         assert!(prompt.contains("kernel_capabilities"));
+        assert!(prompt.contains("interference_analysis"));
+        assert!(prompt.contains("interfering_pair_count"));
         assert!(prompt.contains("read-only"));
     }
 
@@ -1306,13 +1463,134 @@ mod tests {
     }
 
     #[test]
+    fn occurrence_transform_commands_deserialize_for_ai_plans() {
+        let value = json!({
+            "summary": "Reposition the locating pin occurrence",
+            "commands": [{
+                "op": "set_occurrence_transform",
+                "assembly_id": 2,
+                "occurrence_id": 7,
+                "position": [25.0, 5.0, 0.0],
+                "rotation": [0.0, 0.0, 90.0]
+            }]
+        });
+        let plan: AiPlan = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            plan.commands[0],
+            ModelCommand::SetOccurrenceTransform {
+                assembly_id: 2,
+                occurrence_id: 7,
+                position: [25.0, 5.0, 0.0],
+                rotation: [0.0, 0.0, 90.0]
+            }
+        ));
+    }
+
+    #[test]
+    fn assembly_mate_commands_deserialize_for_ai_plans() {
+        let identity = json!({
+            "translation": [0.0, 0.0, 0.0],
+            "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        });
+        let value = json!({
+            "summary": "Add and position the carriage travel mate",
+            "commands": [
+                {
+                    "op": "create_assembly_mate",
+                    "assembly_id": 2,
+                    "mate": {
+                        "id": 9,
+                        "name": "carriage travel",
+                        "parent_occurrence_id": 4,
+                        "child_occurrence_id": 7,
+                        "parent_frame": identity,
+                        "child_frame": {
+                            "translation": [5.0, 0.0, 0.0],
+                            "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                        },
+                        "kind": {
+                            "type": "slider",
+                            "axis": [1.0, 0.0, 0.0],
+                            "limits_mm": { "min": -20.0, "max": 20.0 }
+                        },
+                        "state": 3.0
+                    }
+                },
+                {
+                    "op": "set_assembly_mate_state",
+                    "assembly_id": 2,
+                    "mate_id": 9,
+                    "state": 8.0
+                },
+                {
+                    "op": "delete_assembly_mate",
+                    "assembly_id": 2,
+                    "mate_id": 9
+                }
+            ]
+        });
+        let plan: AiPlan = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            &plan.commands[0],
+            ModelCommand::CreateAssemblyMate { assembly_id: 2, mate }
+                if mate.id == 9
+                    && matches!(&mate.kind, cadx_core::assembly::AssemblyMateKind::Slider { .. })
+        ));
+        assert!(matches!(
+            plan.commands[1],
+            ModelCommand::SetAssemblyMateState {
+                assembly_id: 2,
+                mate_id: 9,
+                state: 8.0
+            }
+        ));
+        assert!(matches!(
+            plan.commands[2],
+            ModelCommand::DeleteAssemblyMate {
+                assembly_id: 2,
+                mate_id: 9
+            }
+        ));
+
+        let schema = serde_json::to_string(&cad_plan_tool()).unwrap();
+        assert!(schema.contains("create_assembly_mate"));
+        assert!(schema.contains("assembly_mate_kind"));
+    }
+
+    #[test]
+    fn occurrence_suppression_commands_deserialize_for_ai_plans() {
+        let value = json!({
+            "summary": "Suppress the alternate locating pin",
+            "commands": [{
+                "op": "set_occurrence_suppressed",
+                "assembly_id": 2,
+                "occurrence_id": 8,
+                "suppressed": true
+            }]
+        });
+        let plan: AiPlan = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            plan.commands[0],
+            ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 2,
+                occurrence_id: 8,
+                suppressed: true,
+            }
+        ));
+    }
+
+    #[test]
     fn planning_prompt_redacts_embedded_step_source() {
         let mut document = cadx_core::domain::CadDocument::default();
         document
             .apply(ModelCommand::ImportStep {
                 name: "supplier part".into(),
                 source: "sensitive-step-source".into(),
+                data_section: 0,
                 shell_id: 42,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [0.0; 3],
             })
             .unwrap();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use cadx_core::{
     domain::{CadDocument, FeatureId, ModelCommand},
-    kernel::{CadKernel, CadKernelCapabilities, EvaluatedScene},
+    kernel::{CadKernel, CadKernelCapabilities, EvaluatedScene, InterferenceAnalysis},
 };
 
 use crate::SessionError;
@@ -91,6 +91,20 @@ impl DocumentSession {
     #[must_use]
     pub fn kernel_capabilities(&self) -> CadKernelCapabilities {
         self.kernel.capabilities()
+    }
+
+    /// Runs exact product-level interference analysis over the active revision.
+    ///
+    /// The operation is read-only and does not affect undo history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the active kernel does not support the
+    /// analysis or cannot materialize the document.
+    pub fn analyze_interference(&self) -> Result<InterferenceAnalysis, SessionError> {
+        self.kernel
+            .analyze_interference(&self.document)
+            .map_err(Into::into)
     }
 
     #[must_use]
@@ -242,6 +256,10 @@ impl DocumentSession {
 
 #[cfg(test)]
 mod tests {
+    use cadx_core::assembly::{
+        AssemblyMate, AssemblyMateKind, AssemblyTransform, ComponentDefinition, ComponentKind,
+        ComponentOccurrence,
+    };
     use cadx_core::diagnostics::{
         BooleanDiagnostic, BooleanFailureReason, BooleanFailureStage, EdgeModifierDiagnostic,
         EdgeModifierFailureReason, EdgeModifierFailureStage, EdgeModifierOperation,
@@ -334,6 +352,16 @@ mod tests {
                 ..EvaluatedScene::default()
             })
         }
+
+        fn analyze_interference(
+            &self,
+            document: &CadDocument,
+        ) -> Result<InterferenceAnalysis, KernelError> {
+            Ok(InterferenceAnalysis {
+                candidate_feature_ids: document.features.iter().map(|feature| feature.id).collect(),
+                ..InterferenceAnalysis::default()
+            })
+        }
     }
 
     fn session() -> DocumentSession {
@@ -355,6 +383,18 @@ mod tests {
         assert!(session.document().features.is_empty());
         assert!(!session.can_undo());
         assert_eq!(session.state(), DocumentState::Clean);
+    }
+
+    #[test]
+    fn interference_analysis_is_read_only_and_delegates_to_the_active_kernel() {
+        let mut session = session();
+        session.execute(vec![create_box("body")]).unwrap();
+        let document_before = session.document().clone();
+        let report = session.analyze_interference().unwrap();
+
+        assert_eq!(report.candidate_feature_ids, vec![1]);
+        assert_eq!(session.document(), &document_before);
+        assert!(session.can_undo());
     }
 
     #[test]
@@ -467,6 +507,179 @@ mod tests {
                 - 7_850.0)
                 .abs()
                 < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn occurrence_placement_is_kernel_validated_and_undoable() {
+        let mut document = CadDocument::default();
+        let body = document
+            .apply(create_box("assembly body"))
+            .unwrap()
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "fixture".into(),
+                definitions: vec![ComponentDefinition {
+                    id: 1,
+                    name: "body".into(),
+                    kind: ComponentKind::Part,
+                    source: None,
+                }],
+                occurrences: vec![ComponentOccurrence {
+                    id: 1,
+                    name: "body:1".into(),
+                    definition_id: 1,
+                    parent_id: None,
+                    suppressed: false,
+                    transform: AssemblyTransform::IDENTITY,
+                    feature_ids: vec![body],
+                    source: None,
+                }],
+            })
+            .unwrap();
+        let mut session = DocumentSession::new(Arc::new(TestKernel), document).unwrap();
+
+        session
+            .execute(vec![ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 1,
+                position: [5.0, 6.0, 7.0],
+                rotation: [10.0, 20.0, 30.0],
+            }])
+            .unwrap();
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::new(5.0, 6.0, 7.0)
+        );
+        assert!(session.undo().unwrap());
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::ZERO
+        );
+        assert!(session.redo().unwrap());
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::new(5.0, 6.0, 7.0)
+        );
+
+        session
+            .execute(vec![ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 1,
+                suppressed: true,
+            }])
+            .unwrap();
+        assert!(session.document().assembly(1).unwrap().occurrences[0].suppressed);
+        assert!(session.undo().unwrap());
+        assert!(!session.document().assembly(1).unwrap().occurrences[0].suppressed);
+        assert!(session.redo().unwrap());
+        assert!(session.document().assembly(1).unwrap().occurrences[0].suppressed);
+    }
+
+    #[test]
+    fn assembly_mate_creation_and_state_are_undoable() {
+        let mut document = CadDocument::default();
+        let body = document
+            .apply(ModelCommand::CreateBox {
+                name: "carriage".into(),
+                size: [1.0; 3],
+                position: [10.0, 0.0, 0.0],
+            })
+            .unwrap()
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "stage".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "stage".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "carriage".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "stage:1".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "carriage:1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [10.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![body],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        let mut session = DocumentSession::new(Arc::new(TestKernel), document).unwrap();
+
+        session
+            .execute(vec![ModelCommand::CreateAssemblyMate {
+                assembly_id: 1,
+                mate: AssemblyMate {
+                    id: 1,
+                    name: "travel".into(),
+                    parent_occurrence_id: 1,
+                    child_occurrence_id: 2,
+                    parent_frame: AssemblyTransform {
+                        translation: [10.0, 0.0, 0.0],
+                        ..AssemblyTransform::IDENTITY
+                    },
+                    child_frame: AssemblyTransform::IDENTITY,
+                    kind: AssemblyMateKind::Slider {
+                        axis: [1.0, 0.0, 0.0],
+                        limits_mm: None,
+                    },
+                    state: 0.0,
+                },
+            }])
+            .unwrap();
+        session
+            .execute(vec![ModelCommand::SetAssemblyMateState {
+                assembly_id: 1,
+                mate_id: 1,
+                state: 5.0,
+            }])
+            .unwrap();
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::new(15.0, 0.0, 0.0)
+        );
+
+        assert!(session.undo().unwrap());
+        assert!(session.document().assembly(1).unwrap().mates[0].state.abs() < f64::EPSILON);
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::new(10.0, 0.0, 0.0)
+        );
+        assert!(session.redo().unwrap());
+        assert!(
+            (session.document().assembly(1).unwrap().mates[0].state - 5.0).abs() < f64::EPSILON
+        );
+        assert_eq!(
+            session.document().feature(body).unwrap().translation,
+            cadx_core::domain::Vec3::new(15.0, 0.0, 0.0)
         );
     }
 

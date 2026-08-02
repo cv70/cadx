@@ -8,7 +8,7 @@ use std::{
 
 use truck_meshalgo::prelude::*;
 use truck_modeling::{
-    BSplineCurve, Curve, Edge, Face, Invertible, KnotVec, Line, NurbsCurve, Plane, Point3,
+    BSplineCurve, Curve, Edge, Face, Invertible, KnotVec, Line, Matrix4, NurbsCurve, Plane, Point3,
     Processor, Rad, Shell, Solid, Surface, Transformed, Vector3, Vector4, Vertex, Wire, builder,
 };
 use truck_stepio::{
@@ -23,6 +23,7 @@ use truck_topology::compress::{
 };
 
 use cadx_core::{
+    assembly::{AssemblyDefinitionBody, AssemblyTransform},
     diagnostics::{
         AxisAlignedBounds, BooleanDiagnostic, BooleanFailureReason, BooleanFailureStage,
         EdgeModifierDiagnostic, EdgeModifierFailureReason, EdgeModifierFailureStage,
@@ -34,23 +35,226 @@ use cadx_core::{
     },
     kernel::{
         CadKernel, CadKernelCapabilities, EdgeConvexitySupport, EdgeCountSupport, EdgeCurveSupport,
-        EdgeModifierCapability, EvaluatedDatumPlane, EvaluatedDatumPoint, EvaluatedPart,
-        EvaluatedScene, EvaluatedSketch, EvaluatedSketchDiagnostic, ExchangeKernel, KernelError,
-        SharedVertexSupport, SourceFeatureScope, SupportSurfaceSupport, TriangleMesh,
+        EdgeModifierCapability, EvaluatedDatumPlane, EvaluatedDatumPoint, EvaluatedMeshDefinition,
+        EvaluatedMeshInstance, EvaluatedPart, EvaluatedScene, EvaluatedSketch,
+        EvaluatedSketchDiagnostic, ExchangeKernel, InterferenceAnalysis, InterferenceFailureReason,
+        InterferenceFailureStage, InterferenceIntersectionMethod, InterferencePairAnalysis,
+        InterferencePairOutcome, InterferenceVolumePrecision, KernelError, SharedVertexSupport,
+        SourceFeatureScope, SupportSurfaceSupport, TriangleMesh,
     },
     tolerance::{BooleanTolerancePolicy, BooleanTolerancePolicyError},
     topology::{FaceRef, TopologyResolution},
 };
 
 mod boolean;
+mod step;
 mod topology;
 
+use step::{
+    AssemblyStepExportPlan, StepExportBodyOwner, append_ap242_product_structure, import_step_solid,
+    partition_step_export_solids,
+};
 use topology::NamedSolid;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TruckKernel {
     tolerance: f64,
     boolean_tolerance_policy: BooleanTolerancePolicy,
+}
+
+#[derive(Default)]
+struct ImportedStepSolidCache {
+    local_solids: HashMap<AssemblyDefinitionBody, Solid>,
+}
+
+impl ImportedStepSolidCache {
+    fn instantiate(
+        &mut self,
+        key: Option<AssemblyDefinitionBody>,
+        reconstruct: impl FnOnce() -> Result<Solid, KernelError>,
+    ) -> Result<Solid, KernelError> {
+        if let Some(solid) = key.and_then(|key| self.local_solids.get(&key)) {
+            return Ok(builder::clone(solid));
+        }
+
+        let solid = reconstruct()?;
+        #[cfg(test)]
+        IMPORTED_STEP_RECONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
+        if let Some(key) = key {
+            self.local_solids.insert(key, builder::clone(&solid));
+        }
+        Ok(solid)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMPORTED_STEP_RECONSTRUCTION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_imported_step_reconstruction_count() {
+    IMPORTED_STEP_RECONSTRUCTION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn imported_step_reconstruction_count() -> usize {
+    IMPORTED_STEP_RECONSTRUCTION_COUNT.with(std::cell::Cell::get)
+}
+
+fn shared_imported_step_bodies(
+    document: &CadDocument,
+) -> HashMap<FeatureId, AssemblyDefinitionBody> {
+    reusable_definition_bodies(document, |primitive| {
+        matches!(primitive, Primitive::ImportedStep { .. })
+    })
+}
+
+fn reusable_render_bodies(document: &CadDocument) -> HashMap<FeatureId, AssemblyDefinitionBody> {
+    reusable_definition_bodies(document, |primitive| {
+        matches!(
+            primitive,
+            Primitive::Box { .. }
+                | Primitive::Cylinder { .. }
+                | Primitive::Sphere { .. }
+                | Primitive::Cone { .. }
+                | Primitive::Torus { .. }
+                | Primitive::Extrusion { .. }
+                | Primitive::ImportedStep { .. }
+        )
+    })
+}
+
+fn reusable_definition_bodies(
+    document: &CadDocument,
+    eligible: impl Fn(&Primitive) -> bool,
+) -> HashMap<FeatureId, AssemblyDefinitionBody> {
+    let instances = document.assembly_feature_instances();
+    let mut occurrences_by_definition = BTreeMap::new();
+    for assembly in &document.assemblies {
+        for occurrence in &assembly.occurrences {
+            occurrences_by_definition
+                .entry((assembly.id, occurrence.definition_id))
+                .or_insert_with(Vec::new)
+                .push(occurrence);
+        }
+    }
+
+    let mut reusable = HashMap::new();
+    for ((assembly_id, definition_id), occurrences) in occurrences_by_definition {
+        let Some(first) = occurrences.first() else {
+            continue;
+        };
+        let body_count = first.feature_ids.len();
+        if occurrences.len() < 2
+            || body_count == 0
+            || occurrences
+                .iter()
+                .any(|occurrence| occurrence.feature_ids.len() != body_count)
+        {
+            continue;
+        }
+        let compatible = (0..body_count).all(|body_slot| {
+            let Some(reference) = document
+                .feature(first.feature_ids[body_slot])
+                .map(|feature| &feature.primitive)
+                .filter(|primitive| eligible(primitive))
+            else {
+                return false;
+            };
+            occurrences.iter().skip(1).all(|occurrence| {
+                document
+                    .feature(occurrence.feature_ids[body_slot])
+                    .is_some_and(|feature| feature.primitive == *reference)
+            })
+        });
+        if !compatible {
+            continue;
+        }
+
+        for occurrence in occurrences {
+            for feature_id in &occurrence.feature_ids {
+                let Some(instance) = instances.get(feature_id) else {
+                    continue;
+                };
+                debug_assert_eq!(instance.assembly_id, assembly_id);
+                debug_assert_eq!(instance.definition_id, definition_id);
+                reusable.insert(*feature_id, instance.definition_body());
+            }
+        }
+    }
+    reusable
+}
+
+fn instanced_render_geometry(
+    document: &CadDocument,
+    parts: &[EvaluatedPart],
+    reusable_bodies: &HashMap<FeatureId, AssemblyDefinitionBody>,
+) -> (Vec<EvaluatedMeshDefinition>, Vec<EvaluatedMeshInstance>) {
+    let mut parts_by_definition = BTreeMap::<AssemblyDefinitionBody, Vec<&EvaluatedPart>>::new();
+    for part in parts {
+        if let Some(key) = reusable_bodies.get(&part.feature_id) {
+            parts_by_definition.entry(*key).or_default().push(part);
+        }
+    }
+
+    let mut definitions = Vec::new();
+    let mut instances = Vec::new();
+    for (key, grouped_parts) in parts_by_definition {
+        if grouped_parts.len() < 2 {
+            continue;
+        }
+        let Some(first_feature) = document.feature(grouped_parts[0].feature_id) else {
+            continue;
+        };
+        let first_transform = AssemblyTransform::from_euler_xyz_degrees(
+            first_feature.translation.as_array(),
+            first_feature.rotation.as_array(),
+        );
+        definitions.push(EvaluatedMeshDefinition {
+            key,
+            mesh: transform_triangle_mesh(&grouped_parts[0].mesh, first_transform.inverse()),
+        });
+        instances.extend(grouped_parts.into_iter().filter_map(|part| {
+            let feature = document.feature(part.feature_id)?;
+            Some(EvaluatedMeshInstance {
+                feature_id: part.feature_id,
+                definition: key,
+                transform: AssemblyTransform::from_euler_xyz_degrees(
+                    feature.translation.as_array(),
+                    feature.rotation.as_array(),
+                ),
+            })
+        }));
+    }
+    (definitions, instances)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn transform_triangle_mesh(mesh: &TriangleMesh, transform: AssemblyTransform) -> TriangleMesh {
+    TriangleMesh {
+        positions: mesh
+            .positions
+            .iter()
+            .map(|position| {
+                transform
+                    .transform_point(position.map(f64::from))
+                    .map(|value| value as f32)
+            })
+            .collect(),
+        normals: mesh
+            .normals
+            .iter()
+            .map(|normal| {
+                transform
+                    .transform_vector(normal.map(f64::from))
+                    .map(|value| value as f32)
+            })
+            .collect(),
+        indices: mesh.indices.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -383,9 +587,18 @@ impl TruckKernel {
         document: &CadDocument,
         upstream: &HashMap<FeatureId, NamedSolid>,
         sketch_frames: &HashMap<FeatureId, SketchFrame>,
+        shared_imports: &HashMap<FeatureId, AssemblyDefinitionBody>,
+        imported_step_cache: &mut ImportedStepSolidCache,
     ) -> Result<(NamedSolid, EvaluatedPart), KernelError> {
         let solid = self
-            .build_solid(feature, document, upstream, sketch_frames)
+            .build_solid(
+                feature,
+                document,
+                upstream,
+                sketch_frames,
+                shared_imports,
+                imported_step_cache,
+            )
             .map_err(|error| self.enrich_feature_error(feature, upstream, error))?;
         let (mesh, faces, edges, vertices) =
             topology::evaluated_topology(feature, &solid, self.tolerance)
@@ -412,6 +625,8 @@ impl TruckKernel {
         document: &CadDocument,
         upstream: &HashMap<FeatureId, NamedSolid>,
         sketch_frames: &HashMap<FeatureId, SketchFrame>,
+        shared_imports: &HashMap<FeatureId, AssemblyDefinitionBody>,
+        imported_step_cache: &mut ImportedStepSolidCache,
     ) -> Result<NamedSolid, KernelError> {
         let origin = feature.translation;
         let build_extrusion = |frame: SketchFrame,
@@ -501,264 +716,231 @@ impl TruckKernel {
                 Rad(angle.to_radians()),
             ))
         };
-        let (mut solid, faces) = match feature.primitive.clone() {
-            Primitive::Box { size } => {
-                let vertex = builder::vertex(Point3::new(origin.x, origin.y, origin.z));
-                let edge = builder::tsweep(&vertex, Vector3::new(size.x, 0.0, 0.0));
-                let face = builder::tsweep(&edge, Vector3::new(0.0, size.y, 0.0));
-                let solid = builder::tsweep(&face, Vector3::new(0.0, 0.0, size.z));
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::Cylinder { radius, height } => {
-                let center = Point3::new(origin.x, origin.y, origin.z);
-                let start = Point3::new(origin.x + radius, origin.y, origin.z);
-                let vertex = builder::vertex(start);
-                let circle: Wire = builder::rsweep(&vertex, center, Vector3::unit_z(), Rad(TAU));
-                let disk: Face = builder::try_attach_plane(&[circle]).map_err(|error| {
-                    KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!("could not construct cylinder profile: {error}"),
+        let (mut solid, faces) = if let Primitive::ImportedStep {
+            source,
+            data_section,
+            shell_id,
+            void_shells,
+            length_unit,
+        } = &feature.primitive
+        {
+            let key = shared_imports.get(&feature.id).copied();
+            let solid = imported_step_cache.instantiate(key, || {
+                let mut solid =
+                    import_step_solid(feature, source, *data_section, *shell_id, void_shells)?;
+                let scale = length_unit.millimeters_per_unit;
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    solid = builder::scaled(
+                        &solid,
+                        Point3::origin(),
+                        Vector3::new(scale, scale, scale),
+                    );
+                }
+                Ok(solid)
+            })?;
+            let faces = topology::name_primitive_faces(
+                feature,
+                &feature.primitive,
+                &solid,
+                self.tolerance,
+            )?;
+            (solid, faces)
+        } else {
+            match feature.primitive.clone() {
+                Primitive::Box { size } => {
+                    let vertex = builder::vertex(Point3::new(origin.x, origin.y, origin.z));
+                    let edge = builder::tsweep(&vertex, Vector3::new(size.x, 0.0, 0.0));
+                    let face = builder::tsweep(&edge, Vector3::new(0.0, size.y, 0.0));
+                    let solid = builder::tsweep(&face, Vector3::new(0.0, 0.0, size.z));
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
+                }
+                Primitive::Cylinder { radius, height } => {
+                    let center = Point3::new(origin.x, origin.y, origin.z);
+                    let start = Point3::new(origin.x + radius, origin.y, origin.z);
+                    let vertex = builder::vertex(start);
+                    let circle: Wire =
+                        builder::rsweep(&vertex, center, Vector3::unit_z(), Rad(TAU));
+                    let disk: Face = builder::try_attach_plane(&[circle]).map_err(|error| {
+                        KernelError::Evaluation {
+                            feature_id: feature.id,
+                            message: format!("could not construct cylinder profile: {error}"),
+                        }
+                    })?;
+                    let solid = builder::tsweep(&disk, Vector3::new(0.0, 0.0, height));
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
+                }
+                Primitive::Sphere { radius } => {
+                    let center = Point3::new(origin.x, origin.y, origin.z);
+                    let vertex =
+                        builder::vertex(Point3::new(origin.x, origin.y + radius, origin.z));
+                    let meridian: Wire =
+                        builder::rsweep(&vertex, center, Vector3::unit_x(), Rad(TAU / 2.0));
+                    let shell = builder::cone(&meridian, Vector3::unit_y(), Rad(TAU));
+                    let solid = Solid::new(vec![shell]);
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
+                }
+                Primitive::Cone {
+                    bottom_radius,
+                    top_radius,
+                    height,
+                } => {
+                    let bottom_center = builder::vertex(Point3::new(origin.x, origin.y, origin.z));
+                    let bottom_outer =
+                        builder::vertex(Point3::new(origin.x + bottom_radius, origin.y, origin.z));
+                    let top_center =
+                        builder::vertex(Point3::new(origin.x, origin.y, origin.z + height));
+                    let mut profile = vec![builder::line(&bottom_center, &bottom_outer)];
+                    if top_radius > 0.0 {
+                        let top_outer = builder::vertex(Point3::new(
+                            origin.x + top_radius,
+                            origin.y,
+                            origin.z + height,
+                        ));
+                        profile.push(builder::line(&bottom_outer, &top_outer));
+                        profile.push(builder::line(&top_outer, &top_center));
+                    } else {
+                        profile.push(builder::line(&bottom_outer, &top_center));
                     }
-                })?;
-                let solid = builder::tsweep(&disk, Vector3::new(0.0, 0.0, height));
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::Sphere { radius } => {
-                let center = Point3::new(origin.x, origin.y, origin.z);
-                let vertex = builder::vertex(Point3::new(origin.x, origin.y + radius, origin.z));
-                let meridian: Wire =
-                    builder::rsweep(&vertex, center, Vector3::unit_x(), Rad(TAU / 2.0));
-                let shell = builder::cone(&meridian, Vector3::unit_y(), Rad(TAU));
-                let solid = Solid::new(vec![shell]);
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::Cone {
-                bottom_radius,
-                top_radius,
-                height,
-            } => {
-                let bottom_center = builder::vertex(Point3::new(origin.x, origin.y, origin.z));
-                let bottom_outer =
-                    builder::vertex(Point3::new(origin.x + bottom_radius, origin.y, origin.z));
-                let top_center =
-                    builder::vertex(Point3::new(origin.x, origin.y, origin.z + height));
-                let mut profile = vec![builder::line(&bottom_center, &bottom_outer)];
-                if top_radius > 0.0 {
-                    let top_outer = builder::vertex(Point3::new(
-                        origin.x + top_radius,
+                    let profile: Wire = profile.into();
+                    let shell = builder::cone(&profile, Vector3::unit_z(), Rad(TAU));
+                    let solid = Solid::new(vec![shell]);
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
+                }
+                Primitive::Torus {
+                    major_radius,
+                    minor_radius,
+                } => {
+                    let section_start = builder::vertex(Point3::new(
+                        origin.x + major_radius,
                         origin.y,
-                        origin.z + height,
+                        origin.z + minor_radius,
                     ));
-                    profile.push(builder::line(&bottom_outer, &top_outer));
-                    profile.push(builder::line(&top_outer, &top_center));
-                } else {
-                    profile.push(builder::line(&bottom_outer, &top_center));
+                    let section = builder::rsweep(
+                        &section_start,
+                        Point3::new(origin.x + major_radius, origin.y, origin.z),
+                        Vector3::unit_y(),
+                        Rad(TAU),
+                    );
+                    let shell = builder::rsweep(
+                        &section,
+                        Point3::new(origin.x, origin.y, origin.z),
+                        Vector3::unit_z(),
+                        Rad(TAU),
+                    );
+                    let solid = Solid::new(vec![shell]);
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
                 }
-                let profile: Wire = profile.into();
-                let shell = builder::cone(&profile, Vector3::unit_z(), Rad(TAU));
-                let solid = Solid::new(vec![shell]);
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::Torus {
-                major_radius,
-                minor_radius,
-            } => {
-                let section_start = builder::vertex(Point3::new(
-                    origin.x + major_radius,
-                    origin.y,
-                    origin.z + minor_radius,
-                ));
-                let section = builder::rsweep(
-                    &section_start,
-                    Point3::new(origin.x + major_radius, origin.y, origin.z),
-                    Vector3::unit_y(),
-                    Rad(TAU),
-                );
-                let shell = builder::rsweep(
-                    &section,
-                    Point3::new(origin.x, origin.y, origin.z),
-                    Vector3::unit_z(),
-                    Rad(TAU),
-                );
-                let solid = Solid::new(vec![shell]);
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::Extrusion { profile, height } => {
-                let region = SketchRegion2D::from_polygons(profile.clone(), Vec::new());
-                let solid = build_extrusion(
-                    SketchFrame::WORLD_XY.with_model_offset(origin),
-                    &region,
-                    height,
-                )?;
-                let faces = topology::name_primitive_faces(
-                    feature,
-                    &feature.primitive,
-                    &solid,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::ExtrusionFromSketch {
-                sketch_id, height, ..
-            } => {
-                let sketch =
-                    document
-                        .feature(sketch_id)
-                        .ok_or_else(|| KernelError::Evaluation {
-                            feature_id: feature.id,
-                            message: format!("source sketch {sketch_id} does not exist"),
-                        })?;
-                let Primitive::Sketch {
-                    region,
-                    construction,
-                    constraints,
-                    ..
-                } = &sketch.primitive
-                else {
-                    return Err(KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!("source feature {sketch_id} is not a sketch"),
-                    });
-                };
-                let region = cadx_sketch::solve_sketch(
-                    region,
-                    construction,
-                    constraints,
-                    cadx_sketch::SolverConfig::default(),
-                )
-                .map_err(|error| KernelError::Evaluation {
-                    feature_id: feature.id,
-                    message: format!("source sketch {sketch_id} constraints failed: {error}"),
-                })?
-                .region;
-                let frame = sketch_frames.get(&sketch_id).copied().ok_or_else(|| {
-                    KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!("source sketch {sketch_id} has no resolved work plane"),
-                    }
-                })?;
-                let frame = frame.with_model_offset(origin);
-                let solid = build_extrusion(frame, &region, height)?;
-                let faces = topology::name_extrusion_faces(
-                    feature,
-                    &region,
-                    height,
-                    &solid,
-                    frame.origin,
-                    frame.x_dir,
-                    frame.y_dir,
-                    frame.normal,
-                    self.tolerance,
-                )?;
-                (solid, faces)
-            }
-            Primitive::RevolveFromSketch {
-                sketch_id,
-                profile: _,
-                axis_origin,
-                axis_direction,
-                angle,
-            } => {
-                let sketch =
-                    document
-                        .feature(sketch_id)
-                        .ok_or_else(|| KernelError::Evaluation {
-                            feature_id: feature.id,
-                            message: format!("source sketch {sketch_id} does not exist"),
-                        })?;
-                let Primitive::Sketch {
-                    region,
-                    construction,
-                    constraints,
-                    ..
-                } = &sketch.primitive
-                else {
-                    return Err(KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!("source feature {sketch_id} is not a sketch"),
-                    });
-                };
-                if !region.holes.is_empty() {
-                    return Err(KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!(
-                            "source sketch {sketch_id} has hole loops, which revolve does not support"
-                        ),
-                    });
+                Primitive::Extrusion { profile, height } => {
+                    let region = SketchRegion2D::from_polygons(profile.clone(), Vec::new());
+                    let solid = build_extrusion(
+                        SketchFrame::WORLD_XY.with_model_offset(origin),
+                        &region,
+                        height,
+                    )?;
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &feature.primitive,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
                 }
-                let region = cadx_sketch::solve_sketch(
-                    region,
-                    construction,
-                    constraints,
-                    cadx_sketch::SolverConfig::default(),
-                )
-                .map_err(|error| KernelError::Evaluation {
-                    feature_id: feature.id,
-                    message: format!("source sketch {sketch_id} constraints failed: {error}"),
-                })?
-                .region;
-                let profile = region.profile;
-                let frame = sketch_frames.get(&sketch_id).copied().ok_or_else(|| {
-                    KernelError::Evaluation {
-                        feature_id: feature.id,
-                        message: format!("source sketch {sketch_id} has no resolved work plane"),
-                    }
-                })?;
-                let solid = build_revolve(
-                    frame.with_model_offset(origin),
-                    &profile,
-                    axis_origin,
-                    axis_direction,
-                    angle,
-                )?;
-                let effective = Primitive::RevolveFromSketch {
-                    sketch_id,
-                    profile,
-                    axis_origin,
-                    axis_direction,
-                    angle,
-                };
-                let faces =
-                    topology::name_primitive_faces(feature, &effective, &solid, self.tolerance)?;
-                (solid, faces)
-            }
-            Primitive::LoftFromSketches { sketch_ids, .. } => {
-                let mut profiles = Vec::with_capacity(sketch_ids.len());
-                let mut frames = Vec::with_capacity(sketch_ids.len());
-                for sketch_id in &sketch_ids {
+                Primitive::ExtrusionFromSketch {
+                    sketch_id, height, ..
+                } => {
                     let sketch =
                         document
-                            .feature(*sketch_id)
+                            .feature(sketch_id)
+                            .ok_or_else(|| KernelError::Evaluation {
+                                feature_id: feature.id,
+                                message: format!("source sketch {sketch_id} does not exist"),
+                            })?;
+                    let Primitive::Sketch {
+                        region,
+                        construction,
+                        constraints,
+                        ..
+                    } = &sketch.primitive
+                    else {
+                        return Err(KernelError::Evaluation {
+                            feature_id: feature.id,
+                            message: format!("source feature {sketch_id} is not a sketch"),
+                        });
+                    };
+                    let region = cadx_sketch::solve_sketch(
+                        region,
+                        construction,
+                        constraints,
+                        cadx_sketch::SolverConfig::default(),
+                    )
+                    .map_err(|error| KernelError::Evaluation {
+                        feature_id: feature.id,
+                        message: format!("source sketch {sketch_id} constraints failed: {error}"),
+                    })?
+                    .region;
+                    let frame = sketch_frames.get(&sketch_id).copied().ok_or_else(|| {
+                        KernelError::Evaluation {
+                            feature_id: feature.id,
+                            message: format!(
+                                "source sketch {sketch_id} has no resolved work plane"
+                            ),
+                        }
+                    })?;
+                    let frame = frame.with_model_offset(origin);
+                    let solid = build_extrusion(frame, &region, height)?;
+                    let faces = topology::name_extrusion_faces(
+                        feature,
+                        &region,
+                        height,
+                        &solid,
+                        frame.origin,
+                        frame.x_dir,
+                        frame.y_dir,
+                        frame.normal,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
+                }
+                Primitive::RevolveFromSketch {
+                    sketch_id,
+                    profile: _,
+                    axis_origin,
+                    axis_direction,
+                    angle,
+                } => {
+                    let sketch =
+                        document
+                            .feature(sketch_id)
                             .ok_or_else(|| KernelError::Evaluation {
                                 feature_id: feature.id,
                                 message: format!("source sketch {sketch_id} does not exist"),
@@ -779,11 +961,11 @@ impl TruckKernel {
                         return Err(KernelError::Evaluation {
                             feature_id: feature.id,
                             message: format!(
-                                "source sketch {sketch_id} has hole loops, which ruled loft does not support"
+                                "source sketch {sketch_id} has hole loops, which revolve does not support"
                             ),
                         });
                     }
-                    let solved = cadx_sketch::solve_sketch(
+                    let region = cadx_sketch::solve_sketch(
                         region,
                         construction,
                         constraints,
@@ -792,230 +974,306 @@ impl TruckKernel {
                     .map_err(|error| KernelError::Evaluation {
                         feature_id: feature.id,
                         message: format!("source sketch {sketch_id} constraints failed: {error}"),
-                    })?;
-                    profiles.push(solved.region.profile);
-                    frames.push(*sketch_frames.get(sketch_id).ok_or_else(|| {
+                    })?
+                    .region;
+                    let profile = region.profile;
+                    let frame = sketch_frames.get(&sketch_id).copied().ok_or_else(|| {
                         KernelError::Evaluation {
                             feature_id: feature.id,
                             message: format!(
                                 "source sketch {sketch_id} has no resolved work plane"
                             ),
                         }
-                    })?);
+                    })?;
+                    let solid = build_revolve(
+                        frame.with_model_offset(origin),
+                        &profile,
+                        axis_origin,
+                        axis_direction,
+                        angle,
+                    )?;
+                    let effective = Primitive::RevolveFromSketch {
+                        sketch_id,
+                        profile,
+                        axis_origin,
+                        axis_direction,
+                        angle,
+                    };
+                    let faces = topology::name_primitive_faces(
+                        feature,
+                        &effective,
+                        &solid,
+                        self.tolerance,
+                    )?;
+                    (solid, faces)
                 }
-                let solid = build_loft_solid(feature, &frames, &profiles, origin, self.tolerance)?;
-                let effective = Primitive::LoftFromSketches {
-                    sketch_ids,
-                    profiles,
-                };
-                let faces = topology::name_loft_faces(feature, &effective, &solid)?;
-                (solid, faces)
-            }
-            Primitive::ImportedStep { source, shell_id } => {
-                let solid = import_step_solid(feature, &source, shell_id)?;
-                let effective = Primitive::ImportedStep { source, shell_id };
-                let faces =
-                    topology::name_primitive_faces(feature, &effective, &solid, self.tolerance)?;
-                (solid, faces)
-            }
-            Primitive::Chamfer { edges, distance } => {
-                let Some(source_id) = edges.first().map(|edge| edge.feature_id) else {
-                    return Err(edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::EmptyEdgeSet,
-                        None,
-                        "chamfer requires at least one edge",
-                    ));
-                };
-                if edges.iter().any(|edge| edge.feature_id != source_id) {
-                    return Err(edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::MixedSourceFeatures,
-                        None,
-                        "chamfer edges must belong to one source feature",
-                    ));
+                Primitive::LoftFromSketches { sketch_ids, .. } => {
+                    let mut profiles = Vec::with_capacity(sketch_ids.len());
+                    let mut frames = Vec::with_capacity(sketch_ids.len());
+                    for sketch_id in &sketch_ids {
+                        let sketch = document.feature(*sketch_id).ok_or_else(|| {
+                            KernelError::Evaluation {
+                                feature_id: feature.id,
+                                message: format!("source sketch {sketch_id} does not exist"),
+                            }
+                        })?;
+                        let Primitive::Sketch {
+                            region,
+                            construction,
+                            constraints,
+                            ..
+                        } = &sketch.primitive
+                        else {
+                            return Err(KernelError::Evaluation {
+                                feature_id: feature.id,
+                                message: format!("source feature {sketch_id} is not a sketch"),
+                            });
+                        };
+                        if !region.holes.is_empty() {
+                            return Err(KernelError::Evaluation {
+                                feature_id: feature.id,
+                                message: format!(
+                                    "source sketch {sketch_id} has hole loops, which ruled loft does not support"
+                                ),
+                            });
+                        }
+                        let solved = cadx_sketch::solve_sketch(
+                            region,
+                            construction,
+                            constraints,
+                            cadx_sketch::SolverConfig::default(),
+                        )
+                        .map_err(|error| KernelError::Evaluation {
+                            feature_id: feature.id,
+                            message: format!(
+                                "source sketch {sketch_id} constraints failed: {error}"
+                            ),
+                        })?;
+                        profiles.push(solved.region.profile);
+                        frames.push(*sketch_frames.get(sketch_id).ok_or_else(|| {
+                            KernelError::Evaluation {
+                                feature_id: feature.id,
+                                message: format!(
+                                    "source sketch {sketch_id} has no resolved work plane"
+                                ),
+                            }
+                        })?);
+                    }
+                    let solid =
+                        build_loft_solid(feature, &frames, &profiles, origin, self.tolerance)?;
+                    let effective = Primitive::LoftFromSketches {
+                        sketch_ids,
+                        profiles,
+                    };
+                    let faces = topology::name_loft_faces(feature, &effective, &solid)?;
+                    (solid, faces)
                 }
-                let source = upstream.get(&source_id).ok_or_else(|| {
-                    edge_modifier_error(
+                Primitive::ImportedStep { .. } => unreachable!("handled before primitive cloning"),
+                Primitive::Chamfer { edges, distance } => {
+                    let Some(source_id) = edges.first().map(|edge| edge.feature_id) else {
+                        return Err(edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::EmptyEdgeSet,
+                            None,
+                            "chamfer requires at least one edge",
+                        ));
+                    };
+                    if edges.iter().any(|edge| edge.feature_id != source_id) {
+                        return Err(edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::MixedSourceFeatures,
+                            None,
+                            "chamfer edges must belong to one source feature",
+                        ));
+                    }
+                    let source = upstream.get(&source_id).ok_or_else(|| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::LostReference,
+                            None,
+                            format!("chamfer source feature {source_id} was not evaluated"),
+                        )
+                    })?;
+                    let source_feature = document.feature(source_id).ok_or_else(|| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::LostReference,
+                            None,
+                            format!(
+                                "chamfer source feature {source_id} is missing from the document"
+                            ),
+                        )
+                    })?;
+                    let (solid, generated) = build_chamfer(
                         feature,
+                        source_feature,
+                        source,
+                        &edges,
+                        distance,
                         self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::LostReference,
-                        None,
-                        format!("chamfer source feature {source_id} was not evaluated"),
+                    )?;
+                    let faces = topology::name_edge_modifier_faces(
+                        feature,
+                        &solid,
+                        source,
+                        &generated,
+                        "chamfer",
+                        self.tolerance,
                     )
-                })?;
-                let source_feature = document.feature(source_id).ok_or_else(|| {
-                    edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::LostReference,
-                        None,
-                        format!("chamfer source feature {source_id} is missing from the document"),
-                    )
-                })?;
-                let (solid, generated) = build_chamfer(
-                    feature,
-                    source_feature,
-                    source,
-                    &edges,
-                    distance,
-                    self.tolerance,
-                )?;
-                let faces = topology::name_edge_modifier_faces(
-                    feature,
-                    &solid,
-                    source,
-                    &generated,
-                    "chamfer",
-                    self.tolerance,
-                )
-                .map_err(|error| {
-                    edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::TopologyNaming,
-                        EdgeModifierFailureReason::TopologyNamingFailed,
-                        None,
-                        error.to_string(),
-                    )
-                })?;
-                (solid, faces)
-            }
-            Primitive::Fillet { edges, radius } => {
-                let Some(source_id) = edges.first().map(|edge| edge.feature_id) else {
-                    return Err(edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::EmptyEdgeSet,
-                        None,
-                        "fillet requires at least one edge",
-                    ));
-                };
-                if edges.iter().any(|edge| edge.feature_id != source_id) {
-                    return Err(edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::MixedSourceFeatures,
-                        None,
-                        "fillet edges must belong to one source feature",
-                    ));
+                    .map_err(|error| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::TopologyNaming,
+                            EdgeModifierFailureReason::TopologyNamingFailed,
+                            None,
+                            error.to_string(),
+                        )
+                    })?;
+                    (solid, faces)
                 }
-                let source = upstream.get(&source_id).ok_or_else(|| {
-                    edge_modifier_error(
+                Primitive::Fillet { edges, radius } => {
+                    let Some(source_id) = edges.first().map(|edge| edge.feature_id) else {
+                        return Err(edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::EmptyEdgeSet,
+                            None,
+                            "fillet requires at least one edge",
+                        ));
+                    };
+                    if edges.iter().any(|edge| edge.feature_id != source_id) {
+                        return Err(edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::MixedSourceFeatures,
+                            None,
+                            "fillet edges must belong to one source feature",
+                        ));
+                    }
+                    let source = upstream.get(&source_id).ok_or_else(|| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::LostReference,
+                            None,
+                            format!("fillet source feature {source_id} was not evaluated"),
+                        )
+                    })?;
+                    let source_feature = document.feature(source_id).ok_or_else(|| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::ReferenceResolution,
+                            EdgeModifierFailureReason::LostReference,
+                            None,
+                            format!(
+                                "fillet source feature {source_id} is missing from the document"
+                            ),
+                        )
+                    })?;
+                    let (solid, generated) = build_fillet(
                         feature,
+                        source_feature,
+                        source,
+                        &edges,
+                        radius,
                         self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::LostReference,
-                        None,
-                        format!("fillet source feature {source_id} was not evaluated"),
-                    )
-                })?;
-                let source_feature = document.feature(source_id).ok_or_else(|| {
-                    edge_modifier_error(
+                    )?;
+                    let faces = topology::name_edge_modifier_faces(
                         feature,
+                        &solid,
+                        source,
+                        &generated,
+                        "fillet",
                         self.tolerance,
-                        EdgeModifierFailureStage::ReferenceResolution,
-                        EdgeModifierFailureReason::LostReference,
-                        None,
-                        format!("fillet source feature {source_id} is missing from the document"),
                     )
-                })?;
-                let (solid, generated) = build_fillet(
-                    feature,
-                    source_feature,
-                    source,
-                    &edges,
-                    radius,
-                    self.tolerance,
-                )?;
-                let faces = topology::name_edge_modifier_faces(
-                    feature,
-                    &solid,
-                    source,
-                    &generated,
-                    "fillet",
-                    self.tolerance,
-                )
-                .map_err(|error| {
-                    edge_modifier_error(
-                        feature,
-                        self.tolerance,
-                        EdgeModifierFailureStage::TopologyNaming,
-                        EdgeModifierFailureReason::TopologyNamingFailed,
-                        None,
-                        error.to_string(),
-                    )
-                })?;
-                (solid, faces)
-            }
-            Primitive::Boolean {
-                operation,
-                left,
-                right,
-            } => {
-                let left_solid = upstream.get(&left).ok_or_else(|| {
-                    KernelError::from(boolean_diagnostic(
-                        feature,
-                        operation,
-                        [left, right],
-                        self.boolean_tolerance_policy.absolute_mm,
-                        None,
-                        None,
-                        BooleanFailureStage::OperandResolution,
-                        BooleanFailureReason::MissingOperand,
-                        format!("upstream solid {left} was not evaluated"),
-                    ))
-                })?;
-                let right_solid = upstream.get(&right).ok_or_else(|| {
-                    KernelError::from(boolean_diagnostic(
-                        feature,
-                        operation,
-                        [left, right],
-                        self.boolean_tolerance_policy.absolute_mm,
-                        solid_bounds(&left_solid.solid),
-                        None,
-                        BooleanFailureStage::OperandResolution,
-                        BooleanFailureReason::MissingOperand,
-                        format!("upstream solid {right} was not evaluated"),
-                    ))
-                })?;
-                boolean::evaluate(
-                    feature,
+                    .map_err(|error| {
+                        edge_modifier_error(
+                            feature,
+                            self.tolerance,
+                            EdgeModifierFailureStage::TopologyNaming,
+                            EdgeModifierFailureReason::TopologyNamingFailed,
+                            None,
+                            error.to_string(),
+                        )
+                    })?;
+                    (solid, faces)
+                }
+                Primitive::Boolean {
                     operation,
-                    [left, right],
-                    left_solid,
-                    right_solid,
-                    self.boolean_tolerance_policy,
-                )?
-            }
-            Primitive::Sketch { .. } => {
-                return Err(KernelError::Evaluation {
-                    feature_id: feature.id,
-                    message: "sketches are reference geometry and do not produce a solid mesh"
-                        .into(),
-                });
-            }
-            Primitive::DatumPlane { .. } => {
-                return Err(KernelError::Evaluation {
-                    feature_id: feature.id,
-                    message: "datum planes are reference geometry and do not produce a solid mesh"
-                        .into(),
-                });
-            }
-            Primitive::DatumPoint { .. } => {
-                return Err(KernelError::Evaluation {
-                    feature_id: feature.id,
-                    message: "datum points are reference geometry and do not produce a solid mesh"
-                        .into(),
-                });
+                    left,
+                    right,
+                } => {
+                    let left_solid = upstream.get(&left).ok_or_else(|| {
+                        KernelError::from(boolean_diagnostic(
+                            feature,
+                            operation,
+                            [left, right],
+                            self.boolean_tolerance_policy.absolute_mm,
+                            None,
+                            None,
+                            BooleanFailureStage::OperandResolution,
+                            BooleanFailureReason::MissingOperand,
+                            format!("upstream solid {left} was not evaluated"),
+                        ))
+                    })?;
+                    let right_solid = upstream.get(&right).ok_or_else(|| {
+                        KernelError::from(boolean_diagnostic(
+                            feature,
+                            operation,
+                            [left, right],
+                            self.boolean_tolerance_policy.absolute_mm,
+                            solid_bounds(&left_solid.solid),
+                            None,
+                            BooleanFailureStage::OperandResolution,
+                            BooleanFailureReason::MissingOperand,
+                            format!("upstream solid {right} was not evaluated"),
+                        ))
+                    })?;
+                    boolean::evaluate(
+                        feature,
+                        operation,
+                        [left, right],
+                        left_solid,
+                        right_solid,
+                        self.boolean_tolerance_policy,
+                    )?
+                }
+                Primitive::Sketch { .. } => {
+                    return Err(KernelError::Evaluation {
+                        feature_id: feature.id,
+                        message: "sketches are reference geometry and do not produce a solid mesh"
+                            .into(),
+                    });
+                }
+                Primitive::DatumPlane { .. } => {
+                    return Err(KernelError::Evaluation {
+                        feature_id: feature.id,
+                        message:
+                            "datum planes are reference geometry and do not produce a solid mesh"
+                                .into(),
+                    });
+                }
+                Primitive::DatumPoint { .. } => {
+                    return Err(KernelError::Evaluation {
+                        feature_id: feature.id,
+                        message:
+                            "datum points are reference geometry and do not produce a solid mesh"
+                                .into(),
+                    });
+                }
             }
         };
         let is_derived = matches!(
@@ -2364,43 +2622,6 @@ fn resolve_planar_face_frame(
     })
 }
 
-fn import_step_solid(feature: &Feature, source: &str, shell_id: u64) -> Result<Solid, KernelError> {
-    let exchange = truck_stepio::r#in::ruststep::parser::parse(source).map_err(|error| {
-        KernelError::Evaluation {
-            feature_id: feature.id,
-            message: format!("STEP source could not be parsed: {error}"),
-        }
-    })?;
-    let data = exchange
-        .data
-        .first()
-        .ok_or_else(|| KernelError::Evaluation {
-            feature_id: feature.id,
-            message: "STEP source contains no DATA section".into(),
-        })?;
-    let table = Table::from_data_section(data);
-    let shell = table
-        .shell
-        .get(&shell_id)
-        .ok_or_else(|| KernelError::Evaluation {
-            feature_id: feature.id,
-            message: format!("STEP shell entity #{shell_id} could not be resolved"),
-        })?;
-    let compressed = table
-        .to_compressed_shell(shell)
-        .map_err(|error| KernelError::Evaluation {
-            feature_id: feature.id,
-            message: format!("STEP shell #{shell_id} could not be converted: {error}"),
-        })?;
-    let compressed = convert_compressed_shell(feature, compressed)?;
-    let shell =
-        truck_modeling::Shell::extract(compressed).map_err(|error| KernelError::Evaluation {
-            feature_id: feature.id,
-            message: format!("STEP shell #{shell_id} is not a valid closed B-Rep: {error}"),
-        })?;
-    Ok(Solid::new(vec![shell]))
-}
-
 fn convert_compressed_shell(
     feature: &Feature,
     shell: CompressedShell<Point3, Curve3D, StepSurface>,
@@ -2551,12 +2772,12 @@ fn torus_surface(
     Ok(result)
 }
 
-impl CadKernel for TruckKernel {
-    fn name(&self) -> &'static str {
+impl TruckKernel {
+    fn kernel_name() -> &'static str {
         "Truck"
     }
 
-    fn capabilities(&self) -> CadKernelCapabilities {
+    fn kernel_capabilities() -> CadKernelCapabilities {
         let planar_convex_edges = EdgeModifierCapability {
             edge_count: EdgeCountSupport::Multiple,
             source_scope: SourceFeatureScope::Single,
@@ -2571,11 +2792,19 @@ impl CadKernel for TruckKernel {
                 ..planar_convex_edges
             },
             fillet: planar_convex_edges,
+            interference_analysis: true,
         }
     }
 
-    fn evaluate(&self, document: &CadDocument) -> Result<EvaluatedScene, KernelError> {
+    fn evaluate_document(
+        &self,
+        document: &CadDocument,
+    ) -> Result<(EvaluatedScene, HashMap<FeatureId, NamedSolid>), KernelError> {
         let graph = document.feature_graph()?;
+        let suppressed_features = document.suppressed_assembly_feature_ids()?;
+        let shared_imports = shared_imported_step_bodies(document);
+        let reusable_render_bodies = reusable_render_bodies(document);
+        let mut imported_step_cache = ImportedStepSolidCache::default();
         let mut solids: HashMap<FeatureId, NamedSolid> = HashMap::new();
         let mut evaluated_parts: HashMap<FeatureId, EvaluatedPart> = HashMap::new();
         let mut datum_frames: HashMap<FeatureId, SketchFrame> = HashMap::new();
@@ -2585,6 +2814,9 @@ impl CadKernel for TruckKernel {
         let mut datum_planes = Vec::new();
         let mut datum_points = Vec::new();
         for id in graph.order() {
+            if suppressed_features.contains(id) {
+                continue;
+            }
             let feature = document
                 .feature(*id)
                 .ok_or(cadx_core::domain::DocumentError::FeatureNotFound(*id))?;
@@ -2739,7 +2971,14 @@ impl CadKernel for TruckKernel {
                     left,
                     right,
                 } => match catch_unwind(AssertUnwindSafe(|| {
-                    (*self).evaluate_feature(feature, document, &solids, &sketch_frames)
+                    (*self).evaluate_feature(
+                        feature,
+                        document,
+                        &solids,
+                        &sketch_frames,
+                        &shared_imports,
+                        &mut imported_step_cache,
+                    )
                 })) {
                     Ok(evaluated) => evaluated,
                     Err(payload) => Err(boolean_diagnostic(
@@ -2760,7 +2999,14 @@ impl CadKernel for TruckKernel {
                 },
                 Primitive::Chamfer { .. } | Primitive::Fillet { .. } => {
                     match catch_unwind(AssertUnwindSafe(|| {
-                        (*self).evaluate_feature(feature, document, &solids, &sketch_frames)
+                        (*self).evaluate_feature(
+                            feature,
+                            document,
+                            &solids,
+                            &sketch_frames,
+                            &shared_imports,
+                            &mut imported_step_cache,
+                        )
                     })) {
                         Ok(evaluated) => evaluated,
                         Err(payload) => Err(edge_modifier_error(
@@ -2776,7 +3022,14 @@ impl CadKernel for TruckKernel {
                         )),
                     }
                 }
-                _ => (*self).evaluate_feature(feature, document, &solids, &sketch_frames),
+                _ => (*self).evaluate_feature(
+                    feature,
+                    document,
+                    &solids,
+                    &sketch_frames,
+                    &shared_imports,
+                    &mut imported_step_cache,
+                ),
             };
             let (solid, part) = evaluated?;
             solids.insert(*id, solid);
@@ -2792,14 +3045,335 @@ impl CadKernel for TruckKernel {
                     .then(|| evaluated_parts.remove(id))
                     .flatten()
             })
-            .collect();
-        Ok(EvaluatedScene {
+            .collect::<Vec<_>>();
+        let (mesh_definitions, mesh_instances) =
+            instanced_render_geometry(document, &parts, &reusable_render_bodies);
+        let scene = EvaluatedScene {
             parts,
+            mesh_definitions,
+            mesh_instances,
             sketches,
             sketch_diagnostics,
             datum_planes,
             datum_points,
-        })
+        };
+        Ok((scene, solids))
+    }
+
+    fn interference_pair_outcome(self, left: &Solid, right: &Solid) -> InterferencePairOutcome {
+        let precision = InterferenceVolumePrecision::Tessellated {
+            chord_tolerance_mm: self.tolerance,
+        };
+        let proven_non_crossing = catch_unwind(AssertUnwindSafe(|| {
+            boolean::resolve_non_crossing_intersection(left, right, self.tolerance)
+        }));
+        match proven_non_crossing {
+            Ok(Some(Ok(boolean::NonCrossingIntersection::Empty))) => {
+                return InterferencePairOutcome::Clear {
+                    volume_mm3: 0.0,
+                    precision,
+                    method: InterferenceIntersectionMethod::NonCrossingContact,
+                };
+            }
+            Ok(Some(Ok(boolean::NonCrossingIntersection::Solid(solid)))) => {
+                return self.interference_volume_outcome(
+                    &solid,
+                    InterferenceIntersectionMethod::NonCrossingContact,
+                );
+            }
+            Ok(Some(Err(detail))) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::ResultValidation,
+                    reason: InterferenceFailureReason::InvalidResultTopology,
+                    detail,
+                };
+            }
+            Ok(None) => {}
+            Err(payload) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::ResultValidation,
+                    reason: InterferenceFailureReason::KernelPanic,
+                    detail: format!(
+                        "Truck panicked while classifying non-crossing contact: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                };
+            }
+        }
+        if let Some(solid) = strictly_contained_intersection(left, right, self.tolerance) {
+            return self.interference_volume_outcome(
+                &solid,
+                InterferenceIntersectionMethod::BoundaryClassifiedContainment,
+            );
+        }
+
+        let intersection = catch_unwind(AssertUnwindSafe(|| {
+            truck_shapeops::and(left, right, self.tolerance)
+        }));
+        let intersection = match intersection {
+            Ok(Some(solid)) => solid,
+            Ok(None) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::KernelOperation,
+                    reason: InterferenceFailureReason::KernelRejected,
+                    detail: "Truck returned no intersection without proving the pair clear".into(),
+                };
+            }
+            Err(payload) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::KernelOperation,
+                    reason: InterferenceFailureReason::KernelPanic,
+                    detail: format!(
+                        "Truck panicked while intersecting product bodies: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                };
+            }
+        };
+        self.interference_volume_outcome(&intersection, InterferenceIntersectionMethod::BrepBoolean)
+    }
+
+    fn interference_volume_outcome(
+        self,
+        intersection: &Solid,
+        method: InterferenceIntersectionMethod,
+    ) -> InterferencePairOutcome {
+        let precision = InterferenceVolumePrecision::Tessellated {
+            chord_tolerance_mm: self.tolerance,
+        };
+        if let Err(error) = Solid::try_new(intersection.boundaries().clone()) {
+            return InterferencePairOutcome::Failed {
+                stage: InterferenceFailureStage::ResultValidation,
+                reason: InterferenceFailureReason::InvalidResultTopology,
+                detail: format!("intersection is not a closed manifold solid: {error}"),
+            };
+        }
+        let consistency = catch_unwind(AssertUnwindSafe(|| {
+            !supports_geometric_consistency_check(intersection)
+                || intersection.is_geometric_consistent()
+        }));
+        match consistency {
+            Ok(true) => {}
+            Ok(false) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::ResultValidation,
+                    reason: InterferenceFailureReason::InvalidResultTopology,
+                    detail: "intersection is not geometrically consistent".into(),
+                };
+            }
+            Err(payload) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::ResultValidation,
+                    reason: InterferenceFailureReason::KernelPanic,
+                    detail: format!(
+                        "Truck panicked while validating the intersection: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                };
+            }
+        }
+
+        let polygon = match catch_unwind(AssertUnwindSafe(|| {
+            intersection.triangulation(self.tolerance).to_polygon()
+        })) {
+            Ok(polygon) => polygon,
+            Err(payload) => {
+                return InterferencePairOutcome::Failed {
+                    stage: InterferenceFailureStage::VolumeIntegration,
+                    reason: InterferenceFailureReason::KernelPanic,
+                    detail: format!(
+                        "Truck panicked while tessellating the intersection: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                };
+            }
+        };
+        if polygon.tri_faces().is_empty() {
+            return InterferencePairOutcome::Failed {
+                stage: InterferenceFailureStage::VolumeIntegration,
+                reason: InterferenceFailureReason::EmptyMesh,
+                detail: "the exact intersection produced no volume-integration triangles".into(),
+            };
+        }
+        let volume_mm3 = polygon.volume().abs();
+        if !volume_mm3.is_finite() {
+            return InterferencePairOutcome::Failed {
+                stage: InterferenceFailureStage::VolumeIntegration,
+                reason: InterferenceFailureReason::NonFiniteVolume,
+                detail: "intersection volume is non-finite".into(),
+            };
+        }
+        if volume_mm3 > self.tolerance.powi(3) {
+            InterferencePairOutcome::Interfering {
+                volume_mm3,
+                precision,
+                method,
+            }
+        } else {
+            InterferencePairOutcome::Clear {
+                volume_mm3,
+                precision,
+                method,
+            }
+        }
+    }
+
+    fn analyze_document_interference(
+        self,
+        document: &CadDocument,
+    ) -> Result<InterferenceAnalysis, KernelError> {
+        let (_, solids) = self.evaluate_document(document)?;
+        let graph = document.feature_graph()?;
+        let assembly_instances = document.assembly_feature_instances();
+        let mut candidate_feature_ids = graph
+            .order()
+            .iter()
+            .copied()
+            .filter(|id| solids.contains_key(id))
+            .filter(|id| {
+                !graph.dependents(*id).iter().any(|dependent| {
+                    solids.contains_key(dependent)
+                        && document.feature(*dependent).is_some_and(|feature| {
+                            matches!(
+                                feature.primitive,
+                                Primitive::Boolean { .. }
+                                    | Primitive::Chamfer { .. }
+                                    | Primitive::Fillet { .. }
+                            )
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        candidate_feature_ids.sort_unstable();
+
+        let mut bounds = BTreeMap::new();
+        for id in &candidate_feature_ids {
+            let solid = &solids
+                .get(id)
+                .expect("candidate ids are selected from evaluated solids")
+                .solid;
+            let Some(value) = solid_bounds(solid) else {
+                return Err(KernelError::Analysis {
+                    message: format!("product body {id} has no finite axis-aligned bounds"),
+                });
+            };
+            bounds.insert(*id, value);
+        }
+
+        let mut report = InterferenceAnalysis {
+            candidate_feature_ids,
+            volume_tolerance_mm3: self.tolerance.powi(3),
+            ..InterferenceAnalysis::default()
+        };
+        for (left_index, left_id) in report.candidate_feature_ids.iter().copied().enumerate() {
+            for right_id in report.candidate_feature_ids[left_index + 1..]
+                .iter()
+                .copied()
+            {
+                let same_occurrence = assembly_instances
+                    .get(&left_id)
+                    .zip(assembly_instances.get(&right_id))
+                    .is_some_and(|(left, right)| {
+                        left.assembly_id == right.assembly_id
+                            && left.occurrence_id == right.occurrence_id
+                    });
+                if same_occurrence {
+                    continue;
+                }
+                report.total_pair_count += 1;
+                let pair_bounds = [bounds[&left_id], bounds[&right_id]];
+                if pair_bounds[0].is_disjoint_from(pair_bounds[1], 0.0) {
+                    report.clear_pair_count += 1;
+                    continue;
+                }
+                report.broad_phase_pair_count += 1;
+                let outcome = self
+                    .interference_pair_outcome(&solids[&left_id].solid, &solids[&right_id].solid);
+                match outcome {
+                    InterferencePairOutcome::Clear { .. } => report.clear_pair_count += 1,
+                    InterferencePairOutcome::Interfering { .. } => {
+                        report.interfering_pair_count += 1;
+                    }
+                    InterferencePairOutcome::Failed { .. } => report.failed_pair_count += 1,
+                }
+                report.pairs.push(InterferencePairAnalysis {
+                    feature_ids: [left_id, right_id],
+                    bounds: pair_bounds,
+                    outcome,
+                });
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn strictly_contained_intersection(left: &Solid, right: &Solid, tolerance: f64) -> Option<Solid> {
+    let left_bounds = solid_bounds(left)?;
+    let right_bounds = solid_bounds(right)?;
+    if bounds_strictly_contain(right_bounds, left_bounds, tolerance)
+        && boundary_is_inside(left, right, tolerance)
+    {
+        return Some(left.clone());
+    }
+    if bounds_strictly_contain(left_bounds, right_bounds, tolerance)
+        && boundary_is_inside(right, left, tolerance)
+    {
+        return Some(right.clone());
+    }
+    None
+}
+
+fn bounds_strictly_contain(
+    outer: AxisAlignedBounds,
+    inner: AxisAlignedBounds,
+    tolerance: f64,
+) -> bool {
+    (0..3).all(|axis| {
+        inner.min[axis] - outer.min[axis] > tolerance
+            && outer.max[axis] - inner.max[axis] > tolerance
+    })
+}
+
+fn boundary_is_inside(candidate: &Solid, host: &Solid, tolerance: f64) -> bool {
+    let meshes = catch_unwind(AssertUnwindSafe(|| {
+        [
+            candidate.triangulation(tolerance).to_polygon(),
+            host.triangulation(tolerance).to_polygon(),
+        ]
+    }));
+    let Ok([candidate_mesh, host_mesh]) = meshes else {
+        return false;
+    };
+    if candidate_mesh.positions().is_empty()
+        || host_mesh.positions().is_empty()
+        || candidate_mesh.collide_with(&host_mesh).is_some()
+    {
+        return false;
+    }
+    candidate_mesh
+        .positions()
+        .iter()
+        .all(|point| host_mesh.inside(*point))
+}
+
+impl CadKernel for TruckKernel {
+    fn name(&self) -> &'static str {
+        Self::kernel_name()
+    }
+
+    fn capabilities(&self) -> CadKernelCapabilities {
+        Self::kernel_capabilities()
+    }
+
+    fn evaluate(&self, document: &CadDocument) -> Result<EvaluatedScene, KernelError> {
+        self.evaluate_document(document).map(|(scene, _)| scene)
+    }
+
+    fn analyze_interference(
+        &self,
+        document: &CadDocument,
+    ) -> Result<InterferenceAnalysis, KernelError> {
+        (*self).analyze_document_interference(document)
     }
 }
 
@@ -2827,13 +3401,22 @@ fn encode_step_candidate(
     document: &CadDocument,
     file_name: &str,
 ) -> Result<String, KernelError> {
+    let assembly_plan = AssemblyStepExportPlan::new(document)?;
     let graph = document.feature_graph()?;
+    let suppressed_features = document.suppressed_assembly_feature_ids()?;
+    let shared_imports = shared_imported_step_bodies(document);
+    let mut imported_step_cache = ImportedStepSolidCache::default();
     let mut upstream = HashMap::new();
     let mut evaluated_parts = HashMap::new();
     let mut datum_frames = HashMap::new();
     let mut sketch_frames = HashMap::new();
     let mut exported = Vec::new();
+    let mut exported_colors = Vec::new();
+    let mut exported_owners = Vec::new();
     for id in graph.order() {
+        if suppressed_features.contains(id) {
+            continue;
+        }
         let feature = document
             .feature(*id)
             .ok_or(cadx_core::domain::DocumentError::FeatureNotFound(*id))?;
@@ -2859,10 +3442,37 @@ fn encode_step_candidate(
         if matches!(feature.primitive, Primitive::DatumPoint { .. }) {
             continue;
         }
-        let (solid, part) =
-            kernel.evaluate_feature(feature, document, &upstream, &sketch_frames)?;
-        if feature.visible {
-            exported.push(solid.solid.compress());
+        let (solid, part) = kernel.evaluate_feature(
+            feature,
+            document,
+            &upstream,
+            &sketch_frames,
+            &shared_imports,
+            &mut imported_step_cache,
+        )?;
+        if feature.visible
+            && let Some(owner) = assembly_plan.body_owner(feature.id)
+        {
+            let localized = match owner {
+                StepExportBodyOwner::AssemblyDefinition(_) => {
+                    let world_transform = AssemblyTransform::from_euler_xyz_degrees(
+                        feature.translation.as_array(),
+                        feature.rotation.as_array(),
+                    );
+                    Some(builder::transformed(
+                        &solid.solid,
+                        assembly_transform_matrix(world_transform.inverse()),
+                    ))
+                }
+                StepExportBodyOwner::Standalone(_) => None,
+            };
+            let export_solid = localized.as_ref().unwrap_or(&solid.solid);
+            for step_solid in partition_step_export_solids(feature, export_solid, kernel.tolerance)?
+            {
+                exported.push(step_solid.compress());
+                exported_colors.push(feature.color);
+                exported_owners.push(owner);
+            }
         }
         upstream.insert(*id, solid);
         evaluated_parts.insert(*id, part);
@@ -2899,6 +3509,229 @@ END-ISO-10303-21;\n",
         format: "STEP",
         message: "Truck rejected the B-Rep topology".into(),
     })?;
+    source = append_step_body_colors(source, &exported_colors)?;
+    let body_targets = step_body_target_ids(&source)?;
+    append_ap242_product_structure(
+        source,
+        document,
+        &assembly_plan,
+        &exported_owners,
+        &body_targets,
+    )
+}
+
+fn assembly_transform_matrix(transform: AssemblyTransform) -> Matrix4 {
+    let rotation = transform.rotation;
+    let [x, y, z] = transform.translation;
+    Matrix4::new(
+        rotation[0][0],
+        rotation[1][0],
+        rotation[2][0],
+        0.0,
+        rotation[0][1],
+        rotation[1][1],
+        rotation[2][1],
+        0.0,
+        rotation[0][2],
+        rotation[1][2],
+        rotation[2][2],
+        0.0,
+        x,
+        y,
+        z,
+        1.0,
+    )
+}
+
+fn step_body_target_ids(source: &str) -> Result<Vec<u64>, KernelError> {
+    use truck_stepio::r#in::ruststep::ast::EntityInstance;
+
+    let exchange = truck_stepio::r#in::ruststep::parser::parse(source).map_err(|error| {
+        KernelError::Exchange {
+            format: "STEP",
+            message: format!("generated model could not be parsed for body export: {error}"),
+        }
+    })?;
+    let data = exchange.data.first().ok_or_else(|| KernelError::Exchange {
+        format: "STEP",
+        message: "generated model has no DATA section for body export".into(),
+    })?;
+    Ok(data
+        .entities
+        .iter()
+        .filter_map(|entity| match entity {
+            EntityInstance::Simple { id, record }
+                if matches!(
+                    record.name.as_str(),
+                    "MANIFOLD_SOLID_BREP" | "BREP_WITH_VOIDS"
+                ) =>
+            {
+                Some(*id)
+            }
+            EntityInstance::Complex { id, subsuper }
+                if subsuper.0.iter().any(|record| {
+                    matches!(
+                        record.name.as_str(),
+                        "MANIFOLD_SOLID_BREP" | "BREP_WITH_VOIDS"
+                    )
+                }) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+fn append_step_body_colors(mut source: String, colors: &[[f32; 4]]) -> Result<String, KernelError> {
+    const SUFFIX: &str = "ENDSEC;\nEND-ISO-10303-21;\n";
+
+    use truck_stepio::r#in::ruststep::ast::EntityInstance;
+
+    let exchange = truck_stepio::r#in::ruststep::parser::parse(&source).map_err(|error| {
+        KernelError::Exchange {
+            format: "STEP",
+            message: format!("generated model could not be parsed for color export: {error}"),
+        }
+    })?;
+    let data = exchange.data.first().ok_or_else(|| KernelError::Exchange {
+        format: "STEP",
+        message: "generated model has no DATA section for color export".into(),
+    })?;
+    let entity_id = |entity: &EntityInstance| match entity {
+        EntityInstance::Simple { id, .. } | EntityInstance::Complex { id, .. } => *id,
+    };
+    let targets = step_body_target_ids(&source)?;
+    if targets.len() != colors.len() {
+        return Err(KernelError::Exchange {
+            format: "STEP",
+            message: format!(
+                "generated model has {} solid records for {} visible feature colors",
+                targets.len(),
+                colors.len()
+            ),
+        });
+    }
+
+    let mut next_id = data
+        .entities
+        .iter()
+        .map(entity_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| KernelError::Exchange {
+            format: "STEP",
+            message: "generated model exhausted STEP entity ids while exporting colors".into(),
+        })?;
+    let mut styles = String::new();
+    let mut styled_items = Vec::with_capacity(colors.len());
+    for (target, color) in targets.into_iter().zip(colors) {
+        if !color
+            .iter()
+            .all(|channel| channel.is_finite() && (0.0..=1.0).contains(channel))
+        {
+            return Err(KernelError::Exchange {
+                format: "STEP",
+                message: "visible feature has invalid RGBA color".into(),
+            });
+        }
+        let first_id = next_id;
+        next_id = first_id
+            .checked_add(9)
+            .ok_or_else(|| KernelError::Exchange {
+                format: "STEP",
+                message: "generated model exhausted STEP entity ids while exporting colors".into(),
+            })?;
+        let ids = [
+            first_id,
+            first_id + 1,
+            first_id + 2,
+            first_id + 3,
+            first_id + 4,
+            first_id + 5,
+            first_id + 6,
+            first_id + 7,
+            first_id + 8,
+        ];
+        let transparency = 1.0 - color[3];
+        writeln!(
+            &mut styles,
+            "#{}=COLOUR_RGB('CADX body color',{:.9},{:.9},{:.9});",
+            ids[0], color[0], color[1], color[2]
+        )
+        .expect("writing STEP color to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=FILL_AREA_STYLE_COLOUR('',#{});",
+            ids[1], ids[0]
+        )
+        .expect("writing STEP fill color to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=FILL_AREA_STYLE('',(#{}));",
+            ids[2], ids[1]
+        )
+        .expect("writing STEP fill style to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=SURFACE_STYLE_FILL_AREA(#{});",
+            ids[3], ids[2]
+        )
+        .expect("writing STEP surface fill style to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=SURFACE_STYLE_TRANSPARENT({transparency:.9});",
+            ids[4]
+        )
+        .expect("writing STEP transparency style to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=SURFACE_SIDE_STYLE('',(#{} ,#{}));",
+            ids[5], ids[3], ids[4]
+        )
+        .expect("writing STEP side style to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=SURFACE_STYLE_USAGE(.BOTH.,#{});",
+            ids[6], ids[5]
+        )
+        .expect("writing STEP style usage to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=PRESENTATION_STYLE_ASSIGNMENT((#{}));",
+            ids[7], ids[6]
+        )
+        .expect("writing STEP presentation style to a String cannot fail");
+        writeln!(
+            &mut styles,
+            "#{}=STYLED_ITEM('',(#{}),#{});",
+            ids[8], ids[7], target
+        )
+        .expect("writing STEP styled item to a String cannot fail");
+        styled_items.push(ids[8]);
+    }
+    let presentation_id = next_id;
+    let styled_items = styled_items
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(
+        &mut styles,
+        "#{presentation_id}=MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',({styled_items}),#11);"
+    )
+    .expect("writing STEP presentation representation to a String cannot fail");
+
+    let insert_at =
+        source
+            .strip_suffix(SUFFIX)
+            .map(str::len)
+            .ok_or_else(|| KernelError::Exchange {
+                format: "STEP",
+                message: "generated model has an unexpected physical-file trailer".into(),
+            })?;
+    source.insert_str(insert_at, &styles);
     Ok(source)
 }
 
@@ -3024,18 +3857,298 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use cadx_core::assembly::{
+        AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+    };
     use cadx_core::domain::{BooleanOperation, Constraint, ModelCommand, SketchPlane};
     use cadx_core::kernel::EvaluatedPart;
     use cadx_core::topology::{
         CurveKind, EdgeRef, FaceName, FaceRef, PrimitiveFace, SurfaceKind, VertexRef,
     };
-    use cadx_io::{encode_3mf, encode_binary_stl, validate_3mf, validate_step};
+    use cadx_io::{encode_3mf, encode_binary_stl, parse_step, validate_3mf, validate_step};
 
     fn face_references(part: &EvaluatedPart) -> BTreeSet<FaceRef> {
         part.faces
             .iter()
             .map(|face| face.reference.clone())
             .collect()
+    }
+
+    fn imported_box_step(size: [f64; 3]) -> (String, u64) {
+        let mut source_document = CadDocument::default();
+        source_document
+            .apply(ModelCommand::CreateBox {
+                name: "definition body".into(),
+                size,
+                position: [0.0; 3],
+            })
+            .unwrap();
+        let source = TruckKernel::default()
+            .encode_step(&source_document, "definition.step")
+            .unwrap();
+        let shell_id = *Table::from_step(&source)
+            .unwrap()
+            .shell
+            .keys()
+            .next()
+            .unwrap();
+        (source, shell_id)
+    }
+
+    fn repeated_native_box_assembly() -> (
+        CadDocument,
+        [FeatureId; 2],
+        AssemblyTransform,
+        [AssemblyTransform; 2],
+    ) {
+        let root_transform =
+            AssemblyTransform::from_euler_xyz_degrees([5.0, 6.0, 7.0], [0.0, 0.0, 90.0]);
+        let local_transforms = [
+            AssemblyTransform::from_euler_xyz_degrees([10.0, 0.0, 0.0], [0.0; 3]),
+            AssemblyTransform::from_euler_xyz_degrees([0.0, 20.0, 0.0], [0.0, 0.0, 90.0]),
+        ];
+        let world_transforms = local_transforms.map(|local| root_transform.compose(local));
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction(world_transforms.iter().enumerate().map(|(index, world)| {
+                ModelCommand::CreateBox {
+                    name: format!("bracket body {}", index + 1),
+                    size: [2.0, 3.0, 4.0],
+                    position: world.translation,
+                }
+            }))
+            .unwrap();
+        for (id, world) in ids.iter().zip(world_transforms) {
+            document
+                .apply(ModelCommand::Rotate {
+                    id: *id,
+                    rotation: world.euler_xyz_degrees(),
+                })
+                .unwrap();
+            document
+                .apply(ModelCommand::SetColor {
+                    id: *id,
+                    color: [0.2, 0.4, 0.8, 1.0],
+                })
+                .unwrap();
+        }
+        let ids = [ids[0], ids[1]];
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "Export fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "Top assembly".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "Bracket part".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "Root placement".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: root_transform,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "Bracket left".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: local_transforms[0],
+                        feature_ids: vec![ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "Bracket right".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: local_transforms[1],
+                        feature_ids: vec![ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        (document, ids, root_transform, local_transforms)
+    }
+
+    fn repeated_imported_box_assembly() -> (CadDocument, [FeatureId; 2]) {
+        let (source, shell_id) = imported_box_step([10.0; 3]);
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::ImportStep {
+                    name: "bracket 1".into(),
+                    source: source.clone(),
+                    data_section: 0,
+                    shell_id,
+                    void_shells: Vec::new(),
+                    length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                    color: None,
+                    position: [0.0; 3],
+                },
+                ModelCommand::ImportStep {
+                    name: "bracket 2".into(),
+                    source,
+                    data_section: 0,
+                    shell_id,
+                    void_shells: Vec::new(),
+                    length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                    color: Some([0.2, 0.4, 0.8, 1.0]),
+                    position: [4.0, 3.0, 2.0],
+                },
+            ])
+            .unwrap();
+        let ids = [ids[0], ids[1]];
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "bracket".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "bracket 1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "bracket 2".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [4.0, 3.0, 2.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        (document, ids)
+    }
+
+    fn repeated_multi_body_assembly() -> (CadDocument, [[FeatureId; 2]; 2]) {
+        let bodies = [imported_box_step([10.0; 3]), imported_box_step([6.0; 3])];
+        let mut document = CadDocument::default();
+        let commands = [([0.0; 3], "1"), ([20.0, 0.0, 0.0], "2")]
+            .into_iter()
+            .flat_map(|(position, occurrence)| {
+                bodies
+                    .iter()
+                    .enumerate()
+                    .map(move |(body_slot, body)| ModelCommand::ImportStep {
+                        name: format!("component {occurrence} body {}", body_slot + 1),
+                        source: body.0.clone(),
+                        data_section: 0,
+                        shell_id: body.1,
+                        void_shells: Vec::new(),
+                        length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                        color: None,
+                        position,
+                    })
+            });
+        let ids = document.apply_transaction(commands).unwrap();
+        let ids = [[ids[0], ids[1]], [ids[2], ids[3]]];
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "multi-body fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "two-body component".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "component 1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: ids[0].to_vec(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "component 2".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [20.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: ids[1].to_vec(),
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        (document, ids)
     }
 
     fn circle_loop(center: [f64; 2], radius: f64, ccw: bool) -> SketchLoop2D {
@@ -5005,6 +6118,20 @@ mod tests {
         assert_topology_partition(&scene.parts[0]);
         let bounds = mesh_bounds(&scene.parts[0].mesh);
         assert_eq!(bounds, ([0.0, 0.0, 0.0], [40.0, 10.0, 10.0]));
+
+        let step = TruckKernel::default()
+            .encode_step(&document, "disjoint-union.step")
+            .unwrap();
+        assert!(!step.contains("BREP_WITH_VOIDS"));
+        assert_eq!(step.matches("MANIFOLD_SOLID_BREP").count(), 2);
+        let imported = parse_step(step).unwrap();
+        assert_eq!(imported.bodies.len(), 2);
+        assert!(
+            imported
+                .bodies
+                .iter()
+                .all(|body| body.void_shells.is_empty())
+        );
     }
 
     #[test]
@@ -5798,6 +6925,50 @@ mod tests {
     }
 
     #[test]
+    fn step_export_round_trips_body_colors_and_transparency() {
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "blue housing".into(),
+                    size: [10.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateCylinder {
+                    name: "orange pin".into(),
+                    radius: 2.0,
+                    height: 8.0,
+                    position: [20.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        let expected = [[0.1, 0.2, 0.8, 0.75], [0.9, 0.35, 0.1, 1.0]];
+        for (id, color) in ids.into_iter().zip(expected) {
+            document
+                .apply(ModelCommand::SetColor { id, color })
+                .unwrap();
+        }
+
+        let source = TruckKernel::default()
+            .encode_step(&document, "painted-assembly.step")
+            .unwrap();
+        assert_eq!(source.matches("STYLED_ITEM").count(), 2);
+        assert!(source.contains("MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION"));
+        let imported = parse_step(source).unwrap();
+        assert_eq!(imported.bodies.len(), 2);
+        for expected_color in expected {
+            assert!(imported.bodies.iter().any(|body| {
+                body.color.color().is_some_and(|actual| {
+                    actual
+                        .into_iter()
+                        .zip(expected_color)
+                        .all(|(actual, expected)| (actual - expected).abs() < 1.0e-6)
+                })
+            }));
+        }
+    }
+
+    #[test]
     fn step_export_preserves_boolean_brep() {
         use truck_stepio::r#in::Table;
 
@@ -5941,6 +7112,217 @@ mod tests {
     }
 
     #[test]
+    fn step_export_writes_reusable_ap242_product_structure_and_local_brep() {
+        let (document, _, root_transform, local_transforms) = repeated_native_box_assembly();
+        let exported = TruckKernel::default()
+            .encode_step(&document, "fixture.step")
+            .unwrap();
+
+        assert!(exported.contains("CADX AP242 assembly model"));
+        assert!(exported.contains("AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF"));
+        assert_eq!(exported.matches("MANIFOLD_SOLID_BREP").count(), 1);
+        assert_eq!(
+            exported.matches("NEXT_ASSEMBLY_USAGE_OCCURRENCE").count(),
+            3
+        );
+        validate_step(&exported).unwrap();
+        let table = Table::from_step(&exported).unwrap();
+        assert_eq!(table.shell.len(), 1);
+        assert!(
+            !table
+                .to_compressed_shell(table.shell.values().next().unwrap())
+                .unwrap()
+                .triangulation(0.01)
+                .to_polygon()
+                .tri_faces()
+                .is_empty()
+        );
+
+        let parsed = parse_step(exported).unwrap();
+        assert_eq!(parsed.bodies.len(), 1);
+        assert!(parsed.standalone_body_indices.is_empty());
+        assert_eq!(parsed.assemblies.len(), 1);
+        let assembly = &parsed.assemblies[0];
+        assert_eq!(assembly.name, "Export fixture");
+        assert_eq!(assembly.definitions.len(), 3);
+        assert!(
+            assembly
+                .definitions
+                .iter()
+                .any(|definition| definition.name == "Top assembly")
+        );
+        assert!(
+            assembly
+                .definitions
+                .iter()
+                .any(|definition| definition.name == "Bracket part")
+        );
+        assert_eq!(assembly.occurrences.len(), 4);
+        let root = assembly
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.name == "Root placement")
+            .unwrap();
+        assert!(root.transform.approximately_equals(root_transform, 1.0e-10));
+        for (name, expected) in ["Bracket left", "Bracket right"]
+            .into_iter()
+            .zip(local_transforms)
+        {
+            let occurrence = assembly
+                .occurrences
+                .iter()
+                .find(|occurrence| occurrence.name == name)
+                .unwrap();
+            assert!(occurrence.transform.approximately_equals(expected, 1.0e-10));
+            assert_eq!(occurrence.parent_id, Some(root.id));
+            assert_eq!(occurrence.body_indices, vec![0]);
+        }
+    }
+
+    #[test]
+    fn step_export_keeps_standalone_body_outside_ap242_assembly() {
+        let (mut document, _, _, _) = repeated_native_box_assembly();
+        document
+            .apply(ModelCommand::CreateBox {
+                name: "Loose body".into(),
+                size: [5.0, 6.0, 7.0],
+                position: [-30.0, 0.0, 0.0],
+            })
+            .unwrap();
+
+        let exported = TruckKernel::default()
+            .encode_step(&document, "fixture-with-loose-body.step")
+            .unwrap();
+        assert!(exported.contains("'Loose body'"));
+        let parsed = parse_step(exported).unwrap();
+        assert_eq!(parsed.bodies.len(), 2);
+        assert_eq!(parsed.standalone_body_indices, vec![1]);
+        assert_eq!(parsed.assemblies.len(), 1);
+        let repeated = parsed.assemblies[0]
+            .occurrences
+            .iter()
+            .filter(|occurrence| occurrence.name.starts_with("Bracket "))
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 2);
+        assert!(
+            repeated
+                .iter()
+                .all(|occurrence| occurrence.body_indices == vec![0])
+        );
+    }
+
+    #[test]
+    fn step_export_excludes_effectively_suppressed_subtree() {
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "suppressed descendant".into(),
+                    size: [2.0; 3],
+                    position: [10.0, 0.0, 0.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "standalone survivor".into(),
+                    size: [3.0; 3],
+                    position: [-10.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "Suppressed fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "Root".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "Branch".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 3,
+                        name: "Leaf".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "active root".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "suppressed branch".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: true,
+                        transform: AssemblyTransform {
+                            translation: [5.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "inherited leaf".into(),
+                        definition_id: 3,
+                        parent_id: Some(2),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [5.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![ids[0]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let exported = TruckKernel::default()
+            .encode_step(&document, "suppressed-tree.step")
+            .unwrap();
+        assert!(!exported.contains("suppressed branch"));
+        assert!(!exported.contains("inherited leaf"));
+        let parsed = parse_step(exported).unwrap();
+        assert_eq!(parsed.bodies.len(), 1);
+        assert_eq!(parsed.standalone_body_indices, vec![0]);
+        assert_eq!(parsed.assemblies[0].occurrences.len(), 2);
+    }
+
+    #[test]
+    fn step_export_rejects_occurrence_specific_repeated_geometry() {
+        let (mut document, ids, _, _) = repeated_native_box_assembly();
+        document
+            .apply(ModelCommand::ResizeBox {
+                id: ids[1],
+                size: [9.0, 3.0, 4.0],
+            })
+            .unwrap();
+
+        assert!(matches!(
+            TruckKernel::default().encode_step(&document, "incompatible.step"),
+            Err(KernelError::Exchange {
+                format: "STEP",
+                message
+            }) if message.contains("one reusable AP242 product definition")
+        ));
+    }
+
+    #[test]
     fn step_import_rebuilds_a_persistable_solid() {
         use truck_stepio::r#in::Table;
 
@@ -5963,7 +7345,11 @@ mod tests {
             .apply(ModelCommand::ImportStep {
                 name: "imported source".into(),
                 source,
+                data_section: 0,
                 shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [5.0, 6.0, 7.0],
             })
             .unwrap()
@@ -5980,6 +7366,132 @@ mod tests {
             .map(|point| point[0])
             .fold(f32::INFINITY, f32::min);
         assert!((min_x - 7.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn step_import_converts_source_length_units_to_millimeters() {
+        use truck_stepio::r#in::Table;
+
+        let mut source_document = CadDocument::default();
+        source_document
+            .apply(ModelCommand::CreateBox {
+                name: "one source unit".into(),
+                size: [1.0, 2.0, 3.0],
+                position: [0.0; 3],
+            })
+            .unwrap();
+        let source = TruckKernel::default()
+            .encode_step(&source_document, "inch-source.step")
+            .unwrap();
+        let shell_id = *Table::from_step(&source)
+            .unwrap()
+            .shell
+            .keys()
+            .next()
+            .unwrap();
+        let mut imported = CadDocument::default();
+        imported
+            .apply(ModelCommand::ImportStep {
+                name: "inch body".into(),
+                source,
+                data_section: 0,
+                shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit {
+                    name: "inch".into(),
+                    millimeters_per_unit: 25.4,
+                    declared: true,
+                },
+                color: None,
+                position: [0.0; 3],
+            })
+            .unwrap();
+
+        let scene = TruckKernel::default().evaluate(&imported).unwrap();
+        let bounds = scene.parts[0].mesh.positions.iter().fold(
+            ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+            |(mut min, mut max), point| {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(point[axis]);
+                    max[axis] = max[axis].max(point[axis]);
+                }
+                (min, max)
+            },
+        );
+        assert!((bounds.1[0] - 25.4).abs() < 1.0e-3);
+        assert!((bounds.1[1] - 50.8).abs() < 1.0e-3);
+        assert!((bounds.1[2] - 76.2).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn step_import_reconstructs_brep_with_voids_as_one_solid() {
+        let box_solid = |origin: Point3, size: f64| {
+            let vertex = builder::vertex(origin);
+            let edge = builder::tsweep(&vertex, Vector3::new(size, 0.0, 0.0));
+            let face = builder::tsweep(&edge, Vector3::new(0.0, size, 0.0));
+            builder::tsweep(&face, Vector3::new(0.0, 0.0, size))
+        };
+        let outer = box_solid(Point3::origin(), 10.0)
+            .into_boundaries()
+            .pop()
+            .unwrap();
+        let cavity = box_solid(Point3::new(2.0, 2.0, 2.0), 6.0)
+            .into_boundaries()
+            .pop()
+            .unwrap();
+        let hollow = Solid::try_new(vec![outer, cavity]).unwrap().compress();
+        let generated = truck_stepio::out::CompleteStepDisplay::new(
+            truck_stepio::out::StepModel::from(&hollow),
+            StepHeaderDescriptor::default(),
+        )
+        .to_string();
+        let source = generated
+            .lines()
+            .map(|line| {
+                if line.contains("ORIENTED_CLOSED_SHELL") {
+                    line.replace(".T.);", ".F.);")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let kernel = TruckKernel::default();
+        assert!(source.contains("BREP_WITH_VOIDS"));
+
+        let mut parsed = parse_step(source.clone()).unwrap();
+        assert_eq!(parsed.bodies.len(), 1);
+        let body = parsed.bodies.pop().unwrap();
+        assert_eq!(body.void_shells.len(), 1);
+        assert!(!body.void_shells[0].orientation);
+
+        let mut imported = CadDocument::default();
+        imported
+            .apply(ModelCommand::ImportStep {
+                name: body.name.unwrap_or_else(|| "hollow housing".into()),
+                source,
+                data_section: body.data_section,
+                shell_id: body.shell_id,
+                void_shells: body.void_shells,
+                length_unit: body.length_unit,
+                color: body.color.color(),
+                position: [0.0; 3],
+            })
+            .unwrap();
+
+        let scene = kernel.evaluate(&imported).unwrap();
+        assert_eq!(scene.parts.len(), 1);
+        let analysis = cadx_analysis::analyze_scene(&scene, None).unwrap();
+        assert!((analysis.total_volume_mm3 - 784.0).abs() < 1.0e-3);
+
+        let reexported = kernel
+            .encode_step(&imported, "reexported-hollow-housing.step")
+            .unwrap();
+        assert!(reexported.contains("BREP_WITH_VOIDS"));
+        let reparsed = parse_step(reexported).unwrap();
+        assert_eq!(reparsed.bodies.len(), 1);
+        assert_eq!(reparsed.bodies[0].void_shells.len(), 1);
     }
 
     #[test]
@@ -6037,7 +7549,11 @@ mod tests {
                 .map(|(index, shell_id)| ModelCommand::ImportStep {
                     name: format!("imported {index}"),
                     source: source.clone(),
+                    data_section: 0,
                     shell_id,
+                    void_shells: Vec::new(),
+                    length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                    color: None,
                     position: [0.0; 3],
                 });
         let mut imported = CadDocument::default();
@@ -6050,6 +7566,525 @@ mod tests {
                 .iter()
                 .all(|part| part.mesh.triangle_count() > 0 && !part.faces.is_empty())
         );
+    }
+
+    #[test]
+    fn repeated_component_imports_share_local_brep_and_keep_instance_topology() {
+        let (mut document, ids) = repeated_imported_box_assembly();
+        let reusable = shared_imported_step_bodies(&document);
+        assert_eq!(reusable.len(), 2);
+        assert_eq!(reusable[&ids[0]], reusable[&ids[1]]);
+
+        let mut cache = ImportedStepSolidCache::default();
+        let first_solid = TruckKernel::default()
+            .build_solid(
+                document.feature(ids[0]).unwrap(),
+                &document,
+                &HashMap::new(),
+                &HashMap::new(),
+                &reusable,
+                &mut cache,
+            )
+            .unwrap();
+        let second_solid = TruckKernel::default()
+            .build_solid(
+                document.feature(ids[1]).unwrap(),
+                &document,
+                &HashMap::new(),
+                &HashMap::new(),
+                &reusable,
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(cache.local_solids.len(), 1);
+        assert!(
+            first_solid
+                .solid
+                .face_iter()
+                .zip(second_solid.solid.face_iter())
+                .all(|(first, second)| first.id() != second.id())
+        );
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        assert_eq!(scene.parts.len(), 2);
+        assert_eq!(scene.mesh_definitions.len(), 1);
+        assert_eq!(scene.mesh_instances.len(), 2);
+        let definition = &scene.mesh_definitions[0];
+        assert_eq!(definition.key, reusable[&ids[0]]);
+        let (local_min, local_max) = mesh_bounds(&definition.mesh);
+        assert!(
+            local_min
+                .into_iter()
+                .zip([0.0; 3])
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-6)
+        );
+        assert!(
+            local_max
+                .into_iter()
+                .zip([10.0; 3])
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-6)
+        );
+        for instance in &scene.mesh_instances {
+            let part = scene
+                .parts
+                .iter()
+                .find(|part| part.feature_id == instance.feature_id)
+                .unwrap();
+            let reconstructed = transform_triangle_mesh(&definition.mesh, instance.transform);
+            assert_eq!(reconstructed.indices, part.mesh.indices);
+            assert!(
+                reconstructed
+                    .positions
+                    .iter()
+                    .flatten()
+                    .zip(part.mesh.positions.iter().flatten())
+                    .all(|(actual, expected)| (actual - expected).abs() < 1.0e-4)
+            );
+            assert!(
+                reconstructed
+                    .normals
+                    .iter()
+                    .flatten()
+                    .zip(part.mesh.normals.iter().flatten())
+                    .all(|(actual, expected)| (actual - expected).abs() < 1.0e-4)
+            );
+        }
+
+        let analysis = cadx_analysis::analyze_scene(&scene, None).unwrap();
+        let first = analysis.part(ids[0]).unwrap();
+        let second = analysis.part(ids[1]).unwrap();
+        assert!((first.bounds.min[0] - 0.0).abs() < 1.0e-6);
+        assert!((first.bounds.max[0] - 10.0).abs() < 1.0e-6);
+        assert!((second.bounds.min[0] - 4.0).abs() < 1.0e-6);
+        assert!((second.bounds.max[0] - 14.0).abs() < 1.0e-6);
+
+        let first_part = scene
+            .parts
+            .iter()
+            .find(|part| part.feature_id == ids[0])
+            .unwrap();
+        let second_part = scene
+            .parts
+            .iter()
+            .find(|part| part.feature_id == ids[1])
+            .unwrap();
+        assert!(
+            first_part
+                .faces
+                .iter()
+                .all(|face| face.reference.feature_id == ids[0])
+        );
+        assert!(
+            second_part
+                .faces
+                .iter()
+                .all(|face| face.reference.feature_id == ids[1])
+        );
+        let first_face = &first_part.faces[0].reference;
+        let second_face = &second_part.faces[0].reference;
+        assert_ne!(first_face, second_face);
+        assert!(scene.face(first_face).is_some());
+        assert!(scene.face(second_face).is_some());
+
+        reset_imported_step_reconstruction_count();
+        assert!(matches!(
+            TruckKernel::default().encode_step(&document, "repeated-components.step"),
+            Err(KernelError::Exchange { format: "STEP", .. })
+        ));
+        assert_eq!(imported_step_reconstruction_count(), 0);
+
+        let definition_color = document.feature(ids[0]).unwrap().color;
+        document
+            .apply(ModelCommand::SetColor {
+                id: ids[1],
+                color: definition_color,
+            })
+            .unwrap();
+        reset_imported_step_reconstruction_count();
+        let exported = TruckKernel::default()
+            .encode_step(&document, "repeated-components.step")
+            .unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        let parsed = parse_step(exported).unwrap();
+        assert_eq!(parsed.bodies.len(), 1);
+        assert_eq!(parsed.assemblies[0].occurrences.len(), 4);
+    }
+
+    #[test]
+    fn interference_analysis_reports_exact_brep_overlap_deterministically() {
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "first".into(),
+                    size: [10.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "second".into(),
+                    size: [10.0; 3],
+                    position: [5.0, 2.0, 1.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "clear".into(),
+                    size: [10.0; 3],
+                    position: [30.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::SetVisibility {
+                id: ids[1],
+                visible: false,
+            })
+            .unwrap();
+
+        let kernel = TruckKernel::default();
+        assert!(kernel.capabilities().interference_analysis);
+        let first = kernel.analyze_interference(&document).unwrap();
+        let second = kernel.analyze_interference(&document).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.candidate_feature_ids, ids);
+        assert_eq!(first.total_pair_count, 3);
+        assert_eq!(first.broad_phase_pair_count, 1);
+        assert_eq!(first.interfering_pair_count, 1);
+        assert_eq!(first.clear_pair_count, 2);
+        assert_eq!(first.failed_pair_count, 0);
+        assert_eq!(first.pairs[0].feature_ids, [ids[0], ids[1]]);
+        let InterferencePairOutcome::Interfering { volume_mm3, .. } = first.pairs[0].outcome else {
+            panic!("partially overlapping boxes must interfere");
+        };
+        assert!((volume_mm3 - 360.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn interference_analysis_distinguishes_touching_and_containment() {
+        let kernel = TruckKernel::default();
+        for (position, size, expected_volume, expected_overlap) in [
+            ([10.0, 0.0, 0.0], [10.0; 3], 0.0, false),
+            ([2.0; 3], [6.0; 3], 216.0, true),
+        ] {
+            let mut document = CadDocument::default();
+            document
+                .apply_transaction([
+                    ModelCommand::CreateBox {
+                        name: "outer".into(),
+                        size: [10.0; 3],
+                        position: [0.0; 3],
+                    },
+                    ModelCommand::CreateBox {
+                        name: "candidate".into(),
+                        size,
+                        position,
+                    },
+                ])
+                .unwrap();
+            let report = kernel.analyze_interference(&document).unwrap();
+            assert_eq!(report.total_pair_count, 1);
+            assert_eq!(report.broad_phase_pair_count, 1);
+            assert_eq!(report.failed_pair_count, 0);
+            assert_eq!(report.has_interference(), expected_overlap);
+            let volume = match report.pairs[0].outcome {
+                InterferencePairOutcome::Clear { volume_mm3, .. }
+                | InterferencePairOutcome::Interfering { volume_mm3, .. } => volume_mm3,
+                InterferencePairOutcome::Failed { ref detail, .. } => {
+                    panic!("pair analysis failed: {detail}")
+                }
+            };
+            assert!((volume - expected_volume).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn interference_analysis_uses_terminal_solid_products() {
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "left".into(),
+                    size: [10.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "right".into(),
+                    size: [10.0; 3],
+                    position: [5.0, 2.0, 1.0],
+                },
+            ])
+            .unwrap();
+        let result = document
+            .apply(ModelCommand::CreateBoolean {
+                name: "union".into(),
+                operation: BooleanOperation::Union,
+                left: ids[0],
+                right: ids[1],
+            })
+            .unwrap()
+            .unwrap();
+        document
+            .apply(ModelCommand::SetVisibility {
+                id: ids[0],
+                visible: true,
+            })
+            .unwrap();
+
+        let report = TruckKernel::default()
+            .analyze_interference(&document)
+            .unwrap();
+        assert_eq!(report.candidate_feature_ids, vec![result]);
+        assert_eq!(report.total_pair_count, 0);
+        assert!(!report.has_interference());
+    }
+
+    #[test]
+    fn occurrence_interference_respects_suppression_and_reuses_definitions() {
+        let (mut document, ids) = repeated_imported_box_assembly();
+        reset_imported_step_reconstruction_count();
+        let report = TruckKernel::default()
+            .analyze_interference(&document)
+            .unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        assert_eq!(report.candidate_feature_ids, ids);
+        assert_eq!(report.interfering_pair_count, 1);
+        let InterferencePairOutcome::Interfering { volume_mm3, .. } = report.pairs[0].outcome
+        else {
+            panic!("repeated occurrences overlap");
+        };
+        assert!((volume_mm3 - 336.0).abs() < 1.0e-6);
+
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 3,
+                suppressed: true,
+            })
+            .unwrap();
+        let suppressed = TruckKernel::default()
+            .analyze_interference(&document)
+            .unwrap();
+        assert_eq!(suppressed.candidate_feature_ids, vec![ids[0]]);
+        assert_eq!(suppressed.total_pair_count, 0);
+    }
+
+    #[test]
+    fn multi_body_occurrences_do_not_self_interfere() {
+        let (document, _) = repeated_multi_body_assembly();
+        let report = TruckKernel::default()
+            .analyze_interference(&document)
+            .unwrap();
+        assert_eq!(report.candidate_feature_ids.len(), 4);
+        assert_eq!(report.total_pair_count, 4);
+        assert_eq!(report.broad_phase_pair_count, 0);
+        assert_eq!(report.clear_pair_count, 4);
+    }
+
+    #[test]
+    fn repeated_component_import_cache_feeds_transformed_boolean_operands() {
+        let (mut document, ids) = repeated_imported_box_assembly();
+        let boolean_id = document
+            .apply(ModelCommand::CreateBoolean {
+                name: "shared bracket intersection".into(),
+                operation: BooleanOperation::Intersect,
+                left: ids[0],
+                right: ids[1],
+            })
+            .unwrap()
+            .unwrap();
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        assert_eq!(scene.parts.len(), 1);
+        assert_eq!(scene.parts[0].feature_id, boolean_id);
+        let analysis = cadx_analysis::analyze_scene(&scene, None).unwrap();
+        assert!((analysis.total_volume_mm3 - 336.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn suppressed_occurrence_is_excluded_from_scene_analysis_and_step_export() {
+        let (mut document, ids) = repeated_imported_box_assembly();
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 3,
+                suppressed: true,
+            })
+            .unwrap();
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        assert_eq!(scene.parts.len(), 1);
+        assert_eq!(scene.parts[0].feature_id, ids[0]);
+        assert!(scene.mesh_definitions.is_empty());
+        assert!(scene.mesh_instances.is_empty());
+        let analysis = cadx_analysis::analyze_scene(&scene, None).unwrap();
+        assert!(analysis.part(ids[0]).is_some());
+        assert!(analysis.part(ids[1]).is_none());
+
+        reset_imported_step_reconstruction_count();
+        let exported = TruckKernel::default()
+            .encode_step(&document, "suppressed-component.step")
+            .unwrap();
+        assert_eq!(imported_step_reconstruction_count(), 1);
+        assert_eq!(parse_step(exported).unwrap().bodies.len(), 1);
+    }
+
+    #[test]
+    fn repeated_native_component_bodies_emit_renderer_instances() {
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "native bracket 1".into(),
+                    size: [2.0, 3.0, 4.0],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "native bracket 2".into(),
+                    size: [2.0, 3.0, 4.0],
+                    position: [15.0, 5.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::Rotate {
+                id: ids[1],
+                rotation: [0.0, 0.0, 90.0],
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "native fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "native bracket".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "native bracket 1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "native bracket 2".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::from_euler_xyz_degrees(
+                            [15.0, 5.0, 0.0],
+                            [0.0, 0.0, 90.0],
+                        ),
+                        feature_ids: vec![ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert!(shared_imported_step_bodies(&document).is_empty());
+        let reusable = reusable_render_bodies(&document);
+        assert_eq!(reusable.len(), 2);
+        assert_eq!(reusable[&ids[0]], reusable[&ids[1]]);
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(scene.mesh_definitions.len(), 1);
+        assert_eq!(scene.mesh_instances.len(), 2);
+        let local_bounds = mesh_bounds(&scene.mesh_definitions[0].mesh);
+        assert!(
+            local_bounds
+                .0
+                .into_iter()
+                .zip([0.0; 3])
+                .chain(local_bounds.1.into_iter().zip([2.0, 3.0, 4.0]))
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5)
+        );
+    }
+
+    #[test]
+    fn repeated_multi_body_components_cache_each_ordered_body_slot() {
+        let (document, ids) = repeated_multi_body_assembly();
+        let reusable = shared_imported_step_bodies(&document);
+        assert_eq!(reusable.len(), 4);
+        assert_eq!(reusable[&ids[0][0]], reusable[&ids[1][0]]);
+        assert_eq!(reusable[&ids[0][1]], reusable[&ids[1][1]]);
+        assert_ne!(reusable[&ids[0][0]], reusable[&ids[0][1]]);
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(scene.parts.len(), 4);
+        assert_eq!(imported_step_reconstruction_count(), 2);
+        assert_eq!(scene.mesh_definitions.len(), 2);
+        assert_eq!(scene.mesh_instances.len(), 4);
+        assert_ne!(scene.mesh_definitions[0].key, scene.mesh_definitions[1].key);
+        let analysis = cadx_analysis::analyze_scene(&scene, None).unwrap();
+        for occurrence in ids {
+            assert!((analysis.part(occurrence[0]).unwrap().volume_mm3 - 1_000.0).abs() < 1.0e-3);
+            assert!((analysis.part(occurrence[1]).unwrap().volume_mm3 - 216.0).abs() < 1.0e-3);
+        }
+    }
+
+    #[test]
+    fn imported_step_cache_rejects_incompatible_definition_bodies() {
+        let (mut document, ids) = repeated_imported_box_assembly();
+        let Primitive::ImportedStep { length_unit, .. } = &mut document
+            .features
+            .iter_mut()
+            .find(|feature| feature.id == ids[1])
+            .unwrap()
+            .primitive
+        else {
+            unreachable!();
+        };
+        *length_unit = cadx_core::domain::StepLengthUnit::assumed_millimeter();
+        document.validate_and_repair().unwrap();
+        assert!(shared_imported_step_bodies(&document).is_empty());
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(scene.parts.len(), 2);
+        assert_eq!(imported_step_reconstruction_count(), 2);
+    }
+
+    #[test]
+    fn identical_standalone_imports_are_reconstructed_independently() {
+        let (mut document, _) = repeated_imported_box_assembly();
+        document
+            .apply(ModelCommand::DeleteAssembly { id: 1 })
+            .unwrap();
+        assert!(shared_imported_step_bodies(&document).is_empty());
+
+        reset_imported_step_reconstruction_count();
+        let scene = TruckKernel::default().evaluate(&document).unwrap();
+        assert_eq!(scene.parts.len(), 2);
+        assert_eq!(imported_step_reconstruction_count(), 2);
     }
 
     #[test]
@@ -6079,7 +8114,11 @@ mod tests {
                 ModelCommand::ImportStep {
                     name: "imported".into(),
                     source,
+                    data_section: 0,
                     shell_id,
+                    void_shells: Vec::new(),
+                    length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                    color: None,
                     position: [0.0; 3],
                 },
                 ModelCommand::CreateBox {
@@ -6109,7 +8148,11 @@ mod tests {
             .apply(ModelCommand::ImportStep {
                 name: "invalid".into(),
                 source: "ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;".into(),
+                data_section: 0,
                 shell_id: 1,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::default(),
+                color: None,
                 position: [0.0; 3],
             })
             .unwrap();

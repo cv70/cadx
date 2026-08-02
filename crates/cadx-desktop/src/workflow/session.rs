@@ -92,6 +92,7 @@ impl CadxApp {
         self.last_sketch_failure = None;
         self.last_sketch_failure_feature = None;
         self.sketch_dimension_editor = None;
+        self.interference_dialog = None;
         if let Some(&id) = outcome.created_features.last() {
             self.selected = Some(id);
             self.clear_topology_selection();
@@ -121,6 +122,7 @@ impl CadxApp {
     pub(crate) fn undo(&mut self) {
         match self.session.undo() {
             Ok(true) => {
+                self.interference_dialog = None;
                 self.status = StatusMessage::Key("status.undo");
                 self.reconcile_selection();
             }
@@ -132,6 +134,7 @@ impl CadxApp {
     pub(crate) fn redo(&mut self) {
         match self.session.redo() {
             Ok(true) => {
+                self.interference_dialog = None;
                 self.status = StatusMessage::Key("status.redo");
                 self.reconcile_selection();
             }

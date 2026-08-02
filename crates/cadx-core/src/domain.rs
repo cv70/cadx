@@ -1,8 +1,12 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 use crate::{
+    assembly::{
+        Assembly, AssemblyError, AssemblyId, AssemblyMate, AssemblyMateId, AssemblyTransform,
+        ComponentDefinition, ComponentOccurrence, ComponentOccurrenceId,
+    },
     diagnostics::{SketchConstraintDiagnostic, SketchConstraintFailureReason},
     topology::{EdgeRef, FaceRef, VertexRef},
 };
@@ -17,6 +21,78 @@ pub type FeatureId = u64;
 
 pub const MAX_MATERIAL_DENSITY_KG_M3: f64 = 100_000.0;
 pub const MAX_LOFT_SECTIONS: usize = 32;
+pub const MAX_STEP_UNIT_NAME_LENGTH: usize = 80;
+pub const MAX_STEP_VOID_SHELLS: usize = 4_096;
+
+/// Length-unit declaration retained with an imported STEP body.
+///
+/// CADX geometry is always evaluated in millimeters. Keeping the source unit
+/// and its exact conversion factor makes an import portable and auditable
+/// without reparsing external files or relying on UI preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepLengthUnit {
+    pub name: String,
+    pub millimeters_per_unit: f64,
+    /// False only for legacy or unitless exchange files interpreted as mm.
+    #[serde(default)]
+    pub declared: bool,
+}
+
+impl StepLengthUnit {
+    #[must_use]
+    pub fn millimeter() -> Self {
+        Self {
+            name: "millimetre".into(),
+            millimeters_per_unit: 1.0,
+            declared: true,
+        }
+    }
+
+    #[must_use]
+    pub fn assumed_millimeter() -> Self {
+        Self {
+            declared: false,
+            ..Self::millimeter()
+        }
+    }
+
+    fn validate(&self) -> Result<(), DocumentError> {
+        let name = self.name.trim();
+        if name.is_empty() || name.chars().count() > MAX_STEP_UNIT_NAME_LENGTH {
+            return Err(DocumentError::InvalidParameter(format!(
+                "STEP length unit name must contain 1 to {MAX_STEP_UNIT_NAME_LENGTH} characters"
+            )));
+        }
+        if !self.millimeters_per_unit.is_finite() || self.millimeters_per_unit <= 0.0 {
+            return Err(DocumentError::InvalidParameter(
+                "STEP millimeters-per-unit factor must be finite and greater than zero".into(),
+            ));
+        }
+        if !self.declared
+            && (name != "millimetre" || (self.millimeters_per_unit - 1.0).abs() > f64::EPSILON)
+        {
+            return Err(DocumentError::InvalidParameter(
+                "an assumed STEP length unit must be millimetres at 1 mm per unit".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for StepLengthUnit {
+    fn default() -> Self {
+        Self::assumed_millimeter()
+    }
+}
+
+/// One oriented inner boundary of a STEP `BREP_WITH_VOIDS` solid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepShellBoundary {
+    /// Entity id of the underlying `CLOSED_SHELL` in the persisted DATA section.
+    pub shell_id: u64,
+    /// Whether the oriented shell uses the underlying shell's face orientation.
+    pub orientation: bool,
+}
 
 /// Kernel-neutral physical material metadata attached to a solid feature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -262,12 +338,19 @@ pub enum Primitive {
     /// A solid imported from a STEP physical file.
     ///
     /// The source is embedded so a CADX document can be evaluated on another
-    /// machine without depending on the original filesystem path. `shell_id`
-    /// is the STEP entity id of the imported shell and remains stable within
-    /// that exchange file.
+    /// machine without depending on the original filesystem path. The DATA
+    /// section and `shell_id` pair identifies the outer shell; `void_shells`
+    /// retains every oriented inner boundary. Its source unit is persisted so
+    /// every evaluation reconstructs millimeter geometry.
     ImportedStep {
         source: String,
+        #[serde(default)]
+        data_section: usize,
         shell_id: u64,
+        #[serde(default)]
+        void_shells: Vec<StepShellBoundary>,
+        #[serde(default)]
+        length_unit: StepLengthUnit,
     },
     Boolean {
         operation: BooleanOperation,
@@ -434,8 +517,16 @@ impl Primitive {
                 sketch_ids,
                 profiles,
             } => validate_loft_definition(sketch_ids, profiles),
-            Self::ImportedStep { source, shell_id }
-                if !source.trim().is_empty() && *shell_id != 0 => Ok(()),
+            Self::ImportedStep {
+                source,
+                shell_id,
+                void_shells,
+                length_unit,
+                ..
+            } if !source.trim().is_empty() && *shell_id != 0 => {
+                validate_step_boundaries(*shell_id, void_shells)?;
+                length_unit.validate()
+            }
             Self::Sketch {
                 plane,
                 region,
@@ -813,7 +904,11 @@ impl FeatureGraph {
 pub struct CadDocument {
     pub name: String,
     pub features: Vec<Feature>,
+    #[serde(default)]
+    pub assemblies: Vec<Assembly>,
     next_id: FeatureId,
+    #[serde(default)]
+    next_assembly_id: AssemblyId,
 }
 
 impl Default for CadDocument {
@@ -821,7 +916,9 @@ impl Default for CadDocument {
         Self {
             name: "Untitled".into(),
             features: Vec::new(),
+            assemblies: Vec::new(),
             next_id: 1,
+            next_assembly_id: 1,
         }
     }
 }
@@ -847,6 +944,92 @@ impl CadDocument {
     #[must_use]
     pub fn feature(&self, id: FeatureId) -> Option<&Feature> {
         self.features.iter().find(|feature| feature.id == id)
+    }
+
+    #[must_use]
+    pub fn assembly(&self, id: AssemblyId) -> Option<&Assembly> {
+        self.assemblies.iter().find(|assembly| assembly.id == id)
+    }
+
+    #[must_use]
+    pub fn assembly_occurrence_for_feature(
+        &self,
+        feature_id: FeatureId,
+    ) -> Option<(&Assembly, &ComponentOccurrence)> {
+        self.assemblies.iter().find_map(|assembly| {
+            assembly
+                .occurrences
+                .iter()
+                .find(|occurrence| occurrence.feature_ids.contains(&feature_id))
+                .map(|occurrence| (assembly, occurrence))
+        })
+    }
+
+    /// Returns stable assembly and ordered body-slot identity for one feature.
+    #[must_use]
+    pub fn assembly_feature_instance(
+        &self,
+        feature_id: FeatureId,
+    ) -> Option<crate::assembly::AssemblyFeatureInstance> {
+        self.assemblies.iter().find_map(|assembly| {
+            assembly.occurrences.iter().find_map(|occurrence| {
+                occurrence
+                    .feature_ids
+                    .iter()
+                    .position(|candidate| *candidate == feature_id)
+                    .map(|body_slot| crate::assembly::AssemblyFeatureInstance {
+                        assembly_id: assembly.id,
+                        definition_id: occurrence.definition_id,
+                        occurrence_id: occurrence.id,
+                        body_slot,
+                    })
+            })
+        })
+    }
+
+    /// Builds a feature-id lookup for every materialized assembly body.
+    #[must_use]
+    pub fn assembly_feature_instances(
+        &self,
+    ) -> HashMap<FeatureId, crate::assembly::AssemblyFeatureInstance> {
+        self.assemblies
+            .iter()
+            .flat_map(|assembly| {
+                assembly.occurrences.iter().flat_map(move |occurrence| {
+                    occurrence
+                        .feature_ids
+                        .iter()
+                        .enumerate()
+                        .map(move |(body_slot, feature_id)| {
+                            (
+                                *feature_id,
+                                crate::assembly::AssemblyFeatureInstance {
+                                    assembly_id: assembly.id,
+                                    definition_id: occurrence.definition_id,
+                                    occurrence_id: occurrence.id,
+                                    body_slot,
+                                },
+                            )
+                        })
+                })
+            })
+            .collect()
+    }
+
+    /// Returns every materialized body excluded by direct or inherited
+    /// occurrence suppression.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] if a persisted occurrence hierarchy cannot be
+    /// resolved.
+    pub fn suppressed_assembly_feature_ids(&self) -> Result<HashSet<FeatureId>, DocumentError> {
+        suppressed_assembly_feature_ids(&self.assemblies).map_err(Into::into)
+    }
+
+    #[must_use]
+    pub const fn next_feature_id(&self) -> FeatureId {
+        self.next_id
     }
 
     /// Builds and validates the document's dependency graph.
@@ -1096,13 +1279,34 @@ impl CadDocument {
             ModelCommand::ImportStep {
                 name,
                 source,
+                data_section,
                 shell_id,
+                void_shells,
+                length_unit,
+                color,
                 position,
-            } => self.create(
-                &name,
-                Primitive::ImportedStep { source, shell_id },
-                Vec3::from_array(position),
-            ),
+            } => {
+                if color.is_some_and(|color| !color_is_valid(&color)) {
+                    return Err(DocumentError::InvalidParameter(
+                        "color must contain finite values between zero and one".into(),
+                    ));
+                }
+                let created = self.create(
+                    &name,
+                    Primitive::ImportedStep {
+                        source,
+                        data_section,
+                        shell_id,
+                        void_shells,
+                        length_unit,
+                    },
+                    Vec3::from_array(position),
+                )?;
+                if let (Some(id), Some(color)) = (created, color) {
+                    self.feature_mut(id)?.color = color;
+                }
+                Ok(created)
+            }
             ModelCommand::CreateBoolean {
                 name,
                 operation,
@@ -1217,6 +1421,7 @@ impl CadDocument {
                 self.duplicate(id, &name, Vec3::from_array(position))
             }
             ModelCommand::Move { id, position } => {
+                self.ensure_feature_transform_is_editable(id)?;
                 let position = Vec3::from_array(position);
                 if !position.is_finite() {
                     return Err(DocumentError::InvalidParameter(
@@ -1227,6 +1432,7 @@ impl CadDocument {
                 Ok(None)
             }
             ModelCommand::Rotate { id, rotation } => {
+                self.ensure_feature_transform_is_editable(id)?;
                 let rotation = Vec3::from_array(rotation);
                 if !rotation.is_finite() {
                     return Err(DocumentError::InvalidParameter(
@@ -1728,10 +1934,7 @@ impl CadDocument {
                 Ok(None)
             }
             ModelCommand::SetColor { id, color } => {
-                if !color
-                    .iter()
-                    .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
-                {
+                if !color_is_valid(&color) {
                     return Err(DocumentError::InvalidParameter(
                         "color must contain finite values between zero and one".into(),
                     ));
@@ -1766,11 +1969,95 @@ impl CadDocument {
                 feature.material = None;
                 Ok(None)
             }
+            ModelCommand::CreateAssembly {
+                name,
+                definitions,
+                occurrences,
+            } => {
+                let id = self.next_assembly_id;
+                let next_assembly_id = self
+                    .next_assembly_id
+                    .checked_add(1)
+                    .ok_or(DocumentError::IdOverflow)?;
+                let assembly = Assembly {
+                    id,
+                    name: normalized_name(&name, "Assembly"),
+                    definitions,
+                    occurrences,
+                    mates: Vec::new(),
+                };
+                self.validate_assembly(&assembly)?;
+                let mut candidate_assemblies = self.assemblies.clone();
+                candidate_assemblies.push(assembly.clone());
+                self.validate_suppressed_dependencies(&candidate_assemblies)?;
+                self.next_assembly_id = next_assembly_id;
+                self.assemblies.push(assembly);
+                Ok(None)
+            }
+            ModelCommand::SetOccurrenceTransform {
+                assembly_id,
+                occurrence_id,
+                position,
+                rotation,
+            } => {
+                self.set_occurrence_transform(assembly_id, occurrence_id, position, rotation)?;
+                Ok(None)
+            }
+            ModelCommand::CreateAssemblyMate { assembly_id, mate } => {
+                self.create_assembly_mate(assembly_id, mate)?;
+                Ok(None)
+            }
+            ModelCommand::SetAssemblyMateState {
+                assembly_id,
+                mate_id,
+                state,
+            } => {
+                self.set_assembly_mate_state(assembly_id, mate_id, state)?;
+                Ok(None)
+            }
+            ModelCommand::DeleteAssemblyMate {
+                assembly_id,
+                mate_id,
+            } => {
+                self.delete_assembly_mate(assembly_id, mate_id)?;
+                Ok(None)
+            }
+            ModelCommand::SetOccurrenceSuppressed {
+                assembly_id,
+                occurrence_id,
+                suppressed,
+            } => {
+                self.set_occurrence_suppressed(assembly_id, occurrence_id, suppressed)?;
+                Ok(None)
+            }
+            ModelCommand::DeleteAssembly { id } => {
+                let index = self
+                    .assemblies
+                    .iter()
+                    .position(|assembly| assembly.id == id)
+                    .ok_or(DocumentError::AssemblyNotFound(id))?;
+                self.assemblies.remove(index);
+                Ok(None)
+            }
             ModelCommand::Delete { id } => {
                 if let Some(dependent) = self.dependents(id).next() {
                     return Err(DocumentError::FeatureInUse {
                         id,
                         dependent: dependent.id,
+                    });
+                }
+                if let Some((assembly, occurrence)) = self.assemblies.iter().find_map(|assembly| {
+                    assembly.occurrences.iter().find_map(|occurrence| {
+                        occurrence
+                            .feature_ids
+                            .contains(&id)
+                            .then_some((assembly.id, occurrence.id))
+                    })
+                }) {
+                    return Err(DocumentError::FeatureInAssembly {
+                        id,
+                        assembly,
+                        occurrence,
                     });
                 }
                 let index = self
@@ -1840,11 +2127,7 @@ impl CadDocument {
                     feature.id
                 )));
             }
-            if !feature
-                .color
-                .iter()
-                .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
-            {
+            if !color_is_valid(&feature.color) {
                 return Err(DocumentError::InvalidParameter(format!(
                     "feature {} color must contain finite values between zero and one",
                     feature.id
@@ -1862,8 +2145,377 @@ impl CadDocument {
             maximum_id = maximum_id.max(feature.id);
         }
         self.feature_graph()?;
+        let mut assembly_ids = std::collections::BTreeSet::new();
+        let mut maximum_assembly_id = 0;
+        let available_features = self.features.iter().map(|feature| feature.id).collect();
+        let mut owned_features = std::collections::BTreeMap::new();
+        for assembly in &self.assemblies {
+            if !assembly_ids.insert(assembly.id) {
+                return Err(DocumentError::Assembly(AssemblyError::InvalidAssemblyId(
+                    assembly.id,
+                )));
+            }
+            assembly.validate(&available_features)?;
+            let world_transforms = assembly.world_transforms()?;
+            for occurrence in &assembly.occurrences {
+                let world_transform = world_transforms
+                    .get(&occurrence.id)
+                    .copied()
+                    .ok_or(AssemblyError::UnresolvableOccurrenceHierarchy)?;
+                for feature_id in &occurrence.feature_ids {
+                    let feature =
+                        self.feature(*feature_id)
+                            .ok_or(AssemblyError::MissingFeature {
+                                occurrence: occurrence.id,
+                                feature: *feature_id,
+                            })?;
+                    if feature.primitive.is_reference_geometry() {
+                        return Err(DocumentError::Assembly(AssemblyError::NonSolidFeature {
+                            occurrence: occurrence.id,
+                            feature: *feature_id,
+                        }));
+                    }
+                    let feature_transform = AssemblyTransform::from_euler_xyz_degrees(
+                        feature.translation.as_array(),
+                        feature.rotation.as_array(),
+                    );
+                    if !feature_transform.approximately_equals(world_transform, 1.0e-8) {
+                        return Err(DocumentError::Assembly(
+                            AssemblyError::FeatureTransformMismatch {
+                                occurrence: occurrence.id,
+                                feature: *feature_id,
+                            },
+                        ));
+                    }
+                    if let Some((owner_assembly, owner_occurrence)) =
+                        owned_features.insert(*feature_id, (assembly.id, occurrence.id))
+                    {
+                        return Err(DocumentError::FeatureInMultipleAssemblies {
+                            id: *feature_id,
+                            first_assembly: owner_assembly,
+                            first_occurrence: owner_occurrence,
+                            second_assembly: assembly.id,
+                            second_occurrence: occurrence.id,
+                        });
+                    }
+                }
+            }
+            maximum_assembly_id = maximum_assembly_id.max(assembly.id);
+        }
+        self.validate_suppressed_dependencies(&self.assemblies)?;
         self.next_id = maximum_id.checked_add(1).ok_or(DocumentError::IdOverflow)?;
+        self.next_assembly_id = maximum_assembly_id
+            .checked_add(1)
+            .ok_or(DocumentError::IdOverflow)?;
         self.name = normalized_name(&self.name, "Untitled");
+        Ok(())
+    }
+
+    fn validate_assembly(&self, assembly: &Assembly) -> Result<(), DocumentError> {
+        let available_features = self.features.iter().map(|feature| feature.id).collect();
+        assembly.validate(&available_features)?;
+        let world_transforms = assembly.world_transforms()?;
+        for occurrence in &assembly.occurrences {
+            let world_transform = world_transforms
+                .get(&occurrence.id)
+                .copied()
+                .ok_or(AssemblyError::UnresolvableOccurrenceHierarchy)?;
+            for feature_id in &occurrence.feature_ids {
+                let feature = self
+                    .feature(*feature_id)
+                    .ok_or(AssemblyError::MissingFeature {
+                        occurrence: occurrence.id,
+                        feature: *feature_id,
+                    })?;
+                if feature.primitive.is_reference_geometry() {
+                    return Err(DocumentError::Assembly(AssemblyError::NonSolidFeature {
+                        occurrence: occurrence.id,
+                        feature: *feature_id,
+                    }));
+                }
+                let feature_transform = AssemblyTransform::from_euler_xyz_degrees(
+                    feature.translation.as_array(),
+                    feature.rotation.as_array(),
+                );
+                if !feature_transform.approximately_equals(world_transform, 1.0e-8) {
+                    return Err(DocumentError::Assembly(
+                        AssemblyError::FeatureTransformMismatch {
+                            occurrence: occurrence.id,
+                            feature: *feature_id,
+                        },
+                    ));
+                }
+                if let Some((owner_assembly, owner_occurrence)) =
+                    self.assemblies.iter().find_map(|existing| {
+                        existing.occurrences.iter().find_map(|existing_occurrence| {
+                            existing_occurrence
+                                .feature_ids
+                                .contains(feature_id)
+                                .then_some((existing.id, existing_occurrence.id))
+                        })
+                    })
+                {
+                    return Err(DocumentError::FeatureInMultipleAssemblies {
+                        id: *feature_id,
+                        first_assembly: owner_assembly,
+                        first_occurrence: owner_occurrence,
+                        second_assembly: assembly.id,
+                        second_occurrence: occurrence.id,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_occurrence_transform(
+        &mut self,
+        assembly_id: AssemblyId,
+        occurrence_id: u64,
+        position: [f64; 3],
+        rotation: [f64; 3],
+    ) -> Result<(), DocumentError> {
+        let assembly_index = self
+            .assemblies
+            .iter()
+            .position(|assembly| assembly.id == assembly_id)
+            .ok_or(DocumentError::AssemblyNotFound(assembly_id))?;
+        let mut assembly = self.assemblies[assembly_index].clone();
+        if let Some(mate) = assembly.mate_for_child(occurrence_id) {
+            return Err(DocumentError::MateDrivenOccurrence {
+                assembly: assembly_id,
+                occurrence: occurrence_id,
+                mate: mate.id,
+            });
+        }
+        let occurrence = assembly
+            .occurrences
+            .iter_mut()
+            .find(|occurrence| occurrence.id == occurrence_id)
+            .ok_or(DocumentError::OccurrenceNotFound {
+                assembly: assembly_id,
+                occurrence: occurrence_id,
+            })?;
+        occurrence.transform = AssemblyTransform::from_euler_xyz_degrees(position, rotation);
+
+        self.replace_assembly_with_feature_transforms(assembly_index, assembly)
+    }
+
+    fn create_assembly_mate(
+        &mut self,
+        assembly_id: AssemblyId,
+        mate: AssemblyMate,
+    ) -> Result<(), DocumentError> {
+        let assembly_index = self
+            .assemblies
+            .iter()
+            .position(|assembly| assembly.id == assembly_id)
+            .ok_or(DocumentError::AssemblyNotFound(assembly_id))?;
+        let mut assembly = self.assemblies[assembly_index].clone();
+        let child_id = mate.child_occurrence_id;
+        let local_transform = mate.local_transform();
+        assembly.mates.push(mate);
+        if let Some(child) = assembly
+            .occurrences
+            .iter_mut()
+            .find(|occurrence| occurrence.id == child_id)
+        {
+            child.transform = local_transform;
+        }
+        self.replace_assembly_with_feature_transforms(assembly_index, assembly)
+    }
+
+    fn set_assembly_mate_state(
+        &mut self,
+        assembly_id: AssemblyId,
+        mate_id: AssemblyMateId,
+        state: f64,
+    ) -> Result<(), DocumentError> {
+        let assembly_index = self
+            .assemblies
+            .iter()
+            .position(|assembly| assembly.id == assembly_id)
+            .ok_or(DocumentError::AssemblyNotFound(assembly_id))?;
+        let mut assembly = self.assemblies[assembly_index].clone();
+        let mate = assembly
+            .mates
+            .iter_mut()
+            .find(|mate| mate.id == mate_id)
+            .ok_or(DocumentError::AssemblyMateNotFound {
+                assembly: assembly_id,
+                mate: mate_id,
+            })?;
+        mate.state = state;
+        let child_id = mate.child_occurrence_id;
+        let local_transform = mate.local_transform();
+        let child = assembly
+            .occurrences
+            .iter_mut()
+            .find(|occurrence| occurrence.id == child_id)
+            .ok_or(AssemblyError::MateOccurrenceNotFound {
+                mate: mate_id,
+                occurrence: child_id,
+            })?;
+        child.transform = local_transform;
+        self.replace_assembly_with_feature_transforms(assembly_index, assembly)
+    }
+
+    fn delete_assembly_mate(
+        &mut self,
+        assembly_id: AssemblyId,
+        mate_id: AssemblyMateId,
+    ) -> Result<(), DocumentError> {
+        let assembly_index = self
+            .assemblies
+            .iter()
+            .position(|assembly| assembly.id == assembly_id)
+            .ok_or(DocumentError::AssemblyNotFound(assembly_id))?;
+        let mut assembly = self.assemblies[assembly_index].clone();
+        let mate_index = assembly
+            .mates
+            .iter()
+            .position(|mate| mate.id == mate_id)
+            .ok_or(DocumentError::AssemblyMateNotFound {
+                assembly: assembly_id,
+                mate: mate_id,
+            })?;
+        assembly.mates.remove(mate_index);
+        self.replace_assembly_with_feature_transforms(assembly_index, assembly)
+    }
+
+    fn replace_assembly_with_feature_transforms(
+        &mut self,
+        assembly_index: usize,
+        assembly: Assembly,
+    ) -> Result<(), DocumentError> {
+        let available_features = self.features.iter().map(|feature| feature.id).collect();
+        assembly.validate(&available_features)?;
+        let world_transforms = assembly.world_transforms()?;
+        let mut updates = Vec::new();
+        for occurrence in &assembly.occurrences {
+            let world_transform = world_transforms
+                .get(&occurrence.id)
+                .copied()
+                .ok_or(AssemblyError::UnresolvableOccurrenceHierarchy)?;
+            let feature_rotation = world_transform.euler_xyz_degrees();
+            let reconstructed = AssemblyTransform::from_euler_xyz_degrees(
+                world_transform.translation,
+                feature_rotation,
+            );
+            if !world_transform.approximately_equals(reconstructed, 1.0e-8) {
+                return Err(DocumentError::Assembly(
+                    AssemblyError::UnrepresentableFeatureTransform {
+                        occurrence: occurrence.id,
+                    },
+                ));
+            }
+            for feature_id in &occurrence.feature_ids {
+                let feature_index = self
+                    .features
+                    .iter()
+                    .position(|feature| feature.id == *feature_id)
+                    .ok_or(AssemblyError::MissingFeature {
+                        occurrence: occurrence.id,
+                        feature: *feature_id,
+                    })?;
+                if self.features[feature_index]
+                    .primitive
+                    .is_reference_geometry()
+                {
+                    return Err(DocumentError::Assembly(AssemblyError::NonSolidFeature {
+                        occurrence: occurrence.id,
+                        feature: *feature_id,
+                    }));
+                }
+                updates.push((feature_index, world_transform.translation, feature_rotation));
+            }
+        }
+
+        self.assemblies[assembly_index] = assembly;
+        for (feature_index, translation, rotation) in updates {
+            self.features[feature_index].translation = Vec3::from_array(translation);
+            self.features[feature_index].rotation = Vec3::from_array(rotation);
+        }
+        Ok(())
+    }
+
+    fn set_occurrence_suppressed(
+        &mut self,
+        assembly_id: AssemblyId,
+        occurrence_id: u64,
+        suppressed: bool,
+    ) -> Result<(), DocumentError> {
+        let assembly_index = self
+            .assemblies
+            .iter()
+            .position(|assembly| assembly.id == assembly_id)
+            .ok_or(DocumentError::AssemblyNotFound(assembly_id))?;
+        let mut candidate_assemblies = self.assemblies.clone();
+        let occurrence = candidate_assemblies[assembly_index]
+            .occurrences
+            .iter_mut()
+            .find(|occurrence| occurrence.id == occurrence_id)
+            .ok_or(DocumentError::OccurrenceNotFound {
+                assembly: assembly_id,
+                occurrence: occurrence_id,
+            })?;
+        occurrence.suppressed = suppressed;
+        self.validate_suppressed_dependencies(&candidate_assemblies)?;
+        self.assemblies = candidate_assemblies;
+        Ok(())
+    }
+
+    fn validate_suppressed_dependencies(
+        &self,
+        assemblies: &[Assembly],
+    ) -> Result<(), DocumentError> {
+        let suppressed = suppressed_assembly_feature_ids(assemblies)?;
+        for feature in &self.features {
+            if suppressed.contains(&feature.id) {
+                continue;
+            }
+            if let Some(dependency) = feature
+                .primitive
+                .dependencies()
+                .into_iter()
+                .find(|dependency| suppressed.contains(dependency))
+            {
+                return Err(DocumentError::SuppressedFeatureDependency {
+                    feature: feature.id,
+                    dependency,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_primitive_suppressed_dependencies(
+        &self,
+        feature: FeatureId,
+        primitive: &Primitive,
+    ) -> Result<(), DocumentError> {
+        let suppressed = self.suppressed_assembly_feature_ids()?;
+        if let Some(dependency) = primitive
+            .dependencies()
+            .into_iter()
+            .find(|dependency| suppressed.contains(dependency))
+        {
+            return Err(DocumentError::SuppressedFeatureDependency {
+                feature,
+                dependency,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_feature_transform_is_editable(&self, id: FeatureId) -> Result<(), DocumentError> {
+        if let Some((assembly, occurrence)) = self.assembly_occurrence_for_feature(id) {
+            return Err(DocumentError::FeatureInAssembly {
+                id,
+                assembly: assembly.id,
+                occurrence: occurrence.id,
+            });
+        }
         Ok(())
     }
 
@@ -1903,6 +2555,7 @@ impl CadDocument {
         translation: Vec3,
     ) -> Result<Option<FeatureId>, DocumentError> {
         primitive.validate()?;
+        self.validate_primitive_suppressed_dependencies(self.next_id, &primitive)?;
         if !translation.is_finite() {
             return Err(DocumentError::InvalidParameter(
                 "translation must contain finite values".into(),
@@ -1982,6 +2635,7 @@ impl CadDocument {
             });
         };
         primitive.validate()?;
+        self.validate_primitive_suppressed_dependencies(sketch_id, &primitive)?;
         let solved_region = solve_sketch_region(region, construction, constraints)?;
 
         // Validate every derived primitive before changing any feature so a
@@ -2073,6 +2727,21 @@ impl CadDocument {
         }
         Ok(())
     }
+}
+
+fn suppressed_assembly_feature_ids(
+    assemblies: &[Assembly],
+) -> Result<HashSet<FeatureId>, AssemblyError> {
+    let mut features = HashSet::new();
+    for assembly in assemblies {
+        let effective = assembly.effective_suppression()?;
+        for occurrence in &assembly.occurrences {
+            if effective.get(&occurrence.id) == Some(&true) {
+                features.extend(occurrence.feature_ids.iter().copied());
+            }
+        }
+    }
+    Ok(features)
 }
 
 fn normalized_name(name: &str, fallback: &str) -> String {
@@ -2245,6 +2914,32 @@ fn palette_color(id: FeatureId) -> [f32; 4] {
     }
 }
 
+fn color_is_valid(color: &[f32; 4]) -> bool {
+    color
+        .iter()
+        .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+}
+
+fn validate_step_boundaries(
+    outer_shell_id: u64,
+    void_shells: &[StepShellBoundary],
+) -> Result<(), DocumentError> {
+    if void_shells.len() > MAX_STEP_VOID_SHELLS {
+        return Err(DocumentError::InvalidParameter(format!(
+            "imported STEP solid exceeds the limit of {MAX_STEP_VOID_SHELLS} void shells"
+        )));
+    }
+    let mut shell_ids = std::collections::BTreeSet::from([outer_shell_id]);
+    for boundary in void_shells {
+        if boundary.shell_id == 0 || !shell_ids.insert(boundary.shell_id) {
+            return Err(DocumentError::InvalidParameter(
+                "imported STEP boundary shell ids must be non-zero and unique".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ModelCommand {
@@ -2339,7 +3034,15 @@ pub enum ModelCommand {
     ImportStep {
         name: String,
         source: String,
+        #[serde(default)]
+        data_section: usize,
         shell_id: u64,
+        #[serde(default)]
+        void_shells: Vec<StepShellBoundary>,
+        #[serde(default)]
+        length_unit: StepLengthUnit,
+        #[serde(default)]
+        color: Option<[f32; 4]>,
         #[serde(default)]
         position: [f64; 3],
     },
@@ -2490,6 +3193,40 @@ pub enum ModelCommand {
     ClearMaterial {
         id: FeatureId,
     },
+    CreateAssembly {
+        name: String,
+        definitions: Vec<ComponentDefinition>,
+        occurrences: Vec<ComponentOccurrence>,
+    },
+    SetOccurrenceTransform {
+        assembly_id: AssemblyId,
+        occurrence_id: u64,
+        /// Absolute local translation in the parent occurrence's coordinates.
+        position: [f64; 3],
+        /// Absolute local XYZ Euler rotation in degrees.
+        rotation: [f64; 3],
+    },
+    CreateAssemblyMate {
+        assembly_id: AssemblyId,
+        mate: AssemblyMate,
+    },
+    SetAssemblyMateState {
+        assembly_id: AssemblyId,
+        mate_id: AssemblyMateId,
+        state: f64,
+    },
+    DeleteAssemblyMate {
+        assembly_id: AssemblyId,
+        mate_id: AssemblyMateId,
+    },
+    SetOccurrenceSuppressed {
+        assembly_id: AssemblyId,
+        occurrence_id: u64,
+        suppressed: bool,
+    },
+    DeleteAssembly {
+        id: AssemblyId,
+    },
     Delete {
         id: FeatureId,
     },
@@ -2541,6 +3278,13 @@ impl ModelCommand {
             Self::SetColor { .. } => "Change color",
             Self::SetMaterial { .. } => "Set material",
             Self::ClearMaterial { .. } => "Clear material",
+            Self::CreateAssembly { .. } => "Create assembly",
+            Self::SetOccurrenceTransform { .. } => "Move assembly occurrence",
+            Self::CreateAssemblyMate { .. } => "Create assembly mate",
+            Self::SetAssemblyMateState { .. } => "Move assembly mate",
+            Self::DeleteAssemblyMate { .. } => "Delete assembly mate",
+            Self::SetOccurrenceSuppressed { .. } => "Suppress assembly occurrence",
+            Self::DeleteAssembly { .. } => "Delete assembly",
             Self::Delete { .. } => "Delete feature",
         }
     }
@@ -2550,6 +3294,26 @@ impl ModelCommand {
 pub enum DocumentError {
     #[error("feature {0} does not exist")]
     FeatureNotFound(FeatureId),
+    #[error("assembly {0} does not exist")]
+    AssemblyNotFound(AssemblyId),
+    #[error("assembly {assembly} occurrence {occurrence} does not exist")]
+    OccurrenceNotFound {
+        assembly: AssemblyId,
+        occurrence: u64,
+    },
+    #[error("assembly {assembly} mate {mate} does not exist")]
+    AssemblyMateNotFound {
+        assembly: AssemblyId,
+        mate: AssemblyMateId,
+    },
+    #[error("assembly {assembly} occurrence {occurrence} is driven by mate {mate}")]
+    MateDrivenOccurrence {
+        assembly: AssemblyId,
+        occurrence: ComponentOccurrenceId,
+        mate: AssemblyMateId,
+    },
+    #[error("invalid assembly: {0}")]
+    Assembly(#[from] AssemblyError),
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
     #[error("{0}")]
@@ -2571,10 +3335,31 @@ pub enum DocumentError {
         dependency: FeatureId,
         expected: &'static str,
     },
+    #[error("active feature {feature} depends on suppressed assembly feature {dependency}")]
+    SuppressedFeatureDependency {
+        feature: FeatureId,
+        dependency: FeatureId,
+    },
     #[error("feature dependency graph contains a cycle: {cycle:?}")]
     DependencyCycle { cycle: Vec<FeatureId> },
     #[error("feature {id} is used by dependent feature {dependent}")]
     FeatureInUse { id: FeatureId, dependent: FeatureId },
+    #[error("feature {id} belongs to assembly {assembly} occurrence {occurrence}")]
+    FeatureInAssembly {
+        id: FeatureId,
+        assembly: AssemblyId,
+        occurrence: u64,
+    },
+    #[error(
+        "feature {id} belongs to assembly {first_assembly} occurrence {first_occurrence} and assembly {second_assembly} occurrence {second_occurrence}"
+    )]
+    FeatureInMultipleAssemblies {
+        id: FeatureId,
+        first_assembly: AssemblyId,
+        first_occurrence: u64,
+        second_assembly: AssemblyId,
+        second_occurrence: u64,
+    },
 }
 
 #[cfg(test)]
@@ -4521,7 +5306,9 @@ mod tests {
                     material: None,
                 },
             ],
+            assemblies: Vec::new(),
             next_id: 3,
+            next_assembly_id: 1,
         };
         assert!(matches!(
             document.validate_and_repair(),
@@ -4542,5 +5329,870 @@ mod tests {
             document.validate_and_repair(),
             Err(DocumentError::DependencyCycle { cycle }) if cycle == vec![1, 2]
         ));
+    }
+
+    #[test]
+    fn imported_step_units_are_validated_before_commit() {
+        let mut document = CadDocument::default();
+        let command = |length_unit| ModelCommand::ImportStep {
+            name: "supplier body".into(),
+            source: "ISO-10303-21; DATA; #1=CLOSED_SHELL('',(#2)); ENDSEC; END-ISO-10303-21;"
+                .into(),
+            data_section: 0,
+            shell_id: 1,
+            void_shells: Vec::new(),
+            length_unit,
+            color: None,
+            position: [0.0; 3],
+        };
+        assert!(
+            document
+                .apply(command(StepLengthUnit {
+                    name: "inch".into(),
+                    millimeters_per_unit: f64::NAN,
+                    declared: true,
+                }))
+                .is_err()
+        );
+        assert!(
+            document
+                .apply(command(StepLengthUnit {
+                    name: String::new(),
+                    millimeters_per_unit: 25.4,
+                    declared: true,
+                }))
+                .is_err()
+        );
+        assert!(
+            document
+                .apply(command(StepLengthUnit {
+                    name: "inch".into(),
+                    millimeters_per_unit: 25.4,
+                    declared: false,
+                }))
+                .is_err()
+        );
+        assert!(document.features.is_empty());
+    }
+
+    #[test]
+    fn imported_step_boundary_ids_are_validated_before_commit() {
+        let command = |void_shells| ModelCommand::ImportStep {
+            name: "hollow supplier body".into(),
+            source: "ISO-10303-21; DATA; #1=CLOSED_SHELL('',(#2)); ENDSEC; END-ISO-10303-21;"
+                .into(),
+            data_section: 0,
+            shell_id: 1,
+            void_shells,
+            length_unit: StepLengthUnit::millimeter(),
+            color: None,
+            position: [0.0; 3],
+        };
+        let mut document = CadDocument::default();
+        for void_shells in [
+            vec![StepShellBoundary {
+                shell_id: 0,
+                orientation: true,
+            }],
+            vec![StepShellBoundary {
+                shell_id: 1,
+                orientation: false,
+            }],
+            vec![
+                StepShellBoundary {
+                    shell_id: 2,
+                    orientation: true,
+                },
+                StepShellBoundary {
+                    shell_id: 2,
+                    orientation: false,
+                },
+            ],
+        ] {
+            assert!(document.apply(command(void_shells)).is_err());
+            assert!(document.features.is_empty());
+        }
+    }
+
+    #[test]
+    fn imported_step_color_is_applied_atomically() {
+        let command = |color| ModelCommand::ImportStep {
+            name: "painted supplier body".into(),
+            source: "ISO-10303-21; DATA; #1=CLOSED_SHELL('',(#2)); ENDSEC; END-ISO-10303-21;"
+                .into(),
+            data_section: 0,
+            shell_id: 1,
+            void_shells: Vec::new(),
+            length_unit: StepLengthUnit::millimeter(),
+            color,
+            position: [0.0; 3],
+        };
+        let mut document = CadDocument::default();
+        assert!(document.apply(command(Some([1.1, 0.2, 0.3, 1.0]))).is_err());
+        assert!(document.features.is_empty());
+
+        let color = [0.1, 0.2, 0.8, 0.75];
+        let id = document.apply(command(Some(color))).unwrap().unwrap();
+        assert!(
+            document
+                .feature(id)
+                .unwrap()
+                .color
+                .into_iter()
+                .zip(color)
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn assembly_occurrences_reuse_definitions_and_own_concrete_features() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+
+        let mut document = CadDocument::default();
+        let feature_ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "left fastener".into(),
+                    size: [2.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "right fastener".into(),
+                    size: [2.0; 3],
+                    position: [10.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "fastener".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "fastener 1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![feature_ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "fastener 2".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [10.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let assembly = document.assembly(1).unwrap();
+        assert_eq!(assembly.definitions.len(), 2);
+        assert_eq!(assembly.children(1).count(), 2);
+        assert_eq!(
+            document.assembly_feature_instance(feature_ids[1]),
+            Some(crate::assembly::AssemblyFeatureInstance {
+                assembly_id: 1,
+                definition_id: 2,
+                occurrence_id: 3,
+                body_slot: 0,
+            })
+        );
+        assert_eq!(document.assembly_feature_instance(999), None);
+        let instances = document.assembly_feature_instances();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[&feature_ids[0]].occurrence_id, 2);
+        for command in [
+            ModelCommand::Move {
+                id: feature_ids[0],
+                position: [1.0, 2.0, 3.0],
+            },
+            ModelCommand::Rotate {
+                id: feature_ids[0],
+                rotation: [10.0, 20.0, 30.0],
+            },
+        ] {
+            assert!(matches!(
+                document.apply(command),
+                Err(DocumentError::FeatureInAssembly {
+                    assembly: 1,
+                    occurrence: 2,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            document.apply(ModelCommand::Delete { id: feature_ids[0] }),
+            Err(DocumentError::FeatureInAssembly {
+                assembly: 1,
+                occurrence: 2,
+                ..
+            })
+        ));
+        document
+            .apply(ModelCommand::DeleteAssembly { id: 1 })
+            .unwrap();
+        document
+            .apply(ModelCommand::Delete { id: feature_ids[0] })
+            .unwrap();
+    }
+
+    #[test]
+    fn occurrence_transform_updates_descendant_bodies_atomically() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+
+        let mut document = CadDocument::default();
+        let feature_ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "subassembly body".into(),
+                    size: [2.0; 3],
+                    position: [10.0, 0.0, 0.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "nested body".into(),
+                    size: [1.0; 3],
+                    position: [12.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "nested fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "carriage".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 3,
+                        name: "pin".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "carriage:1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [10.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "pin:1".into(),
+                        definition_id: 3,
+                        parent_id: Some(2),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [2.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        document
+            .apply(ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 2,
+                position: [20.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 90.0],
+            })
+            .unwrap();
+        for (feature_id, expected_position) in [
+            (feature_ids[0], [20.0, 0.0, 0.0]),
+            (feature_ids[1], [20.0, 2.0, 0.0]),
+        ] {
+            let feature = document.feature(feature_id).unwrap();
+            assert!(
+                feature
+                    .translation
+                    .as_array()
+                    .into_iter()
+                    .zip(expected_position)
+                    .all(|(actual, expected)| (actual - expected).abs() < 1.0e-9)
+            );
+            assert!((feature.rotation.z - 90.0).abs() < 1.0e-9);
+        }
+        let expected_local =
+            AssemblyTransform::from_euler_xyz_degrees([20.0, 0.0, 0.0], [0.0, 0.0, 90.0]);
+        assert!(
+            document
+                .assembly(1)
+                .unwrap()
+                .occurrence(2)
+                .unwrap()
+                .transform
+                .approximately_equals(expected_local, 1.0e-9)
+        );
+
+        let committed = document.clone();
+        assert!(matches!(
+            document.apply(ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 2,
+                position: [f64::NAN, 0.0, 0.0],
+                rotation: [0.0; 3],
+            }),
+            Err(DocumentError::Assembly(AssemblyError::NonFiniteTransform))
+        ));
+        assert_eq!(document, committed);
+        assert!(matches!(
+            document.apply(ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 99,
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+            }),
+            Err(DocumentError::OccurrenceNotFound {
+                assembly: 1,
+                occurrence: 99
+            })
+        ));
+        assert_eq!(document, committed);
+    }
+
+    #[test]
+    fn assembly_mate_commands_drive_descendants_and_fail_atomically() {
+        use crate::assembly::{
+            AssemblyMate, AssemblyMateKind, AssemblyMateLimits, AssemblyTransform,
+            ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+
+        let mut document = CadDocument::default();
+        let feature_ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "base".into(),
+                    size: [4.0; 3],
+                    position: [5.0, 0.0, 0.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "arm".into(),
+                    size: [3.0; 3],
+                    position: [15.0, 0.0, 0.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "tool".into(),
+                    size: [2.0; 3],
+                    position: [17.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "robot".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "base".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "arm".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 3,
+                        name: "tool".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "base:1".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [5.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "arm:1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [10.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[1]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "tool:1".into(),
+                        definition_id: 3,
+                        parent_id: Some(2),
+                        suppressed: true,
+                        transform: AssemblyTransform {
+                            translation: [2.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![feature_ids[2]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        document
+            .apply(ModelCommand::CreateAssemblyMate {
+                assembly_id: 1,
+                mate: AssemblyMate {
+                    id: 1,
+                    name: "shoulder".into(),
+                    parent_occurrence_id: 1,
+                    child_occurrence_id: 2,
+                    parent_frame: AssemblyTransform {
+                        translation: [10.0, 0.0, 0.0],
+                        ..AssemblyTransform::IDENTITY
+                    },
+                    child_frame: AssemblyTransform::IDENTITY,
+                    kind: AssemblyMateKind::Revolute {
+                        axis: [0.0, 0.0, 1.0],
+                        limits_deg: Some(AssemblyMateLimits {
+                            min: -90.0,
+                            max: 90.0,
+                        }),
+                    },
+                    state: 0.0,
+                },
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::SetAssemblyMateState {
+                assembly_id: 1,
+                mate_id: 1,
+                state: 90.0,
+            })
+            .unwrap();
+
+        let arm = document.feature(feature_ids[1]).unwrap().clone();
+        let tool = document.feature(feature_ids[2]).unwrap().clone();
+        assert!(
+            arm.translation
+                .as_array()
+                .into_iter()
+                .zip([15.0, 0.0, 0.0])
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-9)
+        );
+        assert!((arm.rotation.z - 90.0).abs() < 1.0e-9);
+        assert!(
+            tool.translation
+                .as_array()
+                .into_iter()
+                .zip([15.0, 2.0, 0.0])
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-9)
+        );
+        assert!((tool.rotation.z - 90.0).abs() < 1.0e-9);
+        assert!(
+            document
+                .assembly(1)
+                .unwrap()
+                .occurrence(3)
+                .unwrap()
+                .suppressed
+        );
+
+        let committed = document.clone();
+        assert!(matches!(
+            document.apply(ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 2,
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+            }),
+            Err(DocumentError::MateDrivenOccurrence {
+                assembly: 1,
+                occurrence: 2,
+                mate: 1
+            })
+        ));
+        assert_eq!(document, committed);
+        assert!(matches!(
+            document.apply(ModelCommand::SetAssemblyMateState {
+                assembly_id: 1,
+                mate_id: 1,
+                state: 91.0,
+            }),
+            Err(DocumentError::Assembly(
+                AssemblyError::MateStateOutsideLimits { mate: 1 }
+            ))
+        ));
+        assert_eq!(document, committed);
+
+        document
+            .apply(ModelCommand::DeleteAssemblyMate {
+                assembly_id: 1,
+                mate_id: 1,
+            })
+            .unwrap();
+        assert!(document.assembly(1).unwrap().mates.is_empty());
+        assert_eq!(document.feature(feature_ids[1]).unwrap(), &arm);
+        assert_eq!(document.feature(feature_ids[2]).unwrap(), &tool);
+        document
+            .apply(ModelCommand::SetOccurrenceTransform {
+                assembly_id: 1,
+                occurrence_id: 2,
+                position: [20.0, 0.0, 0.0],
+                rotation: [0.0; 3],
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn occurrence_suppression_is_inherited_and_dependency_safe() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+
+        let mut document = CadDocument::default();
+        let ids = document
+            .apply_transaction([
+                ModelCommand::CreateBox {
+                    name: "carriage".into(),
+                    size: [4.0; 3],
+                    position: [0.0; 3],
+                },
+                ModelCommand::CreateBox {
+                    name: "pin".into(),
+                    size: [2.0; 3],
+                    position: [6.0, 0.0, 0.0],
+                },
+                ModelCommand::CreateBox {
+                    name: "tool".into(),
+                    size: [2.0; 3],
+                    position: [8.0, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "fixture".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "fixture".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "carriage".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 3,
+                        name: "pin".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "fixture".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "carriage:1".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![ids[0]],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "pin:1".into(),
+                        definition_id: 3,
+                        parent_id: Some(2),
+                        suppressed: false,
+                        transform: AssemblyTransform {
+                            translation: [6.0, 0.0, 0.0],
+                            ..AssemblyTransform::IDENTITY
+                        },
+                        feature_ids: vec![ids[1]],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        let dependent = document
+            .apply(ModelCommand::CreateBoolean {
+                name: "dependent".into(),
+                operation: BooleanOperation::Union,
+                left: ids[1],
+                right: ids[2],
+            })
+            .unwrap()
+            .unwrap();
+
+        let committed = document.clone();
+        assert_eq!(
+            document.apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 2,
+                suppressed: true,
+            }),
+            Err(DocumentError::SuppressedFeatureDependency {
+                feature: dependent,
+                dependency: ids[1],
+            })
+        );
+        assert_eq!(document, committed);
+
+        document
+            .apply(ModelCommand::Delete { id: dependent })
+            .unwrap();
+        let visibility = document
+            .features
+            .iter()
+            .map(|feature| (feature.id, feature.visible))
+            .collect::<Vec<_>>();
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 2,
+                suppressed: true,
+            })
+            .unwrap();
+        let assembly = document.assembly(1).unwrap();
+        assert!(assembly.occurrence(2).unwrap().suppressed);
+        assert!(!assembly.occurrence(3).unwrap().suppressed);
+        assert_eq!(
+            assembly.effective_suppression().unwrap(),
+            [(1, false), (2, true), (3, true)].into_iter().collect()
+        );
+        assert_eq!(
+            document.suppressed_assembly_feature_ids().unwrap(),
+            [ids[0], ids[1]].into_iter().collect()
+        );
+
+        let suppressed_document = document.clone();
+        let next_id = document.next_feature_id();
+        assert_eq!(
+            document.apply(ModelCommand::CreateBoolean {
+                name: "invalid active dependent".into(),
+                operation: BooleanOperation::Union,
+                left: ids[0],
+                right: ids[2],
+            }),
+            Err(DocumentError::SuppressedFeatureDependency {
+                feature: next_id,
+                dependency: ids[0],
+            })
+        );
+        assert_eq!(document, suppressed_document);
+
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 3,
+                suppressed: true,
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 2,
+                suppressed: false,
+            })
+            .unwrap();
+        assert_eq!(
+            document.suppressed_assembly_feature_ids().unwrap(),
+            [ids[1]].into_iter().collect()
+        );
+        assert!(
+            document
+                .assembly(1)
+                .unwrap()
+                .occurrence(3)
+                .unwrap()
+                .suppressed
+        );
+        document
+            .apply(ModelCommand::SetOccurrenceSuppressed {
+                assembly_id: 1,
+                occurrence_id: 3,
+                suppressed: false,
+            })
+            .unwrap();
+        assert!(
+            document
+                .suppressed_assembly_feature_ids()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            document
+                .features
+                .iter()
+                .map(|feature| (feature.id, feature.visible))
+                .collect::<Vec<_>>(),
+            visibility
+        );
+    }
+
+    #[test]
+    fn invalid_assembly_hierarchy_is_rejected_atomically() {
+        use crate::assembly::{
+            AssemblyTransform, ComponentDefinition, ComponentKind, ComponentOccurrence,
+        };
+
+        let mut document = CadDocument::default();
+        let body = document
+            .apply(ModelCommand::CreateBox {
+                name: "body".into(),
+                size: [2.0; 3],
+                position: [0.0; 3],
+            })
+            .unwrap()
+            .unwrap();
+        let result = document.apply(ModelCommand::CreateAssembly {
+            name: "cycle".into(),
+            definitions: vec![ComponentDefinition {
+                id: 1,
+                name: "cycle".into(),
+                kind: ComponentKind::Assembly,
+                source: None,
+            }],
+            occurrences: vec![
+                ComponentOccurrence {
+                    id: 1,
+                    name: "one".into(),
+                    definition_id: 1,
+                    parent_id: Some(2),
+                    suppressed: false,
+                    transform: AssemblyTransform::IDENTITY,
+                    feature_ids: vec![body],
+                    source: None,
+                },
+                ComponentOccurrence {
+                    id: 2,
+                    name: "two".into(),
+                    definition_id: 1,
+                    parent_id: Some(1),
+                    suppressed: false,
+                    transform: AssemblyTransform::IDENTITY,
+                    feature_ids: Vec::new(),
+                    source: None,
+                },
+            ],
+        });
+        assert!(matches!(
+            result,
+            Err(DocumentError::Assembly(
+                AssemblyError::MissingRootOccurrence
+            ))
+        ));
+        assert!(document.assemblies.is_empty());
+
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "valid".into(),
+                definitions: vec![ComponentDefinition {
+                    id: 1,
+                    name: "body".into(),
+                    kind: ComponentKind::Part,
+                    source: None,
+                }],
+                occurrences: vec![ComponentOccurrence {
+                    id: 1,
+                    name: "body".into(),
+                    definition_id: 1,
+                    parent_id: None,
+                    suppressed: false,
+                    transform: AssemblyTransform::IDENTITY,
+                    feature_ids: vec![body],
+                    source: None,
+                }],
+            })
+            .unwrap();
+        assert!(document.assembly(1).is_some());
     }
 }

@@ -338,6 +338,7 @@ name = "cadx-app"
 version = "0.1.0"
 dependencies = [
  "cadx-core",
+ "cadx-io",
  "cadx-kernel-truck",
  "thiserror 2.0.19",
 ]

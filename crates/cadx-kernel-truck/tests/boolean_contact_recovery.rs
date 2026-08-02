@@ -238,13 +238,21 @@ fn assert_imported_freeform_gap(elevate_cross_degree: bool) {
             ModelCommand::ImportStep {
                 name: "lower freeform".into(),
                 source: source.clone(),
+                data_section: 0,
                 shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [0.0; 3],
             },
             ModelCommand::ImportStep {
                 name: "upper freeform".into(),
                 source,
+                data_section: 0,
                 shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [0.0, 0.0, 10.01],
             },
         ])
@@ -431,13 +439,21 @@ fn imported_boolean(source: &str, shell_id: u64, operation: BooleanOperation) ->
             ModelCommand::ImportStep {
                 name: "left imported".into(),
                 source: source.into(),
+                data_section: 0,
                 shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [0.0; 3],
             },
             ModelCommand::ImportStep {
                 name: "right imported".into(),
                 source: source.into(),
+                data_section: 0,
                 shell_id,
+                void_shells: Vec::new(),
+                length_unit: cadx_core::domain::StepLengthUnit::millimeter(),
+                color: None,
                 position: [0.0; 3],
             },
         ])

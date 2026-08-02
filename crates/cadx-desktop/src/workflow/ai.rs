@@ -23,13 +23,18 @@ impl CadxApp {
             .active
             .then(|| self.measurement.result(self.session.scene()))
             .and_then(Result::ok);
+        let capabilities = self.session.kernel_capabilities();
+        let interference_analysis = capabilities
+            .interference_analysis
+            .then(|| self.session.analyze_interference())
+            .and_then(Result::ok);
         let request = AiRequest {
             prompt,
             document: self.session.document().clone(),
             context: analyze_scene(self.session.scene(), None)
                 .ok()
                 .map(|scene_analysis| AiContext {
-                    kernel_capabilities: self.session.kernel_capabilities(),
+                    kernel_capabilities: capabilities,
                     selected_feature_id: self.selected,
                     selected_face: self.selected_face.clone(),
                     selected_edges: self.selected_edges.clone(),
@@ -63,6 +68,7 @@ impl CadxApp {
                         })
                         .collect(),
                     scene_analysis,
+                    interference_analysis,
                 }),
         };
         let assistant = Arc::clone(&self.assistant);

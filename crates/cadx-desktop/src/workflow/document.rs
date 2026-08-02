@@ -1,4 +1,4 @@
-use cadx_app::DocumentState;
+use cadx_app::{DocumentState, plan_step_import};
 use cadx_core::domain::CadDocument;
 use cadx_io::{
     DOCUMENT_EXTENSION, load_document, read_step, save_document, write_3mf, write_binary_stl,
@@ -24,6 +24,7 @@ impl CadxApp {
         self.loft_dialog = None;
         self.boolean_dialog = None;
         self.edge_modifier_dialog = None;
+        self.interference_dialog = None;
         self.last_boolean_failure = None;
         self.last_edge_modifier_failure = None;
         self.last_sketch_failure = None;
@@ -60,6 +61,7 @@ impl CadxApp {
                 self.loft_dialog = None;
                 self.boolean_dialog = None;
                 self.edge_modifier_dialog = None;
+                self.interference_dialog = None;
                 self.last_boolean_failure = None;
                 self.last_edge_modifier_failure = None;
                 self.last_sketch_failure = None;
@@ -114,27 +116,18 @@ impl CadxApp {
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("Imported STEP");
-            let source = import.source;
-            let commands = import
-                .shell_ids
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(index, shell_id)| cadx_core::domain::ModelCommand::ImportStep {
-                        name: format!("{stem} body {}", index + 1),
-                        source: source.clone(),
-                        shell_id,
-                        position: [0.0; 3],
-                    },
-                )
-                .collect::<Vec<_>>();
-            if commands.is_empty() {
-                return Err(cadx_io::ExportError::InvalidStep(
-                    "STEP document contains no importable shells".into(),
-                ));
+            let plan = plan_step_import(self.session.document(), import, stem)
+                .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))?;
+            self.execute(plan.commands, StatusMessage::Key("status.imported_step"))
+                .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))?;
+            if plan.unsupported_color_count > 0 {
+                let count = plan.unsupported_color_count.to_string();
+                self.status = StatusMessage::Text(
+                    self.translator
+                        .format("status.imported_step_color_warning", &[("count", &count)]),
+                );
             }
-            self.execute(commands, StatusMessage::Key("status.imported_step"))
-                .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))
+            Ok(())
         });
         if let Err(error) = result {
             self.status = StatusMessage::Text(error.to_string());

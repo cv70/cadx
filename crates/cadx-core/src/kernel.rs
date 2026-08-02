@@ -1,3 +1,4 @@
+use crate::assembly::{AssemblyDefinitionBody, AssemblyTransform};
 use crate::diagnostics::{BooleanDiagnostic, EdgeModifierDiagnostic, EdgeModifierOperation};
 use crate::domain::{CadDocument, DocumentError, FeatureId, Material};
 use crate::topology::{
@@ -78,6 +79,9 @@ pub struct EdgeModifierCapability {
 pub struct CadKernelCapabilities {
     pub chamfer: EdgeModifierCapability,
     pub fillet: EdgeModifierCapability,
+    /// Exact B-Rep intersection analysis with kernel-declared volume precision.
+    #[serde(default)]
+    pub interference_analysis: bool,
 }
 
 impl CadKernelCapabilities {
@@ -87,6 +91,102 @@ impl CadKernelCapabilities {
             EdgeModifierOperation::Chamfer => self.chamfer,
             EdgeModifierOperation::Fillet => self.fillet,
         }
+    }
+}
+
+/// Precision evidence attached to interference-volume results.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InterferenceVolumePrecision {
+    /// Volume integrated from a tessellation of the exact B-Rep intersection.
+    Tessellated { chord_tolerance_mm: f64 },
+}
+
+/// Method that established the exact intersection topology for one pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterferenceIntersectionMethod {
+    BrepBoolean,
+    NonCrossingContact,
+    BoundaryClassifiedContainment,
+}
+
+/// Stable phase at which one candidate-pair analysis failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterferenceFailureStage {
+    KernelOperation,
+    ResultValidation,
+    VolumeIntegration,
+}
+
+/// Stable reason code for one candidate-pair analysis failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterferenceFailureReason {
+    KernelRejected,
+    KernelPanic,
+    InvalidResultTopology,
+    EmptyMesh,
+    NonFiniteVolume,
+}
+
+/// Exact-intersection result for one pair that survived broad-phase culling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InterferencePairOutcome {
+    Clear {
+        volume_mm3: f64,
+        precision: InterferenceVolumePrecision,
+        method: InterferenceIntersectionMethod,
+    },
+    Interfering {
+        volume_mm3: f64,
+        precision: InterferenceVolumePrecision,
+        method: InterferenceIntersectionMethod,
+    },
+    Failed {
+        stage: InterferenceFailureStage,
+        reason: InterferenceFailureReason,
+        detail: String,
+    },
+}
+
+/// Evidence for one deterministic broad-phase candidate pair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterferencePairAnalysis {
+    pub feature_ids: [FeatureId; 2],
+    pub bounds: [crate::diagnostics::AxisAlignedBounds; 2],
+    pub outcome: InterferencePairOutcome,
+}
+
+/// Read-only product-level interference report for one document revision.
+///
+/// `pairs` contains only AABB-overlapping candidates. `clear_pair_count` also
+/// includes pairs proven clear by disjoint bounds, keeping report memory
+/// proportional to broad-phase hits instead of every possible pair.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InterferenceAnalysis {
+    pub candidate_feature_ids: Vec<FeatureId>,
+    pub total_pair_count: u64,
+    pub broad_phase_pair_count: u64,
+    pub clear_pair_count: u64,
+    pub interfering_pair_count: u64,
+    pub failed_pair_count: u64,
+    /// Volumes at or below this modeling-scale threshold are classified clear.
+    pub volume_tolerance_mm3: f64,
+    pub pairs: Vec<InterferencePairAnalysis>,
+}
+
+impl InterferenceAnalysis {
+    #[must_use]
+    pub const fn has_interference(&self) -> bool {
+        self.interfering_pair_count > 0
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.failed_pair_count == 0
     }
 }
 
@@ -114,6 +214,21 @@ pub struct EvaluatedPart {
     pub faces: Vec<EvaluatedFace>,
     pub edges: Vec<EvaluatedEdge>,
     pub vertices: Vec<EvaluatedVertex>,
+}
+
+/// One component-local triangle mesh reusable by multiple render instances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedMeshDefinition {
+    pub key: AssemblyDefinitionBody,
+    pub mesh: TriangleMesh,
+}
+
+/// One placed use of an evaluated reusable render mesh.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvaluatedMeshInstance {
+    pub feature_id: FeatureId,
+    pub definition: AssemblyDefinitionBody,
+    pub transform: AssemblyTransform,
 }
 
 /// A resolved, non-solid datum plane ready for visualization and downstream use.
@@ -230,6 +345,10 @@ fn resolve_unique<'a, T>(mut candidates: impl Iterator<Item = &'a T>) -> Topolog
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EvaluatedScene {
     pub parts: Vec<EvaluatedPart>,
+    /// Optional renderer optimization; engineering consumers use `parts`.
+    pub mesh_definitions: Vec<EvaluatedMeshDefinition>,
+    /// Visible placed uses of `mesh_definitions`.
+    pub mesh_instances: Vec<EvaluatedMeshInstance>,
     pub sketches: Vec<EvaluatedSketch>,
     pub sketch_diagnostics: Vec<EvaluatedSketchDiagnostic>,
     pub datum_planes: Vec<EvaluatedDatumPlane>,
@@ -237,6 +356,20 @@ pub struct EvaluatedScene {
 }
 
 impl EvaluatedScene {
+    #[must_use]
+    pub fn mesh_definition(&self, key: AssemblyDefinitionBody) -> Option<&EvaluatedMeshDefinition> {
+        self.mesh_definitions
+            .iter()
+            .find(|definition| definition.key == key)
+    }
+
+    #[must_use]
+    pub fn mesh_instance(&self, feature_id: FeatureId) -> Option<&EvaluatedMeshInstance> {
+        self.mesh_instances
+            .iter()
+            .find(|instance| instance.feature_id == feature_id)
+    }
+
     #[must_use]
     pub fn sketch_diagnostic(&self, feature_id: FeatureId) -> Option<&SketchSolveDiagnostic> {
         self.sketch_diagnostics
@@ -329,6 +462,23 @@ pub trait CadKernel: Send + Sync {
     /// Returns [`KernelError`] when the backend cannot construct or tessellate
     /// one of the document features.
     fn evaluate(&self, document: &CadDocument) -> Result<EvaluatedScene, KernelError>;
+
+    /// Performs product-level interference analysis without exposing native
+    /// B-Rep objects. Implementations must opt in through `capabilities()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when the capability is unsupported or the
+    /// document cannot be materialized. Individual pair failures are retained
+    /// as structured report evidence instead of aborting the full analysis.
+    fn analyze_interference(
+        &self,
+        _document: &CadDocument,
+    ) -> Result<InterferenceAnalysis, KernelError> {
+        Err(KernelError::Unsupported {
+            operation: "interference analysis",
+        })
+    }
 }
 
 /// Optional CAD-kernel capability for exact B-Rep exchange.
@@ -370,6 +520,7 @@ mod tests {
         let default = CadKernelCapabilities::default();
         assert_eq!(default.chamfer.edge_count, EdgeCountSupport::Unsupported);
         assert_eq!(default.fillet.edge_count, EdgeCountSupport::Unsupported);
+        assert!(!default.interference_analysis);
 
         let capabilities = CadKernelCapabilities {
             chamfer: EdgeModifierCapability {
@@ -390,6 +541,49 @@ mod tests {
                 .shared_vertex_support,
             SharedVertexSupport::ConvexPolyhedralSource
         );
+        assert_eq!(value["interference_analysis"], false);
+    }
+
+    #[test]
+    fn interference_report_serializes_typed_precision_and_pair_outcomes() {
+        let report = InterferenceAnalysis {
+            candidate_feature_ids: vec![2, 7],
+            total_pair_count: 1,
+            broad_phase_pair_count: 1,
+            interfering_pair_count: 1,
+            volume_tolerance_mm3: 0.001,
+            pairs: vec![InterferencePairAnalysis {
+                feature_ids: [2, 7],
+                bounds: [
+                    crate::diagnostics::AxisAlignedBounds {
+                        min: [0.0; 3],
+                        max: [10.0; 3],
+                    },
+                    crate::diagnostics::AxisAlignedBounds {
+                        min: [5.0; 3],
+                        max: [15.0; 3],
+                    },
+                ],
+                outcome: InterferencePairOutcome::Interfering {
+                    volume_mm3: 125.0,
+                    precision: InterferenceVolumePrecision::Tessellated {
+                        chord_tolerance_mm: 0.05,
+                    },
+                    method: InterferenceIntersectionMethod::BrepBoolean,
+                },
+            }],
+            ..InterferenceAnalysis::default()
+        };
+        assert!(report.has_interference());
+        assert!(report.is_complete());
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["pairs"][0]["outcome"]["status"], "interfering");
+        assert_eq!(
+            value["pairs"][0]["outcome"]["precision"]["kind"],
+            "tessellated"
+        );
+        assert_eq!(value["pairs"][0]["outcome"]["method"], "brep_boolean");
     }
 }
 
@@ -418,6 +612,10 @@ pub enum KernelError {
         format: &'static str,
         message: String,
     },
+    #[error("CAD analysis failed: {message}")]
+    Analysis { message: String },
+    #[error("CAD kernel does not support {operation}")]
+    Unsupported { operation: &'static str },
 }
 
 impl From<BooleanDiagnostic> for KernelError {

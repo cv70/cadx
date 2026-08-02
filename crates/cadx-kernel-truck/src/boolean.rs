@@ -18,6 +18,26 @@ use crate::{
 
 mod contact;
 
+pub(crate) enum NonCrossingIntersection {
+    Solid(Solid),
+    Empty,
+}
+
+pub(crate) fn resolve_non_crossing_intersection(
+    left: &Solid,
+    right: &Solid,
+    tolerance: f64,
+) -> Option<Result<NonCrossingIntersection, String>> {
+    contact::resolve(left, right, BooleanOperation::Intersect, tolerance).map(|result| {
+        result.map(|resolution| match resolution {
+            contact::ContactResolution::Solid { solid, .. } => {
+                NonCrossingIntersection::Solid(solid)
+            }
+            contact::ContactResolution::Empty => NonCrossingIntersection::Empty,
+        })
+    })
+}
+
 #[derive(Debug)]
 struct AttemptFailure {
     stage: BooleanFailureStage,

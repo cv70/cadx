@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cadx-core.workspace = true
+cadx-io.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -6,7 +6,9 @@
 //! and kernel evaluation succeed.
 
 mod error;
+mod import;
 mod session;
 
 pub use error::SessionError;
+pub use import::{StepImportPlan, StepImportPlanError, plan_step_import};
 pub use session::{DEFAULT_HISTORY_LIMIT, DocumentSession, DocumentState, TransactionOutcome};

@@ -1,3 +1,4 @@
+pub mod assembly;
 pub mod diagnostics;
 pub mod domain;
 pub mod kernel;

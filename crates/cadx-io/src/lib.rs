@@ -14,6 +14,9 @@ mod threemf;
 
 pub use document::{DOCUMENT_EXTENSION, DocumentFileError, load_document, save_document};
 pub use error::ExportError;
-pub use step::{StepImport, read_step, validate_step, write_step};
+pub use step::{
+    StepBodyColor, StepImport, StepImportAssembly, StepImportBody, StepImportOccurrence,
+    parse_step, read_step, validate_step, write_step,
+};
 pub use stl::{encode_binary_stl, write_binary_stl};
 pub use threemf::{encode_3mf, validate_3mf, write_3mf};

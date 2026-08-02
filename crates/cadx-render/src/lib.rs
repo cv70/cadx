@@ -9,12 +9,18 @@ use glam::{DVec3, Vec3, Vec4, camera};
 use wgpu::util::DeviceExt;
 
 use cadx_core::{
+    assembly::AssemblyTransform,
     domain::FeatureId,
     kernel::{EvaluatedScene, EvaluatedSketch},
     topology::{EdgeRef, FaceRef, VertexRef},
 };
 
+mod instancing;
 mod sketch_annotations;
+
+use instancing::{
+    GpuInstance, GpuMeshVertex, SolidBuffers, SolidDraw, part_display_color, triangle_subset,
+};
 
 pub use sketch_annotations::{
     ScreenSketchAnnotation, layout_sketch_annotations, paint_sketch_annotations,
@@ -53,8 +59,7 @@ struct CameraUniform {
 #[derive(Debug, Default)]
 struct SceneBuffers {
     revision: u64,
-    solid_vertices: Vec<GpuVertex>,
-    solid_indices: Vec<u32>,
+    solid: SolidBuffers,
     grid_vertices: Vec<GpuVertex>,
     topology_vertices: Vec<GpuVertex>,
 }
@@ -117,80 +122,78 @@ impl ViewportScene {
         let Ok(mut buffers) = self.buffers.write() else {
             return;
         };
-        buffers.solid_vertices.clear();
-        buffers.solid_indices.clear();
+        buffers.solid.clear();
         buffers.topology_vertices.clear();
 
-        for part in &scene.parts {
-            let Ok(base_index) = u32::try_from(buffers.solid_vertices.len()) else {
-                buffers.solid_vertices.clear();
-                buffers.solid_indices.clear();
+        let mut instanced_features = HashSet::new();
+        for definition in &scene.mesh_definitions {
+            let instances = scene
+                .mesh_instances
+                .iter()
+                .filter(|instance| instance.definition == definition.key)
+                .filter_map(|instance| {
+                    let part = scene
+                        .parts
+                        .iter()
+                        .find(|part| part.feature_id == instance.feature_id)?;
+                    instanced_features.insert(instance.feature_id);
+                    Some(GpuInstance::new(
+                        instance.transform,
+                        part_display_color(part, selected),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if !instances.is_empty() && !buffers.solid.append(&definition.mesh, &instances) {
+                buffers.solid.clear();
                 return;
-            };
-            let highlighted_vertices = topology
+            }
+        }
+
+        for part in &scene.parts {
+            if !instanced_features.contains(&part.feature_id)
+                && !buffers.solid.append(
+                    &part.mesh,
+                    &[GpuInstance::new(
+                        AssemblyTransform::IDENTITY,
+                        part_display_color(part, selected),
+                    )],
+                )
+            {
+                buffers.solid.clear();
+                return;
+            }
+
+            let highlighted_triangles = topology
                 .face
                 .filter(|face| face.feature_id == part.feature_id)
                 .and_then(|reference| part.faces.iter().find(|face| &face.reference == reference))
-                .map_or_else(HashSet::new, |face| {
-                    let mut vertices = HashSet::new();
-                    let start = face.triangles.start as usize * 3;
-                    let end = face.triangles.end as usize * 3;
-                    for index in part.mesh.indices.get(start..end).unwrap_or_default() {
-                        vertices.insert(*index);
-                    }
-                    vertices
-                });
-            let mut measurement_vertices = HashSet::new();
+                .map_or_else(HashSet::new, |face| face.triangles.clone().collect());
+            let mut measurement_triangles = HashSet::new();
             for reference in topology
                 .measurement_faces
                 .iter()
                 .filter(|reference| reference.feature_id == part.feature_id)
             {
                 if let Some(face) = part.face(reference) {
-                    let start = face.triangles.start as usize * 3;
-                    let end = face.triangles.end as usize * 3;
-                    for index in part.mesh.indices.get(start..end).unwrap_or_default() {
-                        measurement_vertices.insert(*index);
-                    }
+                    measurement_triangles.extend(face.triangles.clone());
                 }
             }
-            let mut color = part.color;
-            if selected == Some(part.feature_id) {
-                color = [
-                    (color[0] * 1.25).min(1.0),
-                    (color[1] * 1.25).min(1.0),
-                    (color[2] * 1.25).min(1.0),
-                    1.0,
-                ];
+            measurement_triangles.retain(|triangle| !highlighted_triangles.contains(triangle));
+            for (triangles, color) in [
+                (&measurement_triangles, [0.18, 0.82, 0.92, 1.0]),
+                (&highlighted_triangles, [1.0, 0.76, 0.18, 1.0]),
+            ] {
+                if !triangles.is_empty()
+                    && let Some(mesh) = triangle_subset(&part.mesh, triangles)
+                    && !buffers.solid.append(
+                        &mesh,
+                        &[GpuInstance::new(AssemblyTransform::IDENTITY, color)],
+                    )
+                {
+                    buffers.solid.clear();
+                    return;
+                }
             }
-            buffers.solid_vertices.extend(
-                part.mesh
-                    .positions
-                    .iter()
-                    .zip(&part.mesh.normals)
-                    .enumerate()
-                    .map(|(index, (&position, &normal))| {
-                        let highlighted = u32::try_from(index)
-                            .is_ok_and(|index| highlighted_vertices.contains(&index));
-                        let measured = u32::try_from(index)
-                            .is_ok_and(|index| measurement_vertices.contains(&index));
-                        let vertex_color = if highlighted {
-                            [1.0, 0.76, 0.18, 1.0]
-                        } else if measured {
-                            [0.18, 0.82, 0.92, 1.0]
-                        } else {
-                            color
-                        };
-                        GpuVertex {
-                            position,
-                            normal,
-                            color: vertex_color,
-                        }
-                    }),
-            );
-            buffers
-                .solid_indices
-                .extend(part.mesh.indices.iter().map(|index| base_index + index));
 
             for reference in topology
                 .measurement_edges
@@ -1006,9 +1009,10 @@ struct ViewportRenderer {
     camera_bind_group: wgpu::BindGroup,
     solid_vertex_buffer: wgpu::Buffer,
     solid_index_buffer: wgpu::Buffer,
+    solid_instance_buffer: wgpu::Buffer,
     grid_vertex_buffer: wgpu::Buffer,
     topology_vertex_buffer: wgpu::Buffer,
-    solid_index_count: u32,
+    solid_draws: Vec<SolidDraw>,
     grid_vertex_count: u32,
     topology_vertex_count: u32,
     uploaded_revision: Option<u64>,
@@ -1056,23 +1060,33 @@ impl ViewportRenderer {
             &pipeline_layout,
             &shader,
             target_format,
-            wgpu::PrimitiveTopology::TriangleList,
-            "fs_solid",
-            true,
+            PipelineSpec {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                vertex_entry: "vs_solid",
+                fragment_entry: "fs_solid",
+                vertex_buffers: &[GpuMeshVertex::layout(), GpuInstance::layout()],
+                depth_write: true,
+            },
         );
         let grid_pipeline = create_pipeline(
             device,
             &pipeline_layout,
             &shader,
             target_format,
-            wgpu::PrimitiveTopology::LineList,
-            "fs_grid",
-            false,
+            PipelineSpec {
+                topology: wgpu::PrimitiveTopology::LineList,
+                vertex_entry: "vs_colored",
+                fragment_entry: "fs_grid",
+                vertex_buffers: &[GpuVertex::layout()],
+                depth_write: false,
+            },
         );
         let solid_vertex_buffer =
             empty_buffer(device, "cadx solid vertices", wgpu::BufferUsages::VERTEX);
         let solid_index_buffer =
             empty_buffer(device, "cadx solid indices", wgpu::BufferUsages::INDEX);
+        let solid_instance_buffer =
+            empty_buffer(device, "cadx solid instances", wgpu::BufferUsages::VERTEX);
         let grid_vertex_buffer =
             empty_buffer(device, "cadx grid vertices", wgpu::BufferUsages::VERTEX);
         let topology_vertex_buffer =
@@ -1085,9 +1099,10 @@ impl ViewportRenderer {
             camera_bind_group,
             solid_vertex_buffer,
             solid_index_buffer,
+            solid_instance_buffer,
             grid_vertex_buffer,
             topology_vertex_buffer,
-            solid_index_count: 0,
+            solid_draws: Vec::new(),
             grid_vertex_count: 0,
             topology_vertex_count: 0,
             uploaded_revision: None,
@@ -1115,14 +1130,20 @@ impl ViewportRenderer {
         self.solid_vertex_buffer = buffer_with_data(
             device,
             "cadx solid vertices",
-            bytemuck::cast_slice(&buffers.solid_vertices),
+            bytemuck::cast_slice(&buffers.solid.vertices),
             wgpu::BufferUsages::VERTEX,
         );
         self.solid_index_buffer = buffer_with_data(
             device,
             "cadx solid indices",
-            bytemuck::cast_slice(&buffers.solid_indices),
+            bytemuck::cast_slice(&buffers.solid.indices),
             wgpu::BufferUsages::INDEX,
+        );
+        self.solid_instance_buffer = buffer_with_data(
+            device,
+            "cadx solid instances",
+            bytemuck::cast_slice(&buffers.solid.instances),
+            wgpu::BufferUsages::VERTEX,
         );
         self.grid_vertex_buffer = buffer_with_data(
             device,
@@ -1136,7 +1157,7 @@ impl ViewportRenderer {
             bytemuck::cast_slice(&buffers.topology_vertices),
             wgpu::BufferUsages::VERTEX,
         );
-        self.solid_index_count = u32::try_from(buffers.solid_indices.len()).unwrap_or(u32::MAX);
+        self.solid_draws.clone_from(&buffers.solid.draws);
         self.grid_vertex_count = u32::try_from(buffers.grid_vertices.len()).unwrap_or(u32::MAX);
         self.topology_vertex_count =
             u32::try_from(buffers.topology_vertices.len()).unwrap_or(u32::MAX);
@@ -1152,8 +1173,11 @@ impl ViewportRenderer {
 
         render_pass.set_pipeline(&self.solid_pipeline);
         render_pass.set_vertex_buffer(0, self.solid_vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.solid_instance_buffer.slice(..));
         render_pass.set_index_buffer(self.solid_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        render_pass.draw_indexed(0..self.solid_index_count, 0, 0..1);
+        for draw in &self.solid_draws {
+            render_pass.draw_indexed(draw.indices.clone(), 0, draw.instances.clone());
+        }
 
         render_pass.set_pipeline(&self.grid_pipeline);
         render_pass.set_vertex_buffer(0, self.topology_vertex_buffer.slice(..));
@@ -1161,27 +1185,34 @@ impl ViewportRenderer {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PipelineSpec<'a> {
+    topology: wgpu::PrimitiveTopology,
+    vertex_entry: &'a str,
+    fragment_entry: &'a str,
+    vertex_buffers: &'a [wgpu::VertexBufferLayout<'a>],
+    depth_write: bool,
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     target_format: wgpu::TextureFormat,
-    topology: wgpu::PrimitiveTopology,
-    fragment_entry: &str,
-    depth_write: bool,
+    spec: PipelineSpec<'_>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cadx viewport pipeline"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(spec.vertex_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[GpuVertex::layout()],
+            buffers: spec.vertex_buffers,
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(fragment_entry),
+            entry_point: Some(spec.fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
@@ -1190,9 +1221,9 @@ fn create_pipeline(
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology,
+            topology: spec.topology,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: if topology == wgpu::PrimitiveTopology::TriangleList {
+            cull_mode: if spec.topology == wgpu::PrimitiveTopology::TriangleList {
                 Some(wgpu::Face::Back)
             } else {
                 None
@@ -1201,7 +1232,7 @@ fn create_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth24Plus,
-            depth_write_enabled: Some(depth_write),
+            depth_write_enabled: Some(spec.depth_write),
             depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
@@ -1281,13 +1312,27 @@ fn build_grid(extent: f32, spacing: f32) -> Vec<GpuVertex> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadx_core::assembly::{AssemblyDefinitionBody, AssemblyTransform};
     use cadx_core::kernel::{
-        EvaluatedDatumPlane, EvaluatedDatumPoint, EvaluatedPart, EvaluatedSketch, TriangleMesh,
+        EvaluatedDatumPlane, EvaluatedDatumPoint, EvaluatedMeshDefinition, EvaluatedMeshInstance,
+        EvaluatedPart, EvaluatedSketch, TriangleMesh,
     };
     use cadx_core::topology::{
         CurveKind, EdgeGeometry, EdgeRef, EvaluatedEdge, EvaluatedFace, EvaluatedVertex,
         FaceGeometry, FaceRef, PrimitiveFace, SurfaceKind, VertexGeometry, VertexRef,
     };
+
+    #[test]
+    fn viewport_shader_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("../shaders/cad.wgsl"))
+            .expect("viewport shader must parse as WGSL");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("viewport shader must pass Naga validation");
+    }
 
     #[test]
     fn picking_returns_the_closest_feature_under_the_cursor() {
@@ -1382,13 +1427,135 @@ mod tests {
         );
         let buffers = viewport.buffers.read().unwrap();
         assert_eq!(buffers.topology_vertices.len(), 18);
-        assert!(buffers.solid_vertices.iter().all(|vertex| {
-            vertex
+        assert_eq!(buffers.solid.draws.len(), 2);
+        assert_eq!(buffers.solid.instances.len(), 2);
+        assert!(
+            buffers.solid.instances[1]
                 .color
                 .iter()
                 .zip([0.18, 0.82, 0.92, 1.0])
                 .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
-        }));
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn repeated_definition_mesh_uploads_once_and_draws_two_instances() {
+        let key = AssemblyDefinitionBody {
+            assembly_id: 1,
+            definition_id: 2,
+            body_slot: 0,
+        };
+        let local_mesh = TriangleMesh {
+            positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            indices: vec![0, 1, 2],
+        };
+        let second_transform =
+            AssemblyTransform::from_euler_xyz_degrees([5.0, 3.0, 1.0], [0.0, 0.0, 90.0]);
+        let second_positions = local_mesh
+            .positions
+            .iter()
+            .map(|position| {
+                second_transform
+                    .transform_point(position.map(f64::from))
+                    .map(|value| value as f32)
+            })
+            .collect();
+        let selected_face = FaceRef::primitive(11, PrimitiveFace::BoxZMax);
+        let scene = EvaluatedScene {
+            parts: vec![
+                EvaluatedPart {
+                    feature_id: 10,
+                    name: "first".into(),
+                    color: [0.8, 0.2, 0.1, 1.0],
+                    material: None,
+                    mesh: local_mesh.clone(),
+                    faces: Vec::new(),
+                    edges: Vec::new(),
+                    vertices: Vec::new(),
+                },
+                EvaluatedPart {
+                    feature_id: 11,
+                    name: "second".into(),
+                    color: [0.2, 0.4, 0.8, 1.0],
+                    material: None,
+                    mesh: TriangleMesh {
+                        positions: second_positions,
+                        ..local_mesh.clone()
+                    },
+                    faces: vec![EvaluatedFace {
+                        reference: selected_face.clone(),
+                        geometry: FaceGeometry {
+                            surface: SurfaceKind::Plane,
+                            plane: None,
+                            area: 1.0,
+                            centroid: [5.0, 3.0, 1.0],
+                            mean_normal: [0.0, 0.0, 1.0],
+                        },
+                        triangles: 0..1,
+                    }],
+                    edges: Vec::new(),
+                    vertices: Vec::new(),
+                },
+            ],
+            mesh_definitions: vec![EvaluatedMeshDefinition {
+                key,
+                mesh: local_mesh,
+            }],
+            mesh_instances: vec![
+                EvaluatedMeshInstance {
+                    feature_id: 10,
+                    definition: key,
+                    transform: AssemblyTransform::IDENTITY,
+                },
+                EvaluatedMeshInstance {
+                    feature_id: 11,
+                    definition: key,
+                    transform: second_transform,
+                },
+            ],
+            ..EvaluatedScene::default()
+        };
+
+        let viewport = ViewportScene::default();
+        viewport.update(&scene, Some(11));
+        let buffers = viewport.buffers.read().unwrap();
+        assert_eq!(buffers.solid.vertices.len(), 3);
+        assert_eq!(buffers.solid.indices, [0, 1, 2]);
+        assert_eq!(buffers.solid.instances.len(), 2);
+        assert_eq!(buffers.solid.draws.len(), 1);
+        assert_eq!(buffers.solid.draws[0].indices, 0..3);
+        assert_eq!(buffers.solid.draws[0].instances, 0..2);
+        assert!(
+            buffers.solid.instances[1].model[3]
+                .into_iter()
+                .zip([5.0, 3.0, 1.0, 1.0])
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
+        assert!(
+            buffers.solid.instances[1]
+                .color
+                .into_iter()
+                .zip([0.25, 0.5, 1.0, 1.0])
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
+        drop(buffers);
+
+        viewport.update_with_face(&scene, Some(11), Some(&selected_face));
+        let buffers = viewport.buffers.read().unwrap();
+        assert_eq!(buffers.solid.draws.len(), 2);
+        assert_eq!(buffers.solid.draws[0].instances, 0..2);
+        assert_eq!(buffers.solid.draws[1].instances, 2..3);
+        assert_eq!(buffers.solid.vertices.len(), 6);
+        assert_eq!(buffers.solid.instances.len(), 3);
+        assert!(
+            buffers.solid.instances[2]
+                .color
+                .into_iter()
+                .zip([1.0, 0.76, 0.18, 1.0])
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+        );
     }
 
     #[test]
