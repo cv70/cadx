@@ -4,18 +4,87 @@ CADX uses a layered workspace with inward-owned contracts. Domain and use-case
 code do not depend on desktop frameworks, provider SDKs, concrete kernels, or
 filesystem implementations.
 
+## Industrial AI-CAD Architecture
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                 UI Layer (egui)                                  │
+│  ┌─────────────────────────┬─────────────────────────┬────────────────────────┐  │
+│  │   wgpu Central Viewport │    Domain Inspectors    │   AI Chat & Agent UI   │  │
+│  │   (3D/2D Multi-Canvas)  │  (Schema Driven Forms)  │ (Intent Bar / Command) │  │
+│  └────────────┬────────────┴────────────┬────────────┴────────────┬───────────┘  │
+└───────────────┼─────────────────────────┼─────────────────────────┼──────────────┘
+                │ Interactivity/Gizmo     │ Form Change             │ Prompt/Cancel Token
+                ▼                         ▼                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                      Command / Transaction Pipeline (Core Bus)                   │
+│  ┌───────────────────────────┬─────────────────────────┬──────────────────────┐  │
+│  │ Transaction Manager       │ Undo/Redo Engine        │ Event Dispatcher     │  │
+│  │ (Atomic, Streamable, CoW) │ (Delta-based History)   │ (Publish-Subscribe)  │  │
+│  └───────────────────────────┴─────────────────────────┴──────────────────────┘  │
+└───────────────┬───────────────────────────────────────────────────▲──────────────┘
+                │ Stream / Apply Commands                           │ Streamed AI Cmds
+                ▼                                                   │
+┌──────────────────────────────────────────────┐  ┌─────────────────┴──────────────┐
+│       Core Engine (Data & Geometry)          │  │    AI Native Engine (Agentic)  │
+│ ┌──────────────────────────────────────────┐ │  │ ┌─────────────────────────────┐ │
+│ │ Document Core (ECS: bevy_ecs)            │ │  │ │ Dynamic Context Collector   │ │
+│ │  - Entities & Component Repositories     │ │  │ │  (Spatial, Focus, Topology) │ │
+│ │  - Dirty Mark & Change Detection         │◄┼──┼─┤  (Vector/RAG Index Engine)    │ │
+│ ├──────────────────────────────────────────┤ │  │ └──────────────┬──────────────┘ │
+│ │ Geometry Kernel (Multi-threaded Workers) │ │  │                ▼                │
+│ │  - B-Rep / Parametric Engine             │ │  │ ┌─────────────────────────────┐ │
+│ │  - Rayon Parallel Constraint Solver     │ │  │ │ AI Planner & Tool Router    │ │
+│ │  - Multi-LOD Tessellator (Async Engine)  │ │  │ │  (Tool Calling, RAG, LLM)   │ │
+│ └─────────────────────┬────────────────────┘ │  │ └──────────────┬──────────────┘ │
+│                       │ Sync Sparse Buffers  │  │                ▼                │
+│ ┌─────────────────────▼────────────────────┐ │  │ ┌─────────────────────────────┐ │
+│ │ Spatial Index (BVH / R-Tree Cache)       │ │  │ │ Ghost Sandbox (CoW Delta)   │ │
+│ └──────────────────────────────────────────┘ │  │ │  (Preview & Diff Engine)    │ │
+└───────────────────────┬──────────────────────┘  │ └──────────────┬──────────────┘ │
+                        │                         └────────────────┼────────────────┘
+                        │ Sync Render Data                         │ Ghost Geometry
+                        ▼                                          │ Render Data
+┌──────────────────────────────────────────────┐                   │
+│        wgpu Pipeline (GPU Acceleration)      │                   │
+│ ┌─────────────────────┬────────────────────┐ │                   │
+│ │ Render Pass         │ Compute Pass       │◄┼───────────────────┘
+│ │ - Instanced Mesh/Line│ - GPU Ray Picking  │ │
+│ │ - Ghost/Overlay Pass│ - GPU DRC / Clash  │ │
+│ │ - LOD Mesh Shading  │ - Spatial Sorting  │ │
+│ └─────────────────────┴────────────────────┘ │
+└───────────────────────▲──────────────────────┘
+                        │ Pack Pipeline / Shader / Tool Registration
+┌───────────────────────┴──────────────────────────────────────────────────────────┐
+│                         Domain Pack SDK (Plugin Core)                            │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Pack Trait Interface (Schema Injection, Solvers, Shaders, AI Tools)        │  │
+│  └──────────────┬─────────────────────┬──────────────────────┬────────────────┘  │
+│                 │                     │                      │                   │
+│  ┌──────────────┴──────────┐ ┌────────┴─────────────┐ ┌──────┴─────────────────┐  │
+│  │        MCAD Pack        │ │      AEC Pack        │ │      ECAD Pack        │  │
+│  │ - Feature Tree          │ │ - BIM Attributes     │ │ - Netlist & Layers    │  │
+│  │ - Extrude/Fillet Tools  │ │ - Wall/Slab Solvers  │ │ - Router & DRC Tools  │  │
+│  │ - Assembly Constraints  │ │ - IFC Standard Data  │ │ - Footprint Library   │  │
+│  └─────────────────────────┘ └──────────────────────┘ └───────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Crate Map
 
 | Layer | Crate | Responsibility |
 | --- | --- | --- |
 | Geometry foundation | `cadx-sketch` | Exact kernel-neutral Line/Arc/rational-quadratic/cubic regions, curve validation, and capability-routed deterministic projection or bounded nonlinear constraints |
 | Domain and ports | `cadx-core` | Parametric document, explicit assembly definitions and occurrences, commands, invariants, persistent topology references, kernel-neutral meshes, kernel ports, pure document codec |
+| Domain Pack SPI | `cadx-domain-api` | Geometry-neutral `DomainPack` trait, runtime registry, typed schema validation, executable tool requests, solver/shader/AI descriptors, actions, diagnostics, artifacts, NL routes, and export contracts |
+| MCAD pack | `cadx-mcad-*` | Feature dependency regeneration, assembly constraint proposals, sketch/extrude/chamfer/fillet tools, GB/T/ISO/ASME standards, DFM, grouped BOM, and standard parts |
+| AEC pack | `cadx-aec-*` | Validated BIM models, parametric wall/slab actions, levels, schedules, quantities, spatial clash analysis, and deterministic IFC4/IFC4X3 exchange |
+| ECAD pack | `cadx-ecad-*` | Validated schematic netlists, copper/dielectric stackups, footprints, placement, orthogonal routing, pad/via/trace DRC, and Gerber/drill export |
 | Analysis | `cadx-analysis` | Read-only geometric, measurement, and physical analysis over evaluated scenes: topology relationships, bounds, area, volume, mass, center of mass, and inertia |
-| Application | `cadx-app` | Kernel-validated transactions, STEP import planning, document session, revisions, undo/redo, clean-state tracking |
+| Application | `cadx-app` | `CoreBus` source tagging, streamable command buffering, event dispatch, kernel-validated transactions, STEP import planning, document session, revisions, undo/redo, clean-state tracking |
 | Configuration | `cadx-config` | Typed YAML models and the injectable `~/.cadx` store |
 | Infrastructure | `cadx-kernel-truck` | Truck B-Rep evaluation, STEP reconstruction, booleans, product interference, tessellation, exact STEP encoding |
 | Infrastructure | `cadx-io` | Atomic `.cadx` IO and validated STEP import/export, STL, and 3MF adapters |
-| Infrastructure | `cadx-ai` | Provider-neutral AI contract and explicit rust-genai adapter configuration |
+| Infrastructure | `cadx-ai` | Provider-neutral AI contract, context collector, domain tool registry, intent diff, and explicit rust-genai adapter configuration |
 | Presentation | `cadx-render` | Kernel-neutral egui/wgpu viewport rendering and picking |
 | Presentation | `cadx-i18n` | Translation resources and runtime language selection |
 | Composition root | `cadx-desktop` | egui interaction, dialogs, asynchronous task wiring, and adapter construction |
@@ -36,6 +105,9 @@ cadx-core
 
 cadx-config <--- cadx-ai
 
+cadx-domain-api <--- cadx-mcad-* + cadx-aec-* + cadx-ecad-*
+cadx-domain-api <--- cadx-desktop
+
 cadx-analysis <--- cadx-ai
 
 cadx-desktop ---> cadx-app + all required adapters
@@ -46,11 +118,14 @@ conformance tests. Production adapters do not depend on one another.
 
 ## State Changes
 
-1. Presentation creates declarative `ModelCommand` values.
-2. `DocumentSession` applies the complete batch to a cloned document.
-3. The configured `CadKernel` evaluates the staged document.
-4. Only a successful evaluation replaces active state and creates one revision.
-5. The viewport consumes the committed `EvaluatedScene`.
+1. Presentation, AI, import, or a domain pack creates declarative
+   `ModelCommand` values.
+2. `CoreBus` tags the source, buffers streamable command batches when needed,
+   and publishes transaction, undo/redo, document, and stream events.
+3. `DocumentSession` applies the complete batch to a cloned document.
+4. The configured `CadKernel` evaluates the staged document.
+5. Only a successful evaluation replaces active state and creates one revision.
+6. The viewport consumes the committed `EvaluatedScene`.
 
 Each evaluated solid also exposes kernel-neutral face, edge, and vertex
 indexes. Persistent references are generated from feature semantics, topology

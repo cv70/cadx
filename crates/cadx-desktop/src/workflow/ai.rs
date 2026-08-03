@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use cadx_ai::{AiContext, AiRequest, AiSketchDimension};
 use cadx_analysis::analyze_scene;
+use cadx_app::TransactionSource;
 use eframe::egui;
 
 use crate::{CadxApp, ConversationEntry, LocalizedText, Speaker, StatusMessage};
@@ -13,6 +14,29 @@ impl CadxApp {
             return;
         }
         self.ai_input.clear();
+        if let Some(route) = self.route_domain_prompt(&prompt) {
+            let intent_prompt = prompt.clone();
+            self.conversation.push(ConversationEntry {
+                speaker: Speaker::User,
+                content: LocalizedText::Text(prompt),
+            });
+            let mut intent = cadx_ai::intent::IntentDiff::pending(
+                self.active_domain,
+                intent_prompt,
+                route.action.clone(),
+            );
+            intent.summary.clone_from(&route.rationale);
+            self.last_intent_diff = Some(intent);
+            self.conversation.push(ConversationEntry {
+                speaker: Speaker::Assistant,
+                content: LocalizedText::Text(format!(
+                    "{}\n{}",
+                    route.rationale,
+                    self.translator.text("ai.plan_ready")
+                )),
+            });
+            return;
+        }
         self.ai_pending = true;
         self.conversation.push(ConversationEntry {
             speaker: Speaker::User,
@@ -122,7 +146,11 @@ impl CadxApp {
         };
         let count = plan.commands.len().to_string();
         let summary = plan.summary;
-        if let Err(error) = self.execute(plan.commands, StatusMessage::Text(summary.clone())) {
+        if let Err(error) = self.execute_from(
+            plan.commands,
+            StatusMessage::Text(summary.clone()),
+            TransactionSource::Ai,
+        ) {
             self.conversation.push(ConversationEntry {
                 speaker: Speaker::Error,
                 content: LocalizedText::Text(error.to_string()),

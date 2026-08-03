@@ -119,8 +119,10 @@ fn load_cjk_font(configured: Option<&std::path::Path>) -> Option<Vec<u8>> {
 
 #[must_use]
 pub fn icon(name: &str, size: f32) -> RichText {
-    let icon = try_icon(Pack::Lucide, name, Style::Regular, Size::Regular)
-        .expect("referenced Lucide icon must exist");
+    let icon = try_icon(Pack::Lucide, name, Style::Regular, Size::Regular).unwrap_or_else(|_| {
+        try_icon(Pack::Lucide, "circle", Style::Regular, Size::Regular)
+            .expect("fallback Lucide icon must exist")
+    });
     let glyph = char::from_u32(icon.codepoint).unwrap_or('?');
     RichText::new(glyph.to_string()).font(FontId::new(size, FontFamily::Name(icon.family.into())))
 }
@@ -139,6 +141,7 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadx_domain_api::DomainPack;
 
     #[test]
     fn referenced_lucide_icons_exist() {
@@ -185,6 +188,26 @@ mod tests {
                 try_icon(Pack::Lucide, name, Style::Regular, Size::Regular).is_ok(),
                 "missing Lucide icon: {name}"
             );
+        }
+    }
+
+    #[test]
+    fn built_in_domain_pack_icons_exist() {
+        let mcad = cadx_mcad::McadPack;
+        let aec = cadx_aec::AecPack;
+        let ecad = cadx_ecad::EcadPack;
+        let packs: [&dyn DomainPack; 3] = [&mcad, &aec, &ecad];
+
+        for pack in packs {
+            for tool in pack.tools() {
+                assert!(
+                    try_icon(Pack::Lucide, tool.icon, Style::Regular, Size::Regular).is_ok(),
+                    "missing Lucide icon for {} tool {}: {}",
+                    pack.manifest().name,
+                    tool.id,
+                    tool.icon
+                );
+            }
         }
     }
 }

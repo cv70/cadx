@@ -1,0 +1,20 @@
+[package]
+name = "cadx-ecad"
+description = "Composable PCB electronics domain pack for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cadx-domain-api.workspace = true
+cadx-ecad-drc.workspace = true
+cadx-ecad-export.workspace = true
+cadx-ecad-layout.workspace = true
+cadx-ecad-netlist.workspace = true
+cadx-ecad-router.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

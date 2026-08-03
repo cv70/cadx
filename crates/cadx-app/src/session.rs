@@ -117,6 +117,11 @@ impl DocumentSession {
     }
 
     #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -475,6 +480,29 @@ mod tests {
         assert!(session.redo().unwrap());
         assert_eq!(session.document().features.len(), 1);
         assert_eq!(session.state(), DocumentState::Dirty);
+    }
+
+    #[test]
+    fn domain_data_is_committed_and_restored_with_history() {
+        let mut session = session();
+        session
+            .execute(vec![ModelCommand::SetDomainData {
+                namespace: "aec.bim".into(),
+                entity_key: "wall-1".into(),
+                value: serde_json::json!({"ifc_class": "IFCWALL"}),
+            }])
+            .unwrap();
+        assert_eq!(
+            session.document().domain_data["aec.bim"]["wall-1"]["ifc_class"],
+            "IFCWALL"
+        );
+        assert!(session.undo().unwrap());
+        assert!(session.document().domain_data.is_empty());
+        assert!(session.redo().unwrap());
+        assert_eq!(
+            session.document().domain_data["aec.bim"]["wall-1"]["ifc_class"],
+            "IFCWALL"
+        );
     }
 
     #[test]

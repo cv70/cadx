@@ -1,4 +1,4 @@
-use cadx_app::SessionError;
+use cadx_app::{SessionError, TransactionSource};
 use cadx_core::domain::{FeatureId, ModelCommand, Primitive};
 
 use crate::{CadxApp, StatusMessage};
@@ -64,13 +64,22 @@ impl CadxApp {
         commands: Vec<ModelCommand>,
         status: StatusMessage,
     ) -> Result<(), SessionError> {
+        self.execute_from(commands, status, TransactionSource::Ui)
+    }
+
+    pub(crate) fn execute_from(
+        &mut self,
+        commands: Vec<ModelCommand>,
+        status: StatusMessage,
+        source: TransactionSource,
+    ) -> Result<(), SessionError> {
         let selected_sketch = self.selected.filter(|id| {
             self.session
                 .document()
                 .feature(*id)
                 .is_some_and(|feature| matches!(feature.primitive, Primitive::Sketch { .. }))
         });
-        let outcome = match self.session.execute(commands) {
+        let outcome = match self.session.execute_with_source(commands, source) {
             Ok(outcome) => outcome,
             Err(error) => {
                 if let Some(diagnostic) = error.boolean_diagnostic() {
@@ -114,6 +123,7 @@ impl CadxApp {
             self.selected_vertex = None;
         }
         self.reconcile_measurement();
+        self.sync_domain_state();
         self.status = status;
         self.sync_viewport();
         Ok(())

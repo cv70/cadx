@@ -1,0 +1,15 @@
+[package]
+name = "cadx-aec-analysis"
+description = "Spatial clash and coordination analysis for CADX AEC models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-aec-bim.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

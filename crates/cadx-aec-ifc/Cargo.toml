@@ -1,0 +1,16 @@
+[package]
+name = "cadx-aec-ifc"
+description = "Deterministic IFC STEP exchange adapter for CADX AEC models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cadx-aec-bim.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
 use crate::{
@@ -906,6 +906,10 @@ pub struct CadDocument {
     pub features: Vec<Feature>,
     #[serde(default)]
     pub assemblies: Vec<Assembly>,
+    /// Opaque, namespaced domain-pack state persisted with the document.
+    /// Geometry evaluation deliberately ignores this map.
+    #[serde(default)]
+    pub domain_data: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     next_id: FeatureId,
     #[serde(default)]
     next_assembly_id: AssemblyId,
@@ -917,6 +921,7 @@ impl Default for CadDocument {
             name: "Untitled".into(),
             features: Vec::new(),
             assemblies: Vec::new(),
+            domain_data: BTreeMap::new(),
             next_id: 1,
             next_assembly_id: 1,
         }
@@ -2039,6 +2044,30 @@ impl CadDocument {
                 self.assemblies.remove(index);
                 Ok(None)
             }
+            ModelCommand::SetDomainData {
+                namespace,
+                entity_key,
+                value,
+            } => {
+                validate_domain_data_entry(&namespace, &entity_key, &value)?;
+                self.domain_data
+                    .entry(namespace)
+                    .or_default()
+                    .insert(entity_key, value);
+                Ok(None)
+            }
+            ModelCommand::RemoveDomainData {
+                namespace,
+                entity_key,
+            } => {
+                if let Some(values) = self.domain_data.get_mut(&namespace) {
+                    values.remove(&entity_key);
+                    if values.is_empty() {
+                        self.domain_data.remove(&namespace);
+                    }
+                }
+                Ok(None)
+            }
             ModelCommand::Delete { id } => {
                 if let Some(dependent) = self.dependents(id).next() {
                     return Err(DocumentError::FeatureInUse {
@@ -2099,6 +2128,16 @@ impl CadDocument {
     /// Returns [`DocumentError`] for duplicate ids, invalid geometry, or
     /// non-finite transforms and colors.
     pub fn validate_and_repair(&mut self) -> Result<(), DocumentError> {
+        for (namespace, entries) in &self.domain_data {
+            if entries.is_empty() {
+                return Err(DocumentError::InvalidParameter(
+                    "domain data namespaces must contain at least one entry".into(),
+                ));
+            }
+            for (entity_key, value) in entries {
+                validate_domain_data_entry(namespace, entity_key, value)?;
+            }
+        }
         let mut ids = std::collections::HashSet::with_capacity(self.features.len());
         let mut maximum_id = 0;
         for feature in &self.features {
@@ -2920,6 +2959,31 @@ fn color_is_valid(color: &[f32; 4]) -> bool {
         .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
 }
 
+fn validate_domain_data_entry(
+    namespace: &str,
+    entity_key: &str,
+    value: &serde_json::Value,
+) -> Result<(), DocumentError> {
+    if namespace.trim().is_empty()
+        || entity_key.trim().is_empty()
+        || namespace.len() > 128
+        || entity_key.len() > 256
+    {
+        return Err(DocumentError::InvalidParameter(
+            "domain data namespace and entity key must be non-empty and bounded".into(),
+        ));
+    }
+    let encoded = serde_json::to_vec(value).map_err(|error| {
+        DocumentError::InvalidParameter(format!("domain data must be valid JSON: {error}"))
+    })?;
+    if encoded.len() > 1_048_576 {
+        return Err(DocumentError::InvalidParameter(
+            "one domain data value must not exceed 1 MiB".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_step_boundaries(
     outer_shell_id: u64,
     void_shells: &[StepShellBoundary],
@@ -3227,6 +3291,15 @@ pub enum ModelCommand {
     DeleteAssembly {
         id: AssemblyId,
     },
+    SetDomainData {
+        namespace: String,
+        entity_key: String,
+        value: serde_json::Value,
+    },
+    RemoveDomainData {
+        namespace: String,
+        entity_key: String,
+    },
     Delete {
         id: FeatureId,
     },
@@ -3285,6 +3358,8 @@ impl ModelCommand {
             Self::DeleteAssemblyMate { .. } => "Delete assembly mate",
             Self::SetOccurrenceSuppressed { .. } => "Suppress assembly occurrence",
             Self::DeleteAssembly { .. } => "Delete assembly",
+            Self::SetDomainData { .. } => "Set domain data",
+            Self::RemoveDomainData { .. } => "Remove domain data",
             Self::Delete { .. } => "Delete feature",
         }
     }
@@ -3406,6 +3481,32 @@ mod tests {
 
         assert!(document.apply_transaction(commands).is_err());
         assert!(document.features.is_empty());
+    }
+
+    #[test]
+    fn domain_data_is_namespaced_serializable_document_state() {
+        let mut document = CadDocument::default();
+        document
+            .apply(ModelCommand::SetDomainData {
+                namespace: "aec.bim".into(),
+                entity_key: "wall-1".into(),
+                value: serde_json::json!({"ifc_class": "IFCWALL"}),
+            })
+            .unwrap();
+        assert_eq!(
+            document.domain_data["aec.bim"]["wall-1"]["ifc_class"],
+            "IFCWALL"
+        );
+        let decoded: CadDocument =
+            serde_json::from_str(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert_eq!(decoded.domain_data, document.domain_data);
+
+        let mut invalid = document;
+        invalid.domain_data.insert(String::new(), BTreeMap::new());
+        assert!(matches!(
+            invalid.validate_and_repair(),
+            Err(DocumentError::InvalidParameter(_))
+        ));
     }
 
     #[test]
@@ -5307,6 +5408,7 @@ mod tests {
                 },
             ],
             assemblies: Vec::new(),
+            domain_data: BTreeMap::new(),
             next_id: 3,
             next_assembly_id: 1,
         };

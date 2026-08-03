@@ -1,0 +1,644 @@
+use std::{collections::VecDeque, ops::Deref, sync::Arc};
+
+use cadx_core::{
+    domain::{CadDocument, FeatureId, ModelCommand},
+    kernel::CadKernel,
+};
+use thiserror::Error;
+
+use crate::{DocumentSession, DocumentState, SessionError, TransactionOutcome};
+
+pub const DEFAULT_EVENT_LOG_LIMIT: usize = 256;
+
+pub type StreamId = u64;
+pub type TransactionId = u64;
+
+type EventSubscriber = Box<dyn FnMut(&CoreEvent) + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionSource {
+    Ui,
+    Ai,
+    DomainPack,
+    Import,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionMetadata {
+    pub source: TransactionSource,
+    pub label: String,
+}
+
+impl TransactionMetadata {
+    #[must_use]
+    pub fn new(source: TransactionSource, label: impl Into<String>) -> Self {
+        Self {
+            source,
+            label: label.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_commands(source: TransactionSource, commands: &[ModelCommand]) -> Self {
+        let label = match commands {
+            [] => "No-op transaction".into(),
+            [command] => command.label().into(),
+            [first, ..] => format!("{} batch", first.label()),
+        };
+        Self { source, label }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreEvent {
+    TransactionStarted {
+        transaction_id: TransactionId,
+        source: TransactionSource,
+        label: String,
+        command_count: usize,
+    },
+    TransactionCommitted {
+        transaction_id: TransactionId,
+        source: TransactionSource,
+        label: String,
+        revision: u64,
+        state: DocumentState,
+        command_count: usize,
+        created_features: Vec<FeatureId>,
+    },
+    TransactionRejected {
+        transaction_id: TransactionId,
+        source: TransactionSource,
+        label: String,
+        command_count: usize,
+        error: String,
+    },
+    UndoApplied {
+        revision: u64,
+        state: DocumentState,
+    },
+    RedoApplied {
+        revision: u64,
+        state: DocumentState,
+    },
+    DocumentReplaced {
+        revision: u64,
+        state: DocumentState,
+    },
+    DocumentSaved {
+        revision: u64,
+        state: DocumentState,
+    },
+    StreamStarted {
+        stream_id: StreamId,
+        source: TransactionSource,
+        label: String,
+    },
+    StreamCommandBuffered {
+        stream_id: StreamId,
+        command_count: usize,
+    },
+    StreamCommitted {
+        stream_id: StreamId,
+        transaction_id: TransactionId,
+        revision: u64,
+        command_count: usize,
+        created_features: Vec<FeatureId>,
+    },
+    StreamCanceled {
+        stream_id: StreamId,
+        discarded_command_count: usize,
+    },
+}
+
+#[derive(Default)]
+pub struct EventDispatcher {
+    subscribers: Vec<EventSubscriber>,
+    events: VecDeque<CoreEvent>,
+    event_log_limit: usize,
+}
+
+impl EventDispatcher {
+    #[must_use]
+    pub fn new(event_log_limit: usize) -> Self {
+        Self {
+            subscribers: Vec::new(),
+            events: VecDeque::new(),
+            event_log_limit,
+        }
+    }
+
+    pub fn subscribe(&mut self, subscriber: impl FnMut(&CoreEvent) + Send + 'static) {
+        self.subscribers.push(Box::new(subscriber));
+    }
+
+    pub fn publish(&mut self, event: CoreEvent) {
+        for subscriber in &mut self.subscribers {
+            subscriber(&event);
+        }
+        if self.event_log_limit == 0 {
+            return;
+        }
+        if self.events.len() == self.event_log_limit {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    #[must_use]
+    pub fn drain(&mut self) -> Vec<CoreEvent> {
+        self.events.drain(..).collect()
+    }
+}
+
+impl Default for TransactionMetadata {
+    fn default() -> Self {
+        Self::new(TransactionSource::Ui, "Transaction")
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CoreBusError {
+    #[error("a command stream is already active")]
+    StreamAlreadyActive,
+    #[error("command stream {0} is not active")]
+    StreamNotActive(StreamId),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandStream {
+    pub id: StreamId,
+    pub source: TransactionSource,
+    pub label: String,
+    pub commands: Vec<ModelCommand>,
+}
+
+/// Observable command bus shared by UI, AI, domain packs, and import flows.
+///
+/// `CoreBus` deliberately delegates all document mutation to
+/// [`DocumentSession`]. Its job is the architecture-level boundary around that
+/// session: source tagging, command stream buffering, and publish-subscribe
+/// events for render, analysis, and agent adapters.
+pub struct CoreBus {
+    session: DocumentSession,
+    dispatcher: EventDispatcher,
+    active_stream: Option<CommandStream>,
+    next_stream_id: StreamId,
+    next_transaction_id: TransactionId,
+}
+
+impl CoreBus {
+    /// Creates a bus around a clean, kernel-evaluated document session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the kernel rejects the initial document.
+    pub fn new(kernel: Arc<dyn CadKernel>, document: CadDocument) -> Result<Self, SessionError> {
+        Self::with_history_limit(kernel, document, crate::DEFAULT_HISTORY_LIMIT)
+    }
+
+    /// Creates a bus with an explicit undo-history limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when the kernel rejects the initial document.
+    pub fn with_history_limit(
+        kernel: Arc<dyn CadKernel>,
+        document: CadDocument,
+        history_limit: usize,
+    ) -> Result<Self, SessionError> {
+        Ok(Self {
+            session: DocumentSession::with_history_limit(kernel, document, history_limit)?,
+            dispatcher: EventDispatcher::new(DEFAULT_EVENT_LOG_LIMIT),
+            active_stream: None,
+            next_stream_id: 1,
+            next_transaction_id: 1,
+        })
+    }
+
+    #[must_use]
+    pub const fn session(&self) -> &DocumentSession {
+        &self.session
+    }
+
+    pub fn subscribe(&mut self, subscriber: impl FnMut(&CoreEvent) + Send + 'static) {
+        self.dispatcher.subscribe(subscriber);
+    }
+
+    #[must_use]
+    pub fn drain_events(&mut self) -> Vec<CoreEvent> {
+        self.dispatcher.drain()
+    }
+
+    /// Executes a UI-originated command batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing the active document when
+    /// document validation or kernel evaluation fails.
+    pub fn execute(
+        &mut self,
+        commands: Vec<ModelCommand>,
+    ) -> Result<TransactionOutcome, SessionError> {
+        self.execute_with_source(commands, TransactionSource::Ui)
+    }
+
+    /// Executes a command batch with an explicit source tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing the active document when
+    /// document validation or kernel evaluation fails.
+    pub fn execute_with_source(
+        &mut self,
+        commands: Vec<ModelCommand>,
+        source: TransactionSource,
+    ) -> Result<TransactionOutcome, SessionError> {
+        let metadata = TransactionMetadata::from_commands(source, &commands);
+        self.execute_with_metadata(commands, metadata)
+    }
+
+    /// Executes a command batch with caller-provided transaction metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing the active document when
+    /// document validation or kernel evaluation fails.
+    pub fn execute_with_metadata(
+        &mut self,
+        commands: Vec<ModelCommand>,
+        metadata: TransactionMetadata,
+    ) -> Result<TransactionOutcome, SessionError> {
+        if commands.is_empty() {
+            return self.session.execute(commands);
+        }
+
+        let transaction_id = self.allocate_transaction_id();
+        let command_count = commands.len();
+        self.dispatcher.publish(CoreEvent::TransactionStarted {
+            transaction_id,
+            source: metadata.source,
+            label: metadata.label.clone(),
+            command_count,
+        });
+
+        match self.session.execute(commands) {
+            Ok(outcome) => {
+                self.dispatcher.publish(CoreEvent::TransactionCommitted {
+                    transaction_id,
+                    source: metadata.source,
+                    label: metadata.label,
+                    revision: self.session.revision(),
+                    state: self.session.state(),
+                    command_count,
+                    created_features: outcome.created_features.clone(),
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.dispatcher.publish(CoreEvent::TransactionRejected {
+                    transaction_id,
+                    source: metadata.source,
+                    label: metadata.label,
+                    command_count,
+                    error: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Replaces the active document and clears undo/redo history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing the active document when
+    /// kernel evaluation fails.
+    pub fn replace_document(&mut self, document: CadDocument) -> Result<(), SessionError> {
+        self.session.replace_document(document)?;
+        self.dispatcher.publish(CoreEvent::DocumentReplaced {
+            revision: self.session.revision(),
+            state: self.session.state(),
+        });
+        Ok(())
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.session.mark_saved();
+        self.dispatcher.publish(CoreEvent::DocumentSaved {
+            revision: self.session.revision(),
+            state: self.session.state(),
+        });
+    }
+
+    /// Restores the previous revision and publishes an undo event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing history when evaluation fails.
+    pub fn undo(&mut self) -> Result<bool, SessionError> {
+        let applied = self.session.undo()?;
+        if applied {
+            self.dispatcher.publish(CoreEvent::UndoApplied {
+                revision: self.session.revision(),
+                state: self.session.state(),
+            });
+        }
+        Ok(applied)
+    }
+
+    /// Restores the next revision and publishes a redo event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] without changing history when evaluation fails.
+    pub fn redo(&mut self) -> Result<bool, SessionError> {
+        let applied = self.session.redo()?;
+        if applied {
+            self.dispatcher.publish(CoreEvent::RedoApplied {
+                revision: self.session.revision(),
+                state: self.session.state(),
+            });
+        }
+        Ok(applied)
+    }
+
+    /// Starts buffering streamable commands for later atomic commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreBusError::StreamAlreadyActive`] when another stream is
+    /// already open.
+    pub fn begin_stream(
+        &mut self,
+        source: TransactionSource,
+        label: impl Into<String>,
+    ) -> Result<StreamId, CoreBusError> {
+        if self.active_stream.is_some() {
+            return Err(CoreBusError::StreamAlreadyActive);
+        }
+        let id = self.allocate_stream_id();
+        let label = label.into();
+        self.active_stream = Some(CommandStream {
+            id,
+            source,
+            label: label.clone(),
+            commands: Vec::new(),
+        });
+        self.dispatcher.publish(CoreEvent::StreamStarted {
+            stream_id: id,
+            source,
+            label,
+        });
+        Ok(id)
+    }
+
+    /// Buffers one command into an active command stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreBusError::StreamNotActive`] when `stream_id` does not match
+    /// the active stream.
+    pub fn push_stream_command(
+        &mut self,
+        stream_id: StreamId,
+        command: ModelCommand,
+    ) -> Result<usize, CoreBusError> {
+        let Some(stream) = self
+            .active_stream
+            .as_mut()
+            .filter(|stream| stream.id == stream_id)
+        else {
+            return Err(CoreBusError::StreamNotActive(stream_id));
+        };
+        stream.commands.push(command);
+        let command_count = stream.commands.len();
+        self.dispatcher.publish(CoreEvent::StreamCommandBuffered {
+            stream_id,
+            command_count,
+        });
+        Ok(command_count)
+    }
+
+    /// Atomically validates and commits all commands buffered in a stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreBusError`] when the stream id is invalid or the staged
+    /// transaction fails document/kernel validation.
+    pub fn commit_stream(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Result<TransactionOutcome, CoreBusError> {
+        let stream = self.take_stream(stream_id)?;
+        let transaction_id = self.allocate_transaction_id();
+        let command_count = stream.commands.len();
+        self.dispatcher.publish(CoreEvent::TransactionStarted {
+            transaction_id,
+            source: stream.source,
+            label: stream.label.clone(),
+            command_count,
+        });
+
+        match self.session.execute(stream.commands) {
+            Ok(outcome) => {
+                self.dispatcher.publish(CoreEvent::TransactionCommitted {
+                    transaction_id,
+                    source: stream.source,
+                    label: stream.label,
+                    revision: self.session.revision(),
+                    state: self.session.state(),
+                    command_count,
+                    created_features: outcome.created_features.clone(),
+                });
+                self.dispatcher.publish(CoreEvent::StreamCommitted {
+                    stream_id,
+                    transaction_id,
+                    revision: self.session.revision(),
+                    command_count,
+                    created_features: outcome.created_features.clone(),
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.dispatcher.publish(CoreEvent::TransactionRejected {
+                    transaction_id,
+                    source: stream.source,
+                    label: stream.label,
+                    command_count,
+                    error: error.to_string(),
+                });
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Discards an active command stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreBusError::StreamNotActive`] when `stream_id` does not match
+    /// the active stream.
+    pub fn cancel_stream(&mut self, stream_id: StreamId) -> Result<(), CoreBusError> {
+        let stream = self.take_stream(stream_id)?;
+        self.dispatcher.publish(CoreEvent::StreamCanceled {
+            stream_id,
+            discarded_command_count: stream.commands.len(),
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn active_stream(&self) -> Option<&CommandStream> {
+        self.active_stream.as_ref()
+    }
+
+    fn take_stream(&mut self, stream_id: StreamId) -> Result<CommandStream, CoreBusError> {
+        match self.active_stream.take() {
+            Some(stream) if stream.id == stream_id => Ok(stream),
+            Some(stream) => {
+                self.active_stream = Some(stream);
+                Err(CoreBusError::StreamNotActive(stream_id))
+            }
+            None => Err(CoreBusError::StreamNotActive(stream_id)),
+        }
+    }
+
+    fn allocate_stream_id(&mut self) -> StreamId {
+        let id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.saturating_add(1);
+        id
+    }
+
+    fn allocate_transaction_id(&mut self) -> TransactionId {
+        let id = self.next_transaction_id;
+        self.next_transaction_id = self.next_transaction_id.saturating_add(1);
+        id
+    }
+}
+
+impl Deref for CoreBus {
+    type Target = DocumentSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadx_core::kernel::{EvaluatedScene, KernelError};
+
+    #[derive(Debug)]
+    struct AcceptKernel;
+
+    impl CadKernel for AcceptKernel {
+        fn name(&self) -> &'static str {
+            "accept"
+        }
+
+        fn evaluate(&self, _document: &CadDocument) -> Result<EvaluatedScene, KernelError> {
+            Ok(EvaluatedScene::default())
+        }
+    }
+
+    fn test_bus() -> CoreBus {
+        CoreBus::new(Arc::new(AcceptKernel), CadDocument::default()).unwrap()
+    }
+
+    fn create_box(name: &str) -> ModelCommand {
+        ModelCommand::CreateBox {
+            name: name.into(),
+            size: [10.0, 10.0, 10.0],
+            position: [0.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn publishes_transaction_and_undo_events() {
+        let mut bus = test_bus();
+
+        let outcome = bus
+            .execute_with_source(vec![create_box("part")], TransactionSource::Ui)
+            .unwrap();
+        assert_eq!(outcome.created_features, vec![1]);
+
+        let events = bus.drain_events();
+        assert!(matches!(
+            &events[..],
+            [
+                CoreEvent::TransactionStarted {
+                    source: TransactionSource::Ui,
+                    command_count: 1,
+                    ..
+                },
+                CoreEvent::TransactionCommitted {
+                    source: TransactionSource::Ui,
+                    revision: 2,
+                    state: DocumentState::Dirty,
+                    created_features,
+                    ..
+                }
+            ] if created_features == &vec![1]
+        ));
+
+        assert!(bus.undo().unwrap());
+        assert!(matches!(
+            bus.drain_events().as_slice(),
+            [CoreEvent::UndoApplied {
+                revision: 1,
+                state: DocumentState::Clean
+            }]
+        ));
+    }
+
+    #[test]
+    fn stream_commits_buffered_ai_commands_as_one_transaction() {
+        let mut bus = test_bus();
+
+        let stream_id = bus
+            .begin_stream(TransactionSource::Ai, "AI preview")
+            .unwrap();
+        assert_eq!(
+            bus.push_stream_command(stream_id, create_box("first"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            bus.push_stream_command(stream_id, create_box("second"))
+                .unwrap(),
+            2
+        );
+
+        let outcome = bus.commit_stream(stream_id).unwrap();
+        assert_eq!(outcome.created_features, vec![1, 2]);
+        assert!(bus.active_stream().is_none());
+
+        let events = bus.drain_events();
+        assert_eq!(events.len(), 6);
+        assert!(matches!(
+            events.last(),
+            Some(CoreEvent::StreamCommitted {
+                stream_id: id,
+                revision: 2,
+                command_count: 2,
+                created_features,
+                ..
+            }) if *id == stream_id && created_features == &vec![1, 2]
+        ));
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "cadx-mcad"
+description = "Composable mechanical engineering domain pack for CADX"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cadx-domain-api.workspace = true
+cadx-mcad-bom.workspace = true
+cadx-mcad-dfm.workspace = true
+cadx-mcad-model.workspace = true
+cadx-mcad-standards.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

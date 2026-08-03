@@ -2,6 +2,7 @@ mod appearance;
 mod workflow;
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::Duration,
@@ -9,9 +10,15 @@ use std::{
 
 use eframe::egui;
 
-use cadx_ai::{AiAssistant, AiError, AiPlan, GenAiAssistant};
+use cadx_aec::AecPack;
+use cadx_ai::{
+    AiAssistant, AiError, AiPlan, GenAiAssistant,
+    context::{ContextCollector, ContextSnapshot},
+    intent::IntentDiff,
+    tools::ToolRegistry,
+};
 use cadx_analysis::{MeasurementEntity, analyze_scene};
-use cadx_app::{DocumentSession, DocumentState};
+use cadx_app::{CoreBus, DocumentState, TransactionSource};
 use cadx_config::{ConfigStore, Preferences, ProviderConfig, Settings};
 use cadx_core::{
     assembly::{
@@ -35,12 +42,21 @@ use cadx_core::{
     },
     topology::{EdgeRef, FaceRef, VertexRef},
 };
+use cadx_domain_api::{
+    DomainAction, DomainArtifact, DomainContext, DomainExecution, DomainFieldKind,
+    DomainFieldSchema, DomainFieldValue, DomainId, DomainParameters, DomainRegistry, DomainRoute,
+    DomainToolRequest,
+};
+use cadx_ecad::{EcadPack, drc as pcb_drc, export as pcb_export, layout::PcbBoard};
 use cadx_i18n::{Language, Translator};
 use cadx_kernel_truck::TruckKernel;
+use cadx_mcad::{
+    McadPack, bom as mechanical_bom, dfm as mechanical_dfm, standards as mechanical_standards,
+};
 use cadx_render::{self as render, OrbitCamera, ViewportScene};
 
 pub struct CadxApp {
-    session: DocumentSession,
+    session: CoreBus,
     exchange_kernel: Arc<dyn ExchangeKernel>,
     viewport_scene: ViewportScene,
     camera: OrbitCamera,
@@ -75,6 +91,15 @@ pub struct CadxApp {
     sketch_dimension_editor: Option<SketchDimensionEditor>,
     preferences: Preferences,
     config_store: Option<ConfigStore>,
+    active_domain: DomainId,
+    domain_bus: DomainRegistry,
+    ai_tools: ToolRegistry,
+    context_collector: ContextCollector,
+    domain_tool_form: Option<(DomainId, String)>,
+    domain_form_values: BTreeMap<(DomainId, String), DomainParameters>,
+    pcb_board: PcbBoard,
+    domain_report: Option<DomainReport>,
+    last_intent_diff: Option<IntentDiff>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +128,17 @@ type StatusMessage = LocalizedText;
 struct ConversationEntry {
     speaker: Speaker,
     content: LocalizedText,
+}
+
+#[derive(Debug, Clone)]
+enum DomainReport {
+    MechanicalDfm(mechanical_dfm::DfmReport),
+    MechanicalDrawing(Vec<mechanical_standards::StandardsIssue>),
+    MechanicalBom(Vec<mechanical_bom::BomItem>),
+    PcbDrc(pcb_drc::DrcReport),
+    PcbBom(Vec<(String, String, String, u32)>),
+    ExportPreview(Vec<pcb_export::ExportFile>),
+    Artifacts(Vec<DomainArtifact>),
 }
 
 struct InterferenceDialogState {
@@ -295,7 +331,7 @@ impl CadxApp {
         let kernel: Arc<dyn CadKernel> = truck_kernel.clone();
         let exchange_kernel: Arc<dyn ExchangeKernel> = truck_kernel;
         let document = CadDocument::demo();
-        let session = DocumentSession::new(kernel, document)
+        let session = CoreBus::new(kernel, document)
             .expect("built-in demo document must be accepted by the CAD kernel");
         let viewport_scene = ViewportScene::default();
         let selected = session.document().features.last().map(|feature| feature.id);
@@ -325,6 +361,15 @@ impl CadxApp {
             .build()
             .expect("failed to create AI runtime");
         let (ai_sender, ai_receiver) = mpsc::channel();
+
+        let mut domain_bus = DomainRegistry::new();
+        domain_bus.register(Arc::new(McadPack));
+        domain_bus.register(Arc::new(AecPack));
+        domain_bus.register(Arc::new(EcadPack));
+        let mut ai_tools = ToolRegistry::default();
+        for pack in domain_bus.enabled_packs() {
+            ai_tools.register_pack(pack.as_ref());
+        }
 
         Self {
             session,
@@ -365,6 +410,15 @@ impl CadxApp {
             sketch_dimension_editor: None,
             preferences: settings.preferences,
             config_store,
+            active_domain: DomainId::Mcad,
+            domain_bus,
+            ai_tools,
+            context_collector: ContextCollector::default(),
+            domain_tool_form: None,
+            domain_form_values: BTreeMap::new(),
+            pcb_board: PcbBoard::demo(),
+            domain_report: None,
+            last_intent_diff: None,
         }
     }
 
@@ -395,6 +449,64 @@ impl CadxApp {
                                 .color(appearance::TEXT),
                         );
                         ui.separator();
+                        let manifests = self.domain_bus.registered_manifests();
+                        let active_manifest = manifests
+                            .iter()
+                            .find(|manifest| manifest.id == self.active_domain)
+                            .cloned();
+                        let mut requested_domain = None;
+                        let domain_label =
+                            active_manifest.map_or("DOMAIN", |manifest| manifest.name);
+                        let domain_menu = ui.menu_button(
+                            (
+                                appearance::icon(domain_icon(self.active_domain), 13.0),
+                                egui::RichText::new(domain_label).size(11.0),
+                            ),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(translator.text("domain.switch"))
+                                        .size(10.0)
+                                        .color(appearance::TEXT_MUTED),
+                                );
+                                for manifest in &manifests {
+                                    let mut enabled = self.domain_bus.is_enabled(manifest.id);
+                                    if ui.checkbox(&mut enabled, manifest.name).changed() {
+                                        self.domain_bus.set_enabled(manifest.id, enabled);
+                                        if !enabled && self.active_domain == manifest.id {
+                                            requested_domain = manifests
+                                                .iter()
+                                                .find(|candidate| {
+                                                    candidate.id != manifest.id
+                                                        && self.domain_bus.is_enabled(candidate.id)
+                                                })
+                                                .map(|candidate| candidate.id);
+                                        }
+                                    }
+                                    if enabled
+                                        && ui
+                                            .selectable_label(
+                                                self.active_domain == manifest.id,
+                                                format!("{}  v{}", manifest.name, manifest.version),
+                                            )
+                                            .clicked()
+                                    {
+                                        requested_domain = Some(manifest.id);
+                                        ui.close();
+                                    }
+                                }
+                            },
+                        );
+                        domain_menu
+                            .response
+                            .on_hover_text(translator.text("domain.switch"));
+                        if let Some(domain) = requested_domain {
+                            self.active_domain = domain;
+                            self.domain_tool_form = None;
+                            self.domain_report = None;
+                            self.status = StatusMessage::Text(
+                                self.active_domain.slug().replace('-', " ").to_uppercase(),
+                            );
+                        }
                         if icon_button(ui, "file-plus", translator.text("tool.new"), true, false)
                             .clicked()
                         {
@@ -555,512 +667,580 @@ impl CadxApp {
                     egui::vec2(ui.available_width(), 42.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.add_space(8.0);
-                        if tab_button(
-                            ui,
-                            "box",
-                            translator.text("toolbar.create"),
-                            self.toolbar_tab == ToolbarTab::Create,
-                        )
-                        .clicked()
-                        {
-                            self.toolbar_tab = ToolbarTab::Create;
-                        }
-                        if tab_button(
-                            ui,
-                            "orbit",
-                            translator.text("toolbar.view"),
-                            self.toolbar_tab == ToolbarTab::View,
-                        )
-                        .clicked()
-                        {
-                            self.toolbar_tab = ToolbarTab::View;
-                        }
-                        if tab_button(
-                            ui,
-                            "combine",
-                            translator.text("toolbar.design"),
-                            self.toolbar_tab == ToolbarTab::Design,
-                        )
-                        .clicked()
-                        {
-                            self.toolbar_tab = ToolbarTab::Design;
-                        }
-                        ui.separator();
+                        if self.active_domain == DomainId::Aec {
+                            self.aec_toolbar(ui, &translator);
+                        } else {
+                            ui.add_space(8.0);
+                            if tab_button(
+                                ui,
+                                "box",
+                                translator.text("toolbar.create"),
+                                self.toolbar_tab == ToolbarTab::Create,
+                            )
+                            .clicked()
+                            {
+                                self.toolbar_tab = ToolbarTab::Create;
+                            }
+                            if tab_button(
+                                ui,
+                                "orbit",
+                                translator.text("toolbar.view"),
+                                self.toolbar_tab == ToolbarTab::View,
+                            )
+                            .clicked()
+                            {
+                                self.toolbar_tab = ToolbarTab::View;
+                            }
+                            if tab_button(
+                                ui,
+                                "combine",
+                                translator.text("toolbar.design"),
+                                self.toolbar_tab == ToolbarTab::Design,
+                            )
+                            .clicked()
+                            {
+                                self.toolbar_tab = ToolbarTab::Design;
+                            }
+                            ui.separator();
 
-                        match self.toolbar_tab {
-                            ToolbarTab::Create => {
-                                let selected_face = planar_face_selection(
-                                    self.session.scene(),
-                                    self.selected_face.as_ref(),
-                                );
-                                let selected_datum = self.selected.filter(|id| {
-                                    self.session.document().feature(*id).is_some_and(|feature| {
-                                        matches!(feature.primitive, Primitive::DatumPlane { .. })
-                                    })
-                                });
-                                let sketch_tool = if selected_datum.is_some() {
-                                    translator.text("tool.sketch_on_datum")
-                                } else if selected_face.is_some() {
-                                    translator.text("tool.sketch_on_face")
-                                } else {
-                                    translator.text("tool.sketch")
-                                };
-                                if tool_button(ui, "pencil", sketch_tool, sketch_tool, true)
-                                    .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateSketch {
-                                            plane: selected_datum.map_or_else(
-                                                || {
-                                                    selected_face
-                                                        .clone()
-                                                        .map_or(SketchPlane::WorldXy, |face| {
-                                                            SketchPlane::PlanarFace { face }
-                                                        })
+                            if self.active_domain == DomainId::Ecad {
+                                self.pcb_toolbar(ui, &translator);
+                            } else {
+                                match self.toolbar_tab {
+                                    ToolbarTab::Create => {
+                                        let selected_face = planar_face_selection(
+                                            self.session.scene(),
+                                            self.selected_face.as_ref(),
+                                        );
+                                        let selected_datum = self.selected.filter(|id| {
+                                            self.session.document().feature(*id).is_some_and(
+                                                |feature| {
+                                                    matches!(
+                                                        feature.primitive,
+                                                        Primitive::DatumPlane { .. }
+                                                    )
                                                 },
-                                                |datum_id| SketchPlane::DatumPlane { datum_id },
-                                            ),
-                                            name: translator.text("primitive.sketch").into(),
-                                            profile: vec![
-                                                [-15.0, -10.0],
-                                                [15.0, -10.0],
-                                                [15.0, 10.0],
-                                                [-15.0, 10.0],
-                                            ],
-                                            holes: Vec::new(),
-                                            constraints: Vec::new(),
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_sketch"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "circle-dot",
-                                    translator.text("tool.circle_sketch"),
-                                    translator.text("tool.circle_sketch"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateSketchRegion {
-                                            plane: selected_datum.map_or_else(
-                                                || {
-                                                    selected_face
-                                                        .clone()
-                                                        .map_or(SketchPlane::WorldXy, |face| {
-                                                            SketchPlane::PlanarFace { face }
-                                                        })
-                                                },
-                                                |datum_id| SketchPlane::DatumPlane { datum_id },
-                                            ),
-                                            name: translator.text("primitive.circle_sketch").into(),
-                                            region: SketchRegion2D {
-                                                profile: exact_circle_loop([0.0, 0.0], 12.0),
-                                                holes: Vec::new(),
-                                            },
-                                            construction: Vec::new(),
-                                            constraints: Vec::new(),
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_sketch"),
-                                    );
-                                }
-                                let selected_sketch = self.selected.filter(|id| {
-                                    self.session.document().feature(*id).is_some_and(|feature| {
-                                        matches!(feature.primitive, Primitive::Sketch { .. })
-                                    })
-                                });
-                                if let Some(sketch_id) = selected_sketch
-                                    && tool_button(
-                                        ui,
-                                        "layers",
-                                        translator.text("tool.extrude_sketch"),
-                                        translator.text("tool.extrude_sketch"),
-                                        true,
-                                    )
-                                    .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateExtrusionFromSketch {
-                                            name: translator.text("primitive.extrusion").into(),
-                                            sketch_id,
-                                            height: 20.0,
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_extrusion"),
-                                    );
-                                }
-                                if let Some(sketch_id) = selected_sketch
-                                    && tool_button(
-                                        ui,
-                                        "rotate-cw",
-                                        translator.text("tool.revolve_sketch"),
-                                        if self.session.document().feature(sketch_id).is_some_and(
-                                            |feature| {
-                                                matches!(
-                                                    feature.primitive,
-                                                    Primitive::Sketch { ref region, .. }
-                                                        if !region.holes.is_empty()
-                                                )
-                                            },
-                                        ) {
-                                            translator.text("tool.revolve_holes_unsupported")
+                                            )
+                                        });
+                                        let sketch_tool = if selected_datum.is_some() {
+                                            translator.text("tool.sketch_on_datum")
+                                        } else if selected_face.is_some() {
+                                            translator.text("tool.sketch_on_face")
                                         } else {
-                                            translator.text("tool.revolve_sketch")
-                                        },
-                                        self.session.document().feature(sketch_id).is_some_and(
-                                            |feature| {
-                                                matches!(
-                                                    feature.primitive,
-                                                    Primitive::Sketch { ref region, .. }
-                                                        if region.holes.is_empty()
-                                                )
-                                            },
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    let axis_x = self.session.document().feature(sketch_id).map_or(
-                                        5.0,
-                                        |feature| match &feature.primitive {
-                                            Primitive::Sketch { region, .. } => {
-                                                region
-                                                    .profile
-                                                    .sampled_points(std::f64::consts::PI / 36.0)
-                                                    .into_iter()
-                                                    .map(|point| point[0])
-                                                    .fold(f64::NEG_INFINITY, f64::max)
-                                                    + 5.0
-                                            }
-                                            _ => 5.0,
-                                        },
-                                    );
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateRevolveFromSketch {
-                                            name: translator.text("primitive.revolve").into(),
-                                            sketch_id,
-                                            axis_origin: [axis_x, 0.0],
-                                            axis_direction: [0.0, 1.0],
-                                            angle: 360.0,
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_revolve"),
-                                    );
-                                }
-                                let loft_sketch_ids = self
-                                    .session
-                                    .document()
-                                    .features
-                                    .iter()
-                                    .filter_map(|feature| match &feature.primitive {
-                                        Primitive::Sketch { region, .. }
-                                            if region.holes.is_empty() =>
+                                            translator.text("tool.sketch")
+                                        };
+                                        if tool_button(ui, "pencil", sketch_tool, sketch_tool, true)
+                                            .clicked()
                                         {
-                                            Some(feature.id)
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateSketch {
+                                                    plane: selected_datum.map_or_else(
+                                                        || {
+                                                            selected_face.clone().map_or(
+                                                                SketchPlane::WorldXy,
+                                                                |face| SketchPlane::PlanarFace {
+                                                                    face,
+                                                                },
+                                                            )
+                                                        },
+                                                        |datum_id| SketchPlane::DatumPlane {
+                                                            datum_id,
+                                                        },
+                                                    ),
+                                                    name: translator
+                                                        .text("primitive.sketch")
+                                                        .into(),
+                                                    profile: vec![
+                                                        [-15.0, -10.0],
+                                                        [15.0, -10.0],
+                                                        [15.0, 10.0],
+                                                        [-15.0, 10.0],
+                                                    ],
+                                                    holes: Vec::new(),
+                                                    constraints: Vec::new(),
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_sketch"),
+                                            );
                                         }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-                                if tool_button(
-                                    ui,
-                                    "layers",
-                                    translator.text("tool.loft"),
-                                    translator.text("tool.loft"),
-                                    loft_sketch_ids.len() >= 2,
-                                )
-                                .clicked()
-                                {
-                                    self.loft_dialog = Some(LoftDialogState {
-                                        sketch_ids: loft_sketch_ids
-                                            .into_iter()
-                                            .take(MAX_LOFT_SECTIONS)
-                                            .collect(),
-                                        error: None,
-                                    });
-                                    self.boolean_dialog = None;
-                                    self.edge_modifier_dialog = None;
-                                }
-                                if tool_button(
-                                    ui,
-                                    "box",
-                                    translator.text("tool.box"),
-                                    translator.text("tool.box"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateBox {
-                                            name: translator.text("primitive.box").into(),
-                                            size: [20.0, 20.0, 20.0],
-                                            position: [-10.0, -10.0, 0.0],
-                                        }],
-                                        StatusMessage::Key("status.created_box"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "cylinder",
-                                    translator.text("tool.cylinder"),
-                                    translator.text("tool.cylinder"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateCylinder {
-                                            name: translator.text("primitive.cylinder").into(),
-                                            radius: 10.0,
-                                            height: 24.0,
-                                            position: [0.0, 0.0, 0.0],
-                                        }],
-                                        StatusMessage::Key("status.created_cylinder"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "circle",
-                                    translator.text("tool.sphere"),
-                                    translator.text("tool.sphere"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateSphere {
-                                            name: translator.text("primitive.sphere").into(),
-                                            radius: 10.0,
-                                            position: [0.0, 0.0, 10.0],
-                                        }],
-                                        StatusMessage::Key("status.created_sphere"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "triangle",
-                                    translator.text("tool.cone"),
-                                    translator.text("tool.cone"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateCone {
-                                            name: translator.text("primitive.cone").into(),
-                                            bottom_radius: 10.0,
-                                            top_radius: 4.0,
-                                            height: 24.0,
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_cone"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "circle-dot",
-                                    translator.text("tool.torus"),
-                                    translator.text("tool.torus"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateTorus {
-                                            name: translator.text("primitive.torus").into(),
-                                            major_radius: 14.0,
-                                            minor_radius: 4.0,
-                                            position: [0.0, 0.0, 12.0],
-                                        }],
-                                        StatusMessage::Key("status.created_torus"),
-                                    );
-                                }
-                                if tool_button(
-                                    ui,
-                                    "layers",
-                                    translator.text("tool.extrusion"),
-                                    translator.text("tool.extrusion"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.execute(
-                                        vec![ModelCommand::CreateExtrusion {
-                                            name: translator.text("primitive.extrusion").into(),
-                                            profile: vec![
-                                                [-10.0, -10.0],
-                                                [10.0, -10.0],
-                                                [10.0, 10.0],
-                                                [-10.0, 10.0],
-                                            ],
-                                            height: 20.0,
-                                            position: [0.0; 3],
-                                        }],
-                                        StatusMessage::Key("status.created_extrusion"),
-                                    );
-                                }
-                            }
-                            ToolbarTab::Design => {
-                                let capabilities = self.session.kernel_capabilities();
-                                let edge_count = self.selected_edges.len();
-                                if tool_button(
-                                    ui,
-                                    "combine",
-                                    translator.text("tool.boolean"),
-                                    translator.text("tool.boolean"),
-                                    self.session
-                                        .document()
-                                        .features
-                                        .iter()
-                                        .filter(|feature| {
-                                            !feature.primitive.is_reference_geometry()
-                                        })
-                                        .count()
-                                        >= 2,
-                                )
-                                .clicked()
-                                {
-                                    let left = self.selected.filter(|id| {
-                                        self.session.document().feature(*id).is_some_and(
-                                            |feature| !feature.primitive.is_reference_geometry(),
+                                        if tool_button(
+                                            ui,
+                                            "circle-dot",
+                                            translator.text("tool.circle_sketch"),
+                                            translator.text("tool.circle_sketch"),
+                                            true,
                                         )
-                                    });
-                                    let right = self.session.document().features.iter().find_map(
-                                        |feature| {
-                                            (Some(feature.id) != left
-                                                && !feature.primitive.is_reference_geometry())
-                                            .then_some(feature.id)
-                                        },
-                                    );
-                                    self.boolean_dialog = Some(BooleanDialogState {
-                                        operation: BooleanOperation::Union,
-                                        left,
-                                        right,
-                                        diagnostic: None,
-                                        error: None,
-                                    });
-                                    self.loft_dialog = None;
-                                    self.edge_modifier_dialog = None;
-                                }
-                                if tool_button(
-                                    ui,
-                                    "octagon",
-                                    translator.text("tool.chamfer"),
-                                    translator.text("tool.chamfer"),
-                                    edge_modifier_tool_enabled(capabilities.chamfer, edge_count),
-                                )
-                                .clicked()
-                                    && let Some(edge) = self.selected_edges.last()
-                                {
-                                    let size =
-                                        self.session.scene().edge(edge).map_or(1.0, |edge| {
-                                            (edge.geometry.length * 0.1).clamp(0.1, 5.0)
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateSketchRegion {
+                                                    plane: selected_datum.map_or_else(
+                                                        || {
+                                                            selected_face.clone().map_or(
+                                                                SketchPlane::WorldXy,
+                                                                |face| SketchPlane::PlanarFace {
+                                                                    face,
+                                                                },
+                                                            )
+                                                        },
+                                                        |datum_id| SketchPlane::DatumPlane {
+                                                            datum_id,
+                                                        },
+                                                    ),
+                                                    name: translator
+                                                        .text("primitive.circle_sketch")
+                                                        .into(),
+                                                    region: SketchRegion2D {
+                                                        profile: exact_circle_loop(
+                                                            [0.0, 0.0],
+                                                            12.0,
+                                                        ),
+                                                        holes: Vec::new(),
+                                                    },
+                                                    construction: Vec::new(),
+                                                    constraints: Vec::new(),
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_sketch"),
+                                            );
+                                        }
+                                        let selected_sketch = self.selected.filter(|id| {
+                                            self.session.document().feature(*id).is_some_and(
+                                                |feature| {
+                                                    matches!(
+                                                        feature.primitive,
+                                                        Primitive::Sketch { .. }
+                                                    )
+                                                },
+                                            )
                                         });
-                                    self.edge_modifier_dialog = Some(EdgeModifierDialogState {
-                                        kind: EdgeModifierKind::Chamfer,
-                                        edges: self.selected_edges.clone(),
-                                        size,
-                                        diagnostic: None,
-                                        error: None,
-                                    });
-                                    self.loft_dialog = None;
-                                    self.boolean_dialog = None;
-                                }
-                                if tool_button(
-                                    ui,
-                                    "radius",
-                                    translator.text("tool.fillet"),
-                                    translator.text("tool.fillet"),
-                                    edge_modifier_tool_enabled(capabilities.fillet, edge_count),
-                                )
-                                .clicked()
-                                    && let Some(edge) = self.selected_edges.last()
-                                {
-                                    let size =
-                                        self.session.scene().edge(edge).map_or(1.0, |edge| {
-                                            (edge.geometry.length * 0.1).clamp(0.1, 5.0)
-                                        });
-                                    self.edge_modifier_dialog = Some(EdgeModifierDialogState {
-                                        kind: EdgeModifierKind::Fillet,
-                                        edges: self.selected_edges.clone(),
-                                        size,
-                                        diagnostic: None,
-                                        error: None,
-                                    });
-                                    self.loft_dialog = None;
-                                    self.boolean_dialog = None;
-                                }
-                                ui.separator();
-                                if tool_button(
-                                    ui,
-                                    "scan-search",
-                                    translator.text("tool.interference"),
-                                    translator.text("tool.interference"),
-                                    capabilities.interference_analysis,
-                                )
-                                .clicked()
-                                {
-                                    self.run_interference_analysis();
-                                }
-                            }
-                            ToolbarTab::View => {
-                                if tool_button(
-                                    ui,
-                                    "focus",
-                                    translator.text("tool.frame"),
-                                    translator.text("tool.frame"),
-                                    true,
-                                )
-                                .clicked()
-                                {
-                                    self.camera.frame_scene(self.session.scene());
-                                }
-                                ui.separator();
-                                for (mode, icon, tooltip) in [
-                                    (
-                                        SelectionMode::Face,
-                                        "panel-top",
-                                        translator.text("tool.select_face"),
-                                    ),
-                                    (
-                                        SelectionMode::Edge,
-                                        "minus",
-                                        translator.text("tool.select_edge"),
-                                    ),
-                                    (
-                                        SelectionMode::Vertex,
-                                        "circle-dot",
-                                        translator.text("tool.select_vertex"),
-                                    ),
-                                ] {
-                                    if icon_button(
-                                        ui,
-                                        icon,
-                                        tooltip,
-                                        true,
-                                        self.selection_mode == mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.selection_mode = mode;
-                                        self.clear_topology_selection();
-                                        self.measurement.entities.clear();
-                                        self.sync_viewport();
+                                        if let Some(sketch_id) = selected_sketch
+                                            && tool_button(
+                                                ui,
+                                                "layers",
+                                                translator.text("tool.extrude_sketch"),
+                                                translator.text("tool.extrude_sketch"),
+                                                true,
+                                            )
+                                            .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateExtrusionFromSketch {
+                                                    name: translator
+                                                        .text("primitive.extrusion")
+                                                        .into(),
+                                                    sketch_id,
+                                                    height: 20.0,
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_extrusion"),
+                                            );
+                                        }
+                                        if let Some(sketch_id) = selected_sketch
+                                            && tool_button(
+                                                ui,
+                                                "rotate-cw",
+                                                translator.text("tool.revolve_sketch"),
+                                                if self
+                                                    .session
+                                                    .document()
+                                                    .feature(sketch_id)
+                                                    .is_some_and(|feature| {
+                                                        matches!(
+                                                            feature.primitive,
+                                                            Primitive::Sketch { ref region, .. }
+                                                                if !region.holes.is_empty()
+                                                        )
+                                                    })
+                                                {
+                                                    translator
+                                                        .text("tool.revolve_holes_unsupported")
+                                                } else {
+                                                    translator.text("tool.revolve_sketch")
+                                                },
+                                                self.session
+                                                    .document()
+                                                    .feature(sketch_id)
+                                                    .is_some_and(|feature| {
+                                                        matches!(
+                                                            feature.primitive,
+                                                            Primitive::Sketch { ref region, .. }
+                                                                if region.holes.is_empty()
+                                                        )
+                                                    }),
+                                            )
+                                            .clicked()
+                                        {
+                                            let axis_x = self
+                                                .session
+                                                .document()
+                                                .feature(sketch_id)
+                                                .map_or(5.0, |feature| match &feature.primitive {
+                                                    Primitive::Sketch { region, .. } => {
+                                                        region
+                                                            .profile
+                                                            .sampled_points(
+                                                                std::f64::consts::PI / 36.0,
+                                                            )
+                                                            .into_iter()
+                                                            .map(|point| point[0])
+                                                            .fold(f64::NEG_INFINITY, f64::max)
+                                                            + 5.0
+                                                    }
+                                                    _ => 5.0,
+                                                });
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateRevolveFromSketch {
+                                                    name: translator
+                                                        .text("primitive.revolve")
+                                                        .into(),
+                                                    sketch_id,
+                                                    axis_origin: [axis_x, 0.0],
+                                                    axis_direction: [0.0, 1.0],
+                                                    angle: 360.0,
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_revolve"),
+                                            );
+                                        }
+                                        let loft_sketch_ids = self
+                                            .session
+                                            .document()
+                                            .features
+                                            .iter()
+                                            .filter_map(|feature| match &feature.primitive {
+                                                Primitive::Sketch { region, .. }
+                                                    if region.holes.is_empty() =>
+                                                {
+                                                    Some(feature.id)
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect::<Vec<_>>();
+                                        if tool_button(
+                                            ui,
+                                            "layers",
+                                            translator.text("tool.loft"),
+                                            translator.text("tool.loft"),
+                                            loft_sketch_ids.len() >= 2,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.loft_dialog = Some(LoftDialogState {
+                                                sketch_ids: loft_sketch_ids
+                                                    .into_iter()
+                                                    .take(MAX_LOFT_SECTIONS)
+                                                    .collect(),
+                                                error: None,
+                                            });
+                                            self.boolean_dialog = None;
+                                            self.edge_modifier_dialog = None;
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "box",
+                                            translator.text("tool.box"),
+                                            translator.text("tool.box"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateBox {
+                                                    name: translator.text("primitive.box").into(),
+                                                    size: [20.0, 20.0, 20.0],
+                                                    position: [-10.0, -10.0, 0.0],
+                                                }],
+                                                StatusMessage::Key("status.created_box"),
+                                            );
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "cylinder",
+                                            translator.text("tool.cylinder"),
+                                            translator.text("tool.cylinder"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateCylinder {
+                                                    name: translator
+                                                        .text("primitive.cylinder")
+                                                        .into(),
+                                                    radius: 10.0,
+                                                    height: 24.0,
+                                                    position: [0.0, 0.0, 0.0],
+                                                }],
+                                                StatusMessage::Key("status.created_cylinder"),
+                                            );
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "circle",
+                                            translator.text("tool.sphere"),
+                                            translator.text("tool.sphere"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateSphere {
+                                                    name: translator
+                                                        .text("primitive.sphere")
+                                                        .into(),
+                                                    radius: 10.0,
+                                                    position: [0.0, 0.0, 10.0],
+                                                }],
+                                                StatusMessage::Key("status.created_sphere"),
+                                            );
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "triangle",
+                                            translator.text("tool.cone"),
+                                            translator.text("tool.cone"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateCone {
+                                                    name: translator.text("primitive.cone").into(),
+                                                    bottom_radius: 10.0,
+                                                    top_radius: 4.0,
+                                                    height: 24.0,
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_cone"),
+                                            );
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "circle-dot",
+                                            translator.text("tool.torus"),
+                                            translator.text("tool.torus"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateTorus {
+                                                    name: translator.text("primitive.torus").into(),
+                                                    major_radius: 14.0,
+                                                    minor_radius: 4.0,
+                                                    position: [0.0, 0.0, 12.0],
+                                                }],
+                                                StatusMessage::Key("status.created_torus"),
+                                            );
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "layers",
+                                            translator.text("tool.extrusion"),
+                                            translator.text("tool.extrusion"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            let _ = self.execute(
+                                                vec![ModelCommand::CreateExtrusion {
+                                                    name: translator
+                                                        .text("primitive.extrusion")
+                                                        .into(),
+                                                    profile: vec![
+                                                        [-10.0, -10.0],
+                                                        [10.0, -10.0],
+                                                        [10.0, 10.0],
+                                                        [-10.0, 10.0],
+                                                    ],
+                                                    height: 20.0,
+                                                    position: [0.0; 3],
+                                                }],
+                                                StatusMessage::Key("status.created_extrusion"),
+                                            );
+                                        }
                                     }
-                                }
-                                ui.separator();
-                                if icon_button(
-                                    ui,
-                                    "ruler",
-                                    translator.text("tool.measure"),
-                                    true,
-                                    self.measurement.active,
-                                )
-                                .clicked()
-                                {
-                                    self.toggle_measurement();
+                                    ToolbarTab::Design => {
+                                        let capabilities = self.session.kernel_capabilities();
+                                        let edge_count = self.selected_edges.len();
+                                        if tool_button(
+                                            ui,
+                                            "combine",
+                                            translator.text("tool.boolean"),
+                                            translator.text("tool.boolean"),
+                                            self.session
+                                                .document()
+                                                .features
+                                                .iter()
+                                                .filter(|feature| {
+                                                    !feature.primitive.is_reference_geometry()
+                                                })
+                                                .count()
+                                                >= 2,
+                                        )
+                                        .clicked()
+                                        {
+                                            let left = self.selected.filter(|id| {
+                                                self.session.document().feature(*id).is_some_and(
+                                                    |feature| {
+                                                        !feature.primitive.is_reference_geometry()
+                                                    },
+                                                )
+                                            });
+                                            let right =
+                                                self.session.document().features.iter().find_map(
+                                                    |feature| {
+                                                        (Some(feature.id) != left
+                                                            && !feature
+                                                                .primitive
+                                                                .is_reference_geometry())
+                                                        .then_some(feature.id)
+                                                    },
+                                                );
+                                            self.boolean_dialog = Some(BooleanDialogState {
+                                                operation: BooleanOperation::Union,
+                                                left,
+                                                right,
+                                                diagnostic: None,
+                                                error: None,
+                                            });
+                                            self.loft_dialog = None;
+                                            self.edge_modifier_dialog = None;
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "octagon",
+                                            translator.text("tool.chamfer"),
+                                            translator.text("tool.chamfer"),
+                                            edge_modifier_tool_enabled(
+                                                capabilities.chamfer,
+                                                edge_count,
+                                            ),
+                                        )
+                                        .clicked()
+                                            && let Some(edge) = self.selected_edges.last()
+                                        {
+                                            let size = self
+                                                .session
+                                                .scene()
+                                                .edge(edge)
+                                                .map_or(1.0, |edge| {
+                                                    (edge.geometry.length * 0.1).clamp(0.1, 5.0)
+                                                });
+                                            self.edge_modifier_dialog =
+                                                Some(EdgeModifierDialogState {
+                                                    kind: EdgeModifierKind::Chamfer,
+                                                    edges: self.selected_edges.clone(),
+                                                    size,
+                                                    diagnostic: None,
+                                                    error: None,
+                                                });
+                                            self.loft_dialog = None;
+                                            self.boolean_dialog = None;
+                                        }
+                                        if tool_button(
+                                            ui,
+                                            "radius",
+                                            translator.text("tool.fillet"),
+                                            translator.text("tool.fillet"),
+                                            edge_modifier_tool_enabled(
+                                                capabilities.fillet,
+                                                edge_count,
+                                            ),
+                                        )
+                                        .clicked()
+                                            && let Some(edge) = self.selected_edges.last()
+                                        {
+                                            let size = self
+                                                .session
+                                                .scene()
+                                                .edge(edge)
+                                                .map_or(1.0, |edge| {
+                                                    (edge.geometry.length * 0.1).clamp(0.1, 5.0)
+                                                });
+                                            self.edge_modifier_dialog =
+                                                Some(EdgeModifierDialogState {
+                                                    kind: EdgeModifierKind::Fillet,
+                                                    edges: self.selected_edges.clone(),
+                                                    size,
+                                                    diagnostic: None,
+                                                    error: None,
+                                                });
+                                            self.loft_dialog = None;
+                                            self.boolean_dialog = None;
+                                        }
+                                        ui.separator();
+                                        if tool_button(
+                                            ui,
+                                            "scan-search",
+                                            translator.text("tool.interference"),
+                                            translator.text("tool.interference"),
+                                            capabilities.interference_analysis,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.run_interference_analysis();
+                                        }
+                                    }
+                                    ToolbarTab::View => {
+                                        if tool_button(
+                                            ui,
+                                            "focus",
+                                            translator.text("tool.frame"),
+                                            translator.text("tool.frame"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.camera.frame_scene(self.session.scene());
+                                        }
+                                        ui.separator();
+                                        for (mode, icon, tooltip) in [
+                                            (
+                                                SelectionMode::Face,
+                                                "panel-top",
+                                                translator.text("tool.select_face"),
+                                            ),
+                                            (
+                                                SelectionMode::Edge,
+                                                "minus",
+                                                translator.text("tool.select_edge"),
+                                            ),
+                                            (
+                                                SelectionMode::Vertex,
+                                                "circle-dot",
+                                                translator.text("tool.select_vertex"),
+                                            ),
+                                        ] {
+                                            if icon_button(
+                                                ui,
+                                                icon,
+                                                tooltip,
+                                                true,
+                                                self.selection_mode == mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                self.selection_mode = mode;
+                                                self.clear_topology_selection();
+                                                self.measurement.entities.clear();
+                                                self.sync_viewport();
+                                            }
+                                        }
+                                        ui.separator();
+                                        if icon_button(
+                                            ui,
+                                            "ruler",
+                                            translator.text("tool.measure"),
+                                            true,
+                                            self.measurement.active,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.toggle_measurement();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1093,6 +1273,620 @@ impl CadxApp {
             });
     }
 
+    fn aec_toolbar(&mut self, ui: &mut egui::Ui, translator: &Translator) {
+        const TOOLS: [&str; 10] = [
+            "wall",
+            "slab",
+            "opening",
+            "levels",
+            "space",
+            "bim-attrs",
+            "schedule",
+            "quantity-takeoff",
+            "clash",
+            "ifc",
+        ];
+
+        egui::ScrollArea::horizontal()
+            .id_salt("aec_toolbar")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    for tool_id in TOOLS {
+                        let label = domain_tool_label(tool_id, DomainId::Aec, translator);
+                        if tool_button(ui, aec_tool_icon(tool_id), label, label, true).clicked() {
+                            self.open_domain_tool(tool_id);
+                        }
+                    }
+                });
+            });
+    }
+
+    fn pcb_toolbar(&mut self, ui: &mut egui::Ui, translator: &Translator) {
+        if tool_button(
+            ui,
+            "box",
+            translator.text("pcb.tool.board"),
+            translator.text("pcb.tool.board"),
+            true,
+        )
+        .clicked()
+        {
+            self.create_pcb_board();
+        }
+        if tool_button(
+            ui,
+            "circle-dot",
+            translator.text("pcb.tool.component"),
+            translator.text("pcb.tool.component"),
+            self.pcb_board.validate().is_ok(),
+        )
+        .clicked()
+        {
+            self.place_pcb_component();
+        }
+        if tool_button(
+            ui,
+            "combine",
+            translator.text("pcb.tool.routing"),
+            translator.text("pcb.tool.routing"),
+            true,
+        )
+        .clicked()
+        {
+            self.status = StatusMessage::Key("pcb.status.routing_ready");
+        }
+        if tool_button(
+            ui,
+            "triangle-alert",
+            translator.text("pcb.tool.drc"),
+            translator.text("pcb.tool.drc"),
+            true,
+        )
+        .clicked()
+        {
+            self.domain_report = Some(DomainReport::PcbDrc(pcb_drc::run(&self.pcb_board)));
+        }
+        if tool_button(
+            ui,
+            "layers",
+            translator.text("pcb.tool.stackup"),
+            translator.text("pcb.tool.stackup"),
+            true,
+        )
+        .clicked()
+        {
+            self.status = StatusMessage::Text(format!(
+                "{}: {}",
+                translator.text("pcb.status.stackup"),
+                self.pcb_board.layers.len()
+            ));
+        }
+        if tool_button(
+            ui,
+            "layers",
+            translator.text("pcb.tool.bom"),
+            translator.text("pcb.tool.bom"),
+            true,
+        )
+        .clicked()
+        {
+            self.domain_report = Some(DomainReport::PcbBom(self.pcb_board.bom()));
+        }
+        if tool_button(
+            ui,
+            "file-input",
+            translator.text("pcb.tool.gerber"),
+            translator.text("pcb.tool.gerber"),
+            true,
+        )
+        .clicked()
+        {
+            self.domain_report = Some(DomainReport::ExportPreview(pcb_export::gerber_bundle(
+                &self.pcb_board,
+            )));
+        }
+    }
+
+    fn create_pcb_board(&mut self) {
+        self.create_pcb_board_from(TransactionSource::Ui);
+    }
+
+    fn create_pcb_board_from(&mut self, source: TransactionSource) {
+        let board = PcbBoard::demo();
+        let _ = self.execute_from(
+            vec![ModelCommand::CreateBox {
+                name: board.name.clone(),
+                size: [board.width_mm, board.height_mm, board.thickness_mm],
+                position: [-board.width_mm * 0.5, -board.height_mm * 0.5, 0.0],
+            }],
+            StatusMessage::Key("pcb.status.board_created"),
+            source,
+        );
+        self.pcb_board = board;
+    }
+
+    fn place_pcb_component(&mut self) {
+        self.place_pcb_component_from(TransactionSource::Ui);
+    }
+
+    fn place_pcb_component_from(&mut self, source: TransactionSource) {
+        let index = u32::try_from(self.pcb_board.components.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let reference = format!("U{index}");
+        let position = [
+            14.0 + (f64::from(index) * 13.0) % (self.pcb_board.width_mm - 28.0),
+            14.0 + (f64::from(index) * 9.0) % (self.pcb_board.height_mm - 28.0),
+        ];
+        let size = [8.0, 8.0];
+        let _ = self.execute_from(
+            vec![ModelCommand::CreateBox {
+                name: format!("{reference} MCU"),
+                size: [size[0], size[1], 1.0],
+                position: [
+                    -self.pcb_board.width_mm * 0.5 + position[0] - size[0] * 0.5,
+                    -self.pcb_board.height_mm * 0.5 + position[1] - size[1] * 0.5,
+                    self.pcb_board.thickness_mm,
+                ],
+            }],
+            StatusMessage::Key("pcb.status.component_placed"),
+            source,
+        );
+        let linked_feature_id = self.selected;
+        self.pcb_board
+            .components
+            .push(cadx_ecad::layout::PcbComponent {
+                reference,
+                value: "MCU".into(),
+                footprint: "QFN-32".into(),
+                position_mm: position,
+                size_mm: size,
+                height_mm: 1.0,
+                rotation_deg: 0.0,
+                side: cadx_ecad::layout::ComponentSide::Top,
+                model_3d: Some("QFN-32.step".into()),
+                linked_feature_id,
+            });
+    }
+
+    fn domain_context(&self) -> DomainContext {
+        let spatial_entities = self
+            .session
+            .scene()
+            .parts
+            .iter()
+            .filter_map(|part| {
+                let (minimum_mm, maximum_mm) = part.mesh.positions.iter().fold(
+                    ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
+                    |(minimum, maximum), position| {
+                        let position = position.map(f64::from);
+                        (
+                            std::array::from_fn(|axis| minimum[axis].min(position[axis])),
+                            std::array::from_fn(|axis| maximum[axis].max(position[axis])),
+                        )
+                    },
+                );
+                minimum_mm
+                    .iter()
+                    .chain(maximum_mm.iter())
+                    .all(|value| value.is_finite())
+                    .then(|| cadx_domain_api::DomainSpatialEntity {
+                        feature_id: part.feature_id,
+                        name: part.name.clone(),
+                        minimum_mm,
+                        maximum_mm,
+                    })
+            })
+            .collect();
+        DomainContext {
+            document_name: self.session.document().name.clone(),
+            selected_feature_ids: self.selected.into_iter().collect(),
+            visible_solid_count: self.session.scene().parts.len(),
+            active_feature_count: self.session.document().features.len(),
+            selected_feature_name: self.selected.and_then(|id| {
+                self.session
+                    .document()
+                    .feature(id)
+                    .map(|feature| feature.name.clone())
+            }),
+            spatial_entities,
+        }
+    }
+
+    fn sync_domain_state(&mut self) {
+        let Some(value) = self
+            .session
+            .document()
+            .domain_data
+            .get("ecad.layout")
+            .and_then(|values| values.get("board"))
+        else {
+            self.pcb_board = PcbBoard::demo();
+            return;
+        };
+        match serde_json::from_value::<PcbBoard>(value.clone()) {
+            Ok(board) if board.validate().is_ok() => self.pcb_board = board,
+            Ok(_) => {
+                self.status = StatusMessage::Text("Stored ECAD board data is invalid".into());
+            }
+            Err(error) => self.status = StatusMessage::Text(error.to_string()),
+        }
+    }
+
+    fn route_domain_prompt(&mut self, prompt: &str) -> Option<DomainRoute> {
+        let normalized = prompt.to_ascii_lowercase();
+        let pcb_keyword = normalized.contains("pcb")
+            || normalized.contains("ecad")
+            || normalized.contains("gerber")
+            || normalized.contains("drc")
+            || normalized.contains("board")
+            || normalized.contains("netlist")
+            || normalized.contains("routing")
+            || normalized.contains("footprint")
+            || prompt.contains("电路")
+            || prompt.contains("网表")
+            || prompt.contains("布线")
+            || prompt.contains("封装");
+        let aec_keyword = normalized.contains("aec")
+            || normalized.contains("bim")
+            || normalized.contains("ifc")
+            || normalized.contains("wall")
+            || normalized.contains("slab")
+            || normalized.contains("building")
+            || prompt.contains("建筑")
+            || prompt.contains("墙")
+            || prompt.contains("楼板");
+        let mechanical_keyword = normalized.contains("dfm")
+            || normalized.contains("mcad")
+            || normalized.contains("feature tree")
+            || normalized.contains("extrude")
+            || normalized.contains("fillet")
+            || normalized.contains("chamfer")
+            || normalized.contains("bom")
+            || prompt.contains("制造")
+            || prompt.contains("工程图")
+            || prompt.contains("特征树")
+            || prompt.contains("拉伸")
+            || prompt.contains("倒角")
+            || prompt.contains("圆角")
+            || prompt.contains("物料");
+        let domain_keyword = pcb_keyword || aec_keyword || mechanical_keyword;
+        if !domain_keyword {
+            return None;
+        }
+        let routed_domain = if pcb_keyword {
+            DomainId::Ecad
+        } else if aec_keyword {
+            DomainId::Aec
+        } else {
+            DomainId::Mcad
+        };
+        self.active_domain = routed_domain;
+        let domain_context = self.domain_context();
+        let pack = self
+            .domain_bus
+            .enabled_packs()
+            .into_iter()
+            .find(|pack| pack.manifest().id == routed_domain)?;
+        let mut context_collector = ContextCollector::new(ContextSnapshot {
+            domain: Some(routed_domain),
+            document_name: domain_context.document_name.clone(),
+            selected_feature_ids: domain_context.selected_feature_ids.clone(),
+            visible_solid_count: domain_context.visible_solid_count,
+            active_feature_count: domain_context.active_feature_count,
+            ..ContextSnapshot::default()
+        });
+        if let Ok(serde_json::Value::Object(schema)) = serde_json::to_value(pack.inspector_schema())
+        {
+            context_collector.set_domain_schema(schema);
+        }
+        self.context_collector = context_collector;
+        Some(pack.route_natural_language(prompt, &domain_context))
+    }
+
+    fn dispatch_domain_route(&mut self, route: DomainRoute) {
+        self.dispatch_domain_execution(DomainExecution::with_action(route.rationale, route.action));
+    }
+
+    fn dispatch_domain_execution(&mut self, execution: DomainExecution) {
+        let DomainExecution {
+            summary,
+            actions,
+            issues,
+            artifacts,
+        } = execution;
+        let mut commands = Vec::new();
+        let mut deferred = Vec::new();
+        let mut board_update = None;
+        let mut component_updates = Vec::new();
+
+        for action in actions {
+            match action {
+                DomainAction::CreateSolidBox {
+                    name,
+                    size_mm,
+                    position_mm,
+                } => commands.push(ModelCommand::CreateBox {
+                    name,
+                    size: size_mm,
+                    position: position_mm,
+                }),
+                DomainAction::CreateSolidCylinder {
+                    name,
+                    radius_mm,
+                    height_mm,
+                    position_mm,
+                } => commands.push(ModelCommand::CreateCylinder {
+                    name,
+                    radius: radius_mm,
+                    height: height_mm,
+                    position: position_mm,
+                }),
+                DomainAction::CreateProfileExtrusion {
+                    name,
+                    profile_mm,
+                    height_mm,
+                    position_mm,
+                } => commands.push(ModelCommand::CreateExtrusion {
+                    name,
+                    profile: profile_mm,
+                    height: height_mm,
+                    position: position_mm,
+                }),
+                DomainAction::CreatePcbBoard {
+                    name,
+                    width_mm,
+                    height_mm,
+                    thickness_mm,
+                    layers,
+                } => match PcbBoard::rectangular(
+                    name.clone(),
+                    width_mm,
+                    height_mm,
+                    thickness_mm,
+                    layers,
+                ) {
+                    Ok(board) => {
+                        commands.push(ModelCommand::CreateBox {
+                            name,
+                            size: [width_mm, height_mm, thickness_mm],
+                            position: [-width_mm * 0.5, -height_mm * 0.5, 0.0],
+                        });
+                        board_update = Some(board);
+                    }
+                    Err(error) => {
+                        self.status = StatusMessage::Text(error.to_string());
+                        return;
+                    }
+                },
+                DomainAction::PlacePcbComponent {
+                    reference,
+                    value,
+                    footprint,
+                    position_mm,
+                    rotation_deg,
+                    side,
+                    model_3d,
+                } => {
+                    let descriptor = cadx_ecad::footprint_library()
+                        .iter()
+                        .find(|candidate| candidate.package.eq_ignore_ascii_case(&footprint))
+                        .unwrap_or(&cadx_ecad::footprint_library()[0]);
+                    let size = descriptor.body_size_mm;
+                    commands.push(ModelCommand::CreateBox {
+                        name: format!("{reference} {value}"),
+                        size: [size[0], size[1], descriptor.default_height_mm],
+                        position: [
+                            -self.pcb_board.width_mm * 0.5 + position_mm[0] - size[0] * 0.5,
+                            -self.pcb_board.height_mm * 0.5 + position_mm[1] - size[1] * 0.5,
+                            self.pcb_board.thickness_mm,
+                        ],
+                    });
+                    component_updates.push(cadx_ecad::layout::PcbComponent {
+                        reference,
+                        value,
+                        footprint,
+                        position_mm,
+                        size_mm: size,
+                        height_mm: descriptor.default_height_mm,
+                        rotation_deg,
+                        side: if side.eq_ignore_ascii_case("bottom") {
+                            cadx_ecad::layout::ComponentSide::Bottom
+                        } else {
+                            cadx_ecad::layout::ComponentSide::Top
+                        },
+                        model_3d,
+                        linked_feature_id: None,
+                    });
+                }
+                DomainAction::UpsertDomainMetadata {
+                    entity_key,
+                    namespace,
+                    values,
+                } => {
+                    let value = match serde_json::to_value(values) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.status = StatusMessage::Text(error.to_string());
+                            return;
+                        }
+                    };
+                    commands.push(ModelCommand::SetDomainData {
+                        namespace,
+                        entity_key,
+                        value,
+                    });
+                }
+                action => deferred.push(action),
+            }
+        }
+
+        let mut persisted_board = None;
+        if board_update.is_some() || !component_updates.is_empty() {
+            let mut board = board_update.unwrap_or_else(|| self.pcb_board.clone());
+            board.components.extend(component_updates);
+            if let Err(error) = board.validate() {
+                self.status = StatusMessage::Text(error.to_string());
+                return;
+            }
+            let value = match serde_json::to_value(&board) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = StatusMessage::Text(error.to_string());
+                    return;
+                }
+            };
+            commands.push(ModelCommand::SetDomainData {
+                namespace: "ecad.layout".into(),
+                entity_key: "board".into(),
+                value,
+            });
+            persisted_board = Some(board);
+        }
+
+        if !commands.is_empty()
+            && self
+                .execute_from(
+                    commands,
+                    StatusMessage::Text(summary.clone()),
+                    TransactionSource::DomainPack,
+                )
+                .is_err()
+        {
+            return;
+        }
+        if let Some(board) = persisted_board {
+            self.pcb_board = board;
+        }
+        for action in deferred {
+            self.dispatch_non_geometry_domain_action(action);
+        }
+        if !artifacts.is_empty() {
+            self.domain_report = Some(DomainReport::Artifacts(artifacts));
+        }
+        if !issues.is_empty() {
+            let issue_summary = issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.code, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.status = StatusMessage::Text(issue_summary);
+        } else if self.domain_report.is_none() {
+            self.status = StatusMessage::Text(summary);
+        }
+    }
+
+    fn dispatch_non_geometry_domain_action(&mut self, action: DomainAction) {
+        match action {
+            DomainAction::RunCheck { check } => match check.as_str() {
+                "drc" => {
+                    self.domain_report = Some(DomainReport::PcbDrc(pcb_drc::run(&self.pcb_board)));
+                }
+                "dfm" => self.run_mechanical_dfm(),
+                "drawing" => self.run_mechanical_drawing_check(),
+                "interference" | "clash" => self.run_interference_analysis(),
+                _ => self.status = StatusMessage::Text(format!("Domain check: {check}")),
+            },
+            DomainAction::GenerateBom => match self.active_domain {
+                DomainId::Ecad => {
+                    self.domain_report = Some(DomainReport::PcbBom(self.pcb_board.bom()));
+                }
+                DomainId::Aec => self.run_domain_tool("schedule"),
+                DomainId::Mcad => self.run_mechanical_bom(),
+            },
+            DomainAction::Export { format } if format == "gerber" => {
+                match pcb_export::manufacturing_bundle(&self.pcb_board) {
+                    Ok(files) => self.domain_report = Some(DomainReport::ExportPreview(files)),
+                    Err(error) => self.status = StatusMessage::Text(error.to_string()),
+                }
+            }
+            DomainAction::Export { format } if format == "ifc" => self.run_domain_tool("ifc"),
+            DomainAction::Export { format } => {
+                self.status = StatusMessage::Text(format!("Domain export: {format}"));
+            }
+            DomainAction::OpenPanel { panel } => self.open_domain_panel(&panel),
+            DomainAction::CreateSolidBox { .. }
+            | DomainAction::CreateSolidCylinder { .. }
+            | DomainAction::CreateProfileExtrusion { .. }
+            | DomainAction::CreatePcbBoard { .. }
+            | DomainAction::PlacePcbComponent { .. }
+            | DomainAction::UpsertDomainMetadata { .. } => {
+                unreachable!("geometry actions are extracted before deferred dispatch")
+            }
+        }
+    }
+
+    fn run_mechanical_dfm(&mut self) {
+        let parts = self
+            .session
+            .scene()
+            .parts
+            .iter()
+            .map(|part| {
+                let (minimum, maximum) = part.mesh.positions.iter().fold(
+                    ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
+                    |(minimum, maximum), position| {
+                        let position = position.map(f64::from);
+                        (
+                            [
+                                minimum[0].min(position[0]),
+                                minimum[1].min(position[1]),
+                                minimum[2].min(position[2]),
+                            ],
+                            [
+                                maximum[0].max(position[0]),
+                                maximum[1].max(position[1]),
+                                maximum[2].max(position[2]),
+                            ],
+                        )
+                    },
+                );
+                mechanical_dfm::PartCheckInput {
+                    id: part.feature_id.to_string(),
+                    name: part.name.clone(),
+                    bbox_mm: [
+                        (maximum[0] - minimum[0]).max(0.001),
+                        (maximum[1] - minimum[1]).max(0.001),
+                        (maximum[2] - minimum[2]).max(0.001),
+                    ],
+                    minimum_wall_mm: None,
+                    smallest_hole_mm: None,
+                    material: part.material.as_ref().map(|material| material.name.clone()),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.domain_report = Some(DomainReport::MechanicalDfm(mechanical_dfm::inspect(&parts)));
+    }
+
+    fn run_mechanical_drawing_check(&mut self) {
+        self.domain_report = Some(DomainReport::MechanicalDrawing(
+            mechanical_standards::DrawingSheet::default().inspect(),
+        ));
+    }
+
+    fn run_mechanical_bom(&mut self) {
+        let sources = self
+            .session
+            .document()
+            .features
+            .iter()
+            .filter(|feature| !feature.primitive.is_reference_geometry())
+            .map(|feature| mechanical_bom::BomSource {
+                part_number: format!("CADX-{:04}", feature.id),
+                description: feature.name.clone(),
+                material: feature
+                    .material
+                    .as_ref()
+                    .map(|material| material.name.clone()),
+                revision: Some("A".into()),
+            })
+            .collect::<Vec<_>>();
+        self.domain_report = Some(DomainReport::MechanicalBom(mechanical_bom::generate(
+            sources,
+        )));
+    }
+
     fn model_panel(&mut self, root: &mut egui::Ui) {
         if !self.model_panel_open {
             return;
@@ -1120,6 +1914,7 @@ impl CadxApp {
                         );
                     });
                 });
+                self.domain_inspector_summary(ui, &translator);
                 ui.add_space(8.0);
                 appearance::section_label(ui, translator.text("panel.features"));
                 ui.add_space(4.0);
@@ -1204,6 +1999,108 @@ impl CadxApp {
                         }
                     });
             });
+    }
+
+    fn domain_inspector_summary(&self, ui: &mut egui::Ui, translator: &Translator) {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(appearance::icon("layers", 12.0).color(appearance::ACCENT));
+            ui.label(
+                egui::RichText::new(match self.active_domain {
+                    DomainId::Ecad => translator.text("domain.pcb_inspector"),
+                    DomainId::Aec => translator.text("domain.aec_inspector"),
+                    DomainId::Mcad => translator.text("domain.mechanical_inspector"),
+                })
+                .size(10.0)
+                .strong(),
+            );
+        });
+        if self.active_domain == DomainId::Ecad {
+            ui.label(format!(
+                "{}  {} x {} x {} mm",
+                self.pcb_board.name,
+                self.pcb_board.width_mm,
+                self.pcb_board.height_mm,
+                self.pcb_board.thickness_mm
+            ));
+            ui.label(format!(
+                "{}: {}  ·  {}: {}",
+                translator.text("pcb.report.components"),
+                self.pcb_board.components.len(),
+                translator.text("domain.layers"),
+                self.pcb_board.layers.len()
+            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {:.2} mm  ·  {} {:.2} mm",
+                    translator.text("domain.min_trace"),
+                    self.pcb_board.rules.min_trace_width_mm,
+                    translator.text("domain.clearance"),
+                    self.pcb_board.rules.min_clearance_mm
+                ))
+                .monospace()
+                .size(9.0)
+                .color(appearance::TEXT_MUTED),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}: {}  ·  {}: {}  ·  {}: {}",
+                    translator.text("domain.nets"),
+                    self.pcb_board.nets.len(),
+                    translator.text("domain.routes"),
+                    self.pcb_board.traces.len(),
+                    translator.text("domain.vias"),
+                    self.pcb_board.vias.len()
+                ))
+                .monospace()
+                .size(9.0)
+                .color(appearance::TEXT_MUTED),
+            );
+        } else if self.active_domain == DomainId::Aec {
+            let bim_records = self
+                .session
+                .document()
+                .domain_data
+                .get("aec.bim")
+                .map_or(0, BTreeMap::len);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  ·  {}",
+                    translator.text("domain.bim_level"),
+                    translator.text("domain.ifc_reference")
+                ))
+                .color(appearance::TEXT_MUTED),
+            );
+            ui.label(format!(
+                "{}: {}  ·  {}: {}",
+                translator.text("domain.bim_records"),
+                bim_records,
+                translator.text("domain.visible_parts"),
+                self.session.scene().parts.len()
+            ));
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  ·  {}",
+                    translator.text("domain.gb_standard"),
+                    translator.text("domain.first_angle")
+                ))
+                .color(appearance::TEXT_MUTED),
+            );
+            ui.label(format!(
+                "{}: {}  ·  {}: {}  ·  {}: {}",
+                translator.text("domain.visible_parts"),
+                self.session.scene().parts.len(),
+                translator.text("domain.assemblies"),
+                self.session.document().assemblies.len(),
+                translator.text("domain.standard_tools"),
+                self.ai_tools.tools_for(DomainId::Mcad).len()
+            ));
+        }
+        ui.add_space(4.0);
+        ui.separator();
     }
 
     fn assembly_occurrence_row(
@@ -1309,17 +2206,29 @@ impl CadxApp {
             let selected = self.selected == Some(feature.id);
             let label = format!("{}  {}", translator.text(primitive_key), feature.name);
             let row_width = (ui.available_width() - 113.0).max(80.0);
-            if ui
-                .add_sized(
-                    [row_width, 30.0],
-                    egui::Button::selectable(selected, (appearance::icon(icon_name, 13.0), label)),
-                )
-                .clicked()
-            {
+            let feature_response = ui.add_sized(
+                [row_width, 30.0],
+                egui::Button::selectable(selected, (appearance::icon(icon_name, 13.0), label)),
+            );
+            if feature_response.clicked() {
                 self.selected = Some(feature.id);
                 self.clear_topology_selection();
                 self.sync_viewport();
             }
+            feature_response.context_menu(|ui| {
+                let tool_ids: &[&str] = match self.active_domain {
+                    DomainId::Ecad => &["drc", "bom", "gerber"],
+                    DomainId::Aec => &["bim-attrs", "quantity-takeoff", "clash"],
+                    DomainId::Mcad => &["drawing", "dfm", "bom"],
+                };
+                for &tool_id in tool_ids {
+                    let label = domain_tool_label(tool_id, self.active_domain, translator);
+                    if ui.button(label).clicked() {
+                        self.run_domain_tool(tool_id);
+                        ui.close();
+                    }
+                }
+            });
 
             let visibility_icon = if feature.visible { "eye" } else { "eye-off" };
             if icon_button(
@@ -3201,6 +4110,8 @@ impl CadxApp {
                 );
                 ui.add_space(5.0);
                 ui.separator();
+                self.domain_tools_panel(ui, &translator);
+                ui.separator();
 
                 let composer_height = 126.0;
                 let transcript_height = (ui.available_height() - composer_height).max(90.0);
@@ -3216,6 +4127,7 @@ impl CadxApp {
                                     conversation_entry(ui, entry, &translator);
                                     ui.add_space(7.0);
                                 }
+                                self.domain_intent_review(ui, &translator);
                                 self.ai_plan_review(ui, &translator);
                                 if self.ai_pending {
                                     ui.horizontal(|ui| {
@@ -3251,6 +4163,10 @@ impl CadxApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_send = !self.ai_pending
                             && self.pending_ai_plan.is_none()
+                            && self
+                                .last_intent_diff
+                                .as_ref()
+                                .is_none_or(|intent| intent.accepted)
                             && !self.ai_input.trim().is_empty();
                         let send = tool_button(
                             ui,
@@ -3266,6 +4182,445 @@ impl CadxApp {
                     });
                 });
             });
+    }
+
+    fn domain_intent_review(&mut self, ui: &mut egui::Ui, translator: &Translator) {
+        let Some(intent) = self
+            .last_intent_diff
+            .as_ref()
+            .filter(|intent| !intent.accepted)
+        else {
+            return;
+        };
+        appearance::section_label(ui, translator.text("ai.intent_review"));
+        ui.label(
+            egui::RichText::new(intent.summary.as_str())
+                .size(11.0)
+                .color(appearance::TEXT),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "{} · {}",
+                intent.domain.slug(),
+                intent.actions.len()
+            ))
+            .monospace()
+            .size(9.0)
+            .color(appearance::TEXT_MUTED),
+        );
+        let mut apply = false;
+        let mut discard = false;
+        ui.horizontal(|ui| {
+            apply = tool_button(
+                ui,
+                "check",
+                translator.text("ai.approve"),
+                translator.text("ai.approve"),
+                true,
+            )
+            .clicked();
+            discard = tool_button(
+                ui,
+                "x",
+                translator.text("ai.reject"),
+                translator.text("ai.reject"),
+                true,
+            )
+            .clicked();
+        });
+        if apply {
+            self.approve_domain_intent();
+        } else if discard {
+            self.last_intent_diff = None;
+            self.conversation.push(ConversationEntry {
+                speaker: Speaker::Assistant,
+                content: LocalizedText::Key("ai.plan_discarded"),
+            });
+        }
+        ui.add_space(8.0);
+    }
+
+    fn approve_domain_intent(&mut self) {
+        let Some(mut intent) = self.last_intent_diff.take() else {
+            return;
+        };
+        let actions = intent.actions.clone();
+        for action in actions {
+            self.dispatch_domain_route(DomainRoute {
+                action,
+                confidence: 1.0,
+                rationale: intent.summary.clone(),
+            });
+        }
+        intent.accept();
+        self.last_intent_diff = Some(intent);
+        self.conversation.push(ConversationEntry {
+            speaker: Speaker::Assistant,
+            content: LocalizedText::Key("ai.intent_applied"),
+        });
+    }
+
+    fn domain_tools_panel(&mut self, ui: &mut egui::Ui, translator: &Translator) {
+        let Some(pack) = self
+            .domain_bus
+            .enabled_packs()
+            .into_iter()
+            .find(|pack| pack.manifest().id == self.active_domain)
+        else {
+            return;
+        };
+        let tools = pack.tools().to_vec();
+        ui.horizontal(|ui| {
+            ui.label(appearance::icon("layers", 13.0).color(appearance::ACCENT));
+            ui.label(
+                egui::RichText::new(translator.text("domain.tools"))
+                    .size(10.0)
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(domain_description(self.active_domain, translator))
+                    .size(9.0)
+                    .color(appearance::TEXT_MUTED),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {}",
+                    translator.text("domain.tools_count"),
+                    tools.len()
+                ))
+                .size(9.0)
+                .color(appearance::TEXT_FAINT),
+            );
+        });
+        ui.add_space(4.0);
+        let mut categories = Vec::new();
+        for tool in &tools {
+            if !categories.contains(&tool.category) {
+                categories.push(tool.category);
+            }
+        }
+        for category in categories {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(domain_category_label(category, translator))
+                        .size(9.0)
+                        .strong()
+                        .color(appearance::TEXT_FAINT),
+                );
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    for tool in tools.iter().filter(|tool| tool.category == category) {
+                        let label = domain_tool_label(tool.id, self.active_domain, translator);
+                        if tool_button(ui, tool.icon, label, label, true).clicked() {
+                            self.open_domain_tool(tool.id);
+                        }
+                    }
+                });
+            });
+        }
+        if let Some((domain, tool_id)) = self.domain_tool_form.clone()
+            && domain == self.active_domain
+            && let Some(panel) = pack.tool_panel(&tool_id)
+        {
+            self.domain_schema_form(ui, translator, &tool_id, panel);
+        }
+    }
+
+    fn open_domain_tool(&mut self, tool_id: &str) {
+        let has_panel = self
+            .domain_bus
+            .enabled_packs()
+            .into_iter()
+            .find(|pack| pack.manifest().id == self.active_domain)
+            .and_then(|pack| pack.tool_panel(tool_id))
+            .is_some();
+        if has_panel {
+            self.domain_tool_form = Some((self.active_domain, tool_id.to_string()));
+        } else {
+            self.run_domain_tool(tool_id);
+        }
+    }
+
+    fn run_domain_tool(&mut self, tool_id: &str) {
+        self.run_domain_tool_with_parameters(tool_id, DomainParameters::new());
+    }
+
+    fn run_domain_tool_with_parameters(&mut self, tool_id: &str, parameters: DomainParameters) {
+        let request =
+            DomainToolRequest::new(tool_id, self.domain_context()).with_parameters(parameters);
+        match self.domain_bus.execute(self.active_domain, &request) {
+            Ok(execution) => self.dispatch_domain_execution(execution),
+            Err(error) => self.status = StatusMessage::Text(error.to_string()),
+        }
+    }
+
+    fn domain_schema_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        translator: &Translator,
+        tool_id: &str,
+        panel: cadx_domain_api::DomainPanelSchema,
+    ) {
+        ui.add_space(4.0);
+        ui.separator();
+        let key = (self.active_domain, panel.id.to_string());
+        let values = self
+            .domain_form_values
+            .entry(key.clone())
+            .or_insert_with(|| {
+                panel
+                    .resolve_parameters(&DomainParameters::new())
+                    .unwrap_or_default()
+            });
+        let mut close_form = false;
+        ui.horizontal(|ui| {
+            ui.label(appearance::icon("list-tree", 12.0).color(appearance::ACCENT));
+            ui.label(egui::RichText::new(panel.label).size(10.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, "x", "Close", true, false).clicked() {
+                    close_form = true;
+                }
+            });
+        });
+        let active_domain = self.active_domain;
+        egui::Grid::new(("domain_schema", active_domain, panel.id))
+            .num_columns(2)
+            .spacing([8.0, 5.0])
+            .show(ui, |ui| {
+                for field in panel.fields {
+                    ui.label(
+                        egui::RichText::new(field.label)
+                            .size(9.0)
+                            .color(appearance::TEXT_MUTED),
+                    );
+                    domain_field_editor(ui, field, values);
+                    ui.end_row();
+                }
+            });
+        ui.add_space(3.0);
+        if tool_button(
+            ui,
+            "play",
+            translator.text("tool.apply"),
+            translator.text("tool.apply"),
+            true,
+        )
+        .clicked()
+        {
+            let parameters = self
+                .domain_form_values
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            self.run_domain_tool_with_parameters(tool_id, parameters);
+        }
+        if close_form {
+            self.domain_tool_form = None;
+        }
+    }
+
+    fn open_domain_panel(&mut self, tool_id: &str) {
+        match (self.active_domain, tool_id) {
+            (DomainId::Mcad, "feature-tree") => {
+                self.model_panel_open = true;
+                self.status = StatusMessage::Text("MCAD feature tree".into());
+            }
+            (DomainId::Mcad, "sketch") => {
+                self.toolbar_tab = ToolbarTab::Create;
+                self.status = StatusMessage::Key("tool.sketch");
+            }
+            (DomainId::Mcad, "extrude") => {
+                self.toolbar_tab = ToolbarTab::Create;
+                self.status = StatusMessage::Key("tool.extrusion");
+            }
+            (DomainId::Mcad, "edge-modifiers") => {
+                self.toolbar_tab = ToolbarTab::Design;
+                self.status = StatusMessage::Text("MCAD chamfer / fillet".into());
+            }
+            (DomainId::Mcad, "drawing" | "standards-check") => {
+                self.run_mechanical_drawing_check();
+            }
+            (DomainId::Mcad, "dfm") => self.run_mechanical_dfm(),
+            (DomainId::Mcad, "bom") => self.run_mechanical_bom(),
+            (DomainId::Mcad, "interference") | (DomainId::Aec, "clash") => {
+                self.run_interference_analysis();
+            }
+            (DomainId::Mcad, "ai-part") => {
+                self.ai_input = "Create a mechanical bracket".into();
+            }
+            (DomainId::Aec, "wall" | "slab" | "opening" | "levels" | "bim-attrs") => {
+                self.status = StatusMessage::Text(format!("AEC {tool_id}"));
+            }
+            (DomainId::Aec, "space" | "quantity-takeoff") => {
+                self.status = StatusMessage::Text(format!(
+                    "AEC {}: {}",
+                    tool_id,
+                    self.session.document().features.len()
+                ));
+            }
+            (DomainId::Aec, "ifc") => {
+                self.status = StatusMessage::Text("IFC export preview".into());
+            }
+            (DomainId::Aec, "schedule") => {
+                self.status = StatusMessage::Text(format!(
+                    "AEC schedule: {}",
+                    self.session.document().features.len()
+                ));
+            }
+            (DomainId::Ecad, "board") => {
+                self.status = StatusMessage::Text("ECAD board".into());
+            }
+            (
+                DomainId::Ecad,
+                "schematic" | "netlist" | "footprint-library" | "placement" | "3d-link",
+            ) => {
+                self.status = StatusMessage::Text(format!("ECAD {tool_id}"));
+            }
+            (DomainId::Ecad, "drc") => {
+                self.domain_report = Some(DomainReport::PcbDrc(pcb_drc::run(&self.pcb_board)));
+            }
+            (DomainId::Ecad, "bom") => {
+                self.domain_report = Some(DomainReport::PcbBom(self.pcb_board.bom()));
+            }
+            (DomainId::Ecad, "gerber") => {
+                self.domain_report = Some(DomainReport::ExportPreview(pcb_export::gerber_bundle(
+                    &self.pcb_board,
+                )));
+            }
+            (DomainId::Ecad, "routing" | "stackup" | "diff-pair" | "via") => {
+                self.status = StatusMessage::Key("pcb.status.routing_ready");
+            }
+            _ => {}
+        }
+    }
+
+    fn domain_report_window(&mut self, context: &egui::Context) {
+        let Some(report) = self.domain_report.take() else {
+            return;
+        };
+        let translator = self.translator.clone();
+        let mut open = true;
+        egui::Window::new(translator.text("domain.report"))
+            .open(&mut open)
+            .default_width(540.0)
+            .resizable(true)
+            .show(context, |ui| match &report {
+                DomainReport::MechanicalDfm(report) => {
+                    ui.label(translator.text("mechanical.report.dfm"));
+                    ui.label(format!(
+                        "{}: {}",
+                        translator.text("domain.checked"),
+                        report.checked_parts
+                    ));
+                    for issue in &report.issues {
+                        ui.label(format!(
+                            "[{:?}] {} · {}",
+                            issue.severity, issue.code, issue.message
+                        ));
+                    }
+                }
+                DomainReport::MechanicalDrawing(issues) => {
+                    ui.label(translator.text("mechanical.report.drawing"));
+                    if issues.is_empty() {
+                        ui.colored_label(appearance::ACCENT, translator.text("domain.no_issues"));
+                    }
+                    for issue in issues {
+                        ui.label(format!(
+                            "[{:?}] {} · {}",
+                            issue.severity, issue.code, issue.message
+                        ));
+                    }
+                }
+                DomainReport::MechanicalBom(items) => {
+                    ui.label(translator.text("mechanical.report.bom"));
+                    for item in items {
+                        ui.label(format!(
+                            "{}  x{}  {}{}",
+                            item.part_number,
+                            item.quantity,
+                            item.description,
+                            item.material
+                                .as_deref()
+                                .map_or(String::new(), |material| format!(" · {material}"))
+                        ));
+                    }
+                }
+                DomainReport::PcbDrc(report) => {
+                    ui.label(translator.text("pcb.report.drc"));
+                    ui.label(format!(
+                        "{}: {} · {}: {}",
+                        translator.text("pcb.report.components"),
+                        report.checked_components,
+                        translator.text("pcb.report.traces"),
+                        report.checked_traces
+                    ));
+                    if report.issues.is_empty() {
+                        ui.colored_label(appearance::ACCENT, translator.text("domain.no_issues"));
+                    }
+                    for issue in &report.issues {
+                        ui.label(format!(
+                            "[{:?}] {} · {}",
+                            issue.severity, issue.code, issue.message
+                        ));
+                    }
+                }
+                DomainReport::PcbBom(items) => {
+                    ui.label(translator.text("pcb.report.bom"));
+                    for (reference, value, footprint, quantity) in items {
+                        ui.label(format!("{reference}  x{quantity}  {value} · {footprint}"));
+                    }
+                }
+                DomainReport::ExportPreview(files) => {
+                    ui.label(translator.text("pcb.report.export"));
+                    for file in files {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                appearance::icon("file-input", 12.0).color(appearance::ACCENT),
+                            );
+                            ui.label(file.name.as_str());
+                            ui.label(
+                                egui::RichText::new(format!("{} bytes", file.contents.len()))
+                                    .monospace()
+                                    .color(appearance::TEXT_MUTED),
+                            );
+                        });
+                    }
+                }
+                DomainReport::Artifacts(artifacts) => {
+                    for artifact in artifacts {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                appearance::icon("file-output", 12.0).color(appearance::ACCENT),
+                            );
+                            ui.label(artifact.name.as_str());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {} bytes",
+                                    artifact.media_type,
+                                    artifact.contents.len()
+                                ))
+                                .monospace()
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt(("domain_artifact", artifact.name.as_str()))
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&artifact.contents).monospace(),
+                                    )
+                                    .selectable(true)
+                                    .wrap(),
+                                );
+                            });
+                    }
+                }
+            });
+        if open {
+            self.domain_report = Some(report);
+        }
     }
 
     fn boolean_dialog(&mut self, context: &egui::Context) {
@@ -4595,6 +5950,7 @@ impl eframe::App for CadxApp {
         self.interference_dialog(ui.ctx());
         self.measurement_panel(ui.ctx());
         self.sketch_dimension_dialog(ui.ctx());
+        self.domain_report_window(ui.ctx());
         if self.ai_pending {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -4633,6 +5989,208 @@ fn tool_button(
         .min_size(egui::vec2(0.0, 30.0)),
     )
     .on_hover_text(tooltip)
+}
+
+fn domain_tool_label<'a>(id: &'a str, domain: DomainId, translator: &'a Translator) -> &'a str {
+    let key = match id {
+        "feature-tree" => "mechanical.tool.feature_tree",
+        "sketch" => "mechanical.tool.sketch",
+        "extrude" => "mechanical.tool.extrude",
+        "edge-modifiers" => "mechanical.tool.edge_modifiers",
+        "drawing" => "mechanical.tool.drawing",
+        "standards-check" => "mechanical.tool.standards",
+        "standard-parts" => "mechanical.tool.standard_parts",
+        "assembly" => "mechanical.tool.assembly",
+        "interference" => "mechanical.tool.interference",
+        "dfm" => "mechanical.tool.dfm",
+        "ai-part" => "mechanical.tool.ai_part",
+        "bom" => {
+            if domain == DomainId::Ecad {
+                "pcb.tool.bom"
+            } else {
+                "mechanical.tool.bom"
+            }
+        }
+        "board" => "pcb.tool.board",
+        "placement" => "pcb.tool.component",
+        "routing" => "pcb.tool.routing",
+        "drc" => "pcb.tool.drc",
+        "stackup" => "pcb.tool.stackup",
+        "3d-link" => "pcb.tool.link_3d",
+        "gerber" => "pcb.tool.gerber",
+        "wall" => "aec.tool.wall",
+        "slab" => "aec.tool.slab",
+        "opening" => "aec.tool.opening",
+        "levels" => "aec.tool.levels",
+        "space" => "aec.tool.space",
+        "bim-attrs" => "aec.tool.bim_attrs",
+        "ifc" => "aec.tool.ifc",
+        "schedule" => "aec.tool.schedule",
+        "quantity-takeoff" => "aec.tool.quantity_takeoff",
+        "clash" => "aec.tool.clash",
+        "schematic" => "pcb.tool.schematic",
+        "netlist" => "pcb.tool.netlist",
+        "footprint-library" => "pcb.tool.footprint_library",
+        "diff-pair" => "pcb.tool.diff_pair",
+        "via" => "pcb.tool.via",
+        _ => id,
+    };
+    translator.text(key)
+}
+
+fn domain_description(domain: DomainId, translator: &Translator) -> &str {
+    translator.text(match domain {
+        DomainId::Mcad => "domain.mcad_description",
+        DomainId::Aec => "domain.aec_description",
+        DomainId::Ecad => "domain.ecad_description",
+    })
+}
+
+fn domain_category_label<'a>(category: &str, translator: &'a Translator) -> &'a str {
+    let key = match category {
+        "2D" => "domain.category.2d",
+        "3D" => "domain.category.3d",
+        "AEC" => "domain.category.aec",
+        "AI" => "domain.category.ai",
+        "Analysis" => "domain.category.analysis",
+        "BIM" => "domain.category.bim",
+        "ECAD" => "domain.category.ecad",
+        "Export" => "domain.category.export",
+        "MCAD" => "domain.category.mcad",
+        _ => "domain.category.other",
+    };
+    translator.text(key)
+}
+
+fn aec_tool_icon(id: &str) -> &'static str {
+    match id {
+        "wall" => "panel-top",
+        "slab" => "square",
+        "opening" => "door-open",
+        "levels" => "layers",
+        "space" => "cuboid",
+        "bim-attrs" => "list-tree",
+        "ifc" => "file-output",
+        "schedule" => "table",
+        "quantity-takeoff" => "calculator",
+        "clash" => "scan-search",
+        _ => "circle",
+    }
+}
+
+fn domain_field_editor(
+    ui: &mut egui::Ui,
+    field: &DomainFieldSchema,
+    values: &mut DomainParameters,
+) {
+    let value = values
+        .entry(field.id.to_string())
+        .or_insert_with(|| default_domain_field_value(field));
+    ui.horizontal(|ui| {
+        match field.kind {
+            DomainFieldKind::Text | DomainFieldKind::Select => {
+                if !matches!(value, DomainFieldValue::Text(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::Text(text) = value else {
+                    unreachable!("text field value is normalized before editing")
+                };
+                if field.kind == DomainFieldKind::Select {
+                    egui::ComboBox::from_id_salt(("domain_select", field.id))
+                        .selected_text(text.as_str())
+                        .width(128.0)
+                        .show_ui(ui, |ui| {
+                            for option in field.options {
+                                ui.selectable_value(text, option.value.to_string(), option.label);
+                            }
+                        });
+                } else {
+                    ui.add(egui::TextEdit::singleline(text).desired_width(148.0));
+                }
+            }
+            DomainFieldKind::Integer => {
+                if !matches!(value, DomainFieldValue::Integer(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::Integer(number) = value else {
+                    unreachable!("integer field value is normalized before editing")
+                };
+                ui.add(egui::DragValue::new(number).speed(1));
+            }
+            DomainFieldKind::Decimal | DomainFieldKind::LengthMm | DomainFieldKind::AngleDeg => {
+                if !matches!(value, DomainFieldValue::Decimal(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::Decimal(number) = value else {
+                    unreachable!("decimal field value is normalized before editing")
+                };
+                ui.add(egui::DragValue::new(number).speed(0.1).max_decimals(4));
+            }
+            DomainFieldKind::Boolean => {
+                if !matches!(value, DomainFieldValue::Boolean(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::Boolean(enabled) = value else {
+                    unreachable!("boolean field value is normalized before editing")
+                };
+                ui.checkbox(enabled, "");
+            }
+            DomainFieldKind::EntityReference => {
+                if !matches!(value, DomainFieldValue::EntityReference(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::EntityReference(reference) = value else {
+                    unreachable!("entity field value is normalized before editing")
+                };
+                ui.add(egui::DragValue::new(reference).speed(1));
+            }
+            DomainFieldKind::Color => {
+                if !matches!(value, DomainFieldValue::Color(_)) {
+                    *value = default_domain_field_value(field);
+                }
+                let DomainFieldValue::Color(color) = value else {
+                    unreachable!("color field value is normalized before editing")
+                };
+                ui.add(egui::TextEdit::singleline(color).desired_width(108.0));
+            }
+        }
+        if let Some(unit) = field.unit {
+            ui.label(
+                egui::RichText::new(unit)
+                    .monospace()
+                    .size(9.0)
+                    .color(appearance::TEXT_FAINT),
+            );
+        }
+    });
+}
+
+fn default_domain_field_value(field: &DomainFieldSchema) -> DomainFieldValue {
+    let default = field.default_value.unwrap_or_default();
+    match field.kind {
+        DomainFieldKind::Text | DomainFieldKind::Select => DomainFieldValue::Text(default.into()),
+        DomainFieldKind::Integer => {
+            DomainFieldValue::Integer(default.parse::<i64>().unwrap_or_default())
+        }
+        DomainFieldKind::Decimal | DomainFieldKind::LengthMm | DomainFieldKind::AngleDeg => {
+            DomainFieldValue::Decimal(default.parse::<f64>().unwrap_or_default())
+        }
+        DomainFieldKind::Boolean => {
+            DomainFieldValue::Boolean(default.parse::<bool>().unwrap_or_default())
+        }
+        DomainFieldKind::EntityReference => {
+            DomainFieldValue::EntityReference(default.parse::<u64>().unwrap_or_default())
+        }
+        DomainFieldKind::Color => DomainFieldValue::Color(default.into()),
+    }
+}
+
+const fn domain_icon(domain: DomainId) -> &'static str {
+    match domain {
+        DomainId::Mcad => "boxes",
+        DomainId::Aec => "building-2",
+        DomainId::Ecad => "layers",
+    }
 }
 
 fn assembly_mate_kind_key(kind: &AssemblyMateKind) -> &'static str {

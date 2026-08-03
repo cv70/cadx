@@ -1,4 +1,4 @@
-use cadx_app::{DocumentState, plan_step_import};
+use cadx_app::{DocumentState, TransactionSource, plan_step_import};
 use cadx_core::domain::CadDocument;
 use cadx_io::{
     DOCUMENT_EXTENSION, load_document, read_step, save_document, write_3mf, write_binary_stl,
@@ -30,6 +30,7 @@ impl CadxApp {
         self.last_sketch_failure = None;
         self.last_sketch_failure_feature = None;
         self.sketch_dimension_editor = None;
+        self.sync_domain_state();
         self.status = StatusMessage::Key("status.new_document");
         self.sync_viewport();
     }
@@ -67,6 +68,7 @@ impl CadxApp {
                 self.last_sketch_failure = None;
                 self.last_sketch_failure_feature = None;
                 self.sketch_dimension_editor = None;
+                self.sync_domain_state();
                 self.clear_topology_selection();
                 self.clear_measurement();
                 self.status = StatusMessage::Key("status.opened");
@@ -118,8 +120,12 @@ impl CadxApp {
                 .unwrap_or("Imported STEP");
             let plan = plan_step_import(self.session.document(), import, stem)
                 .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))?;
-            self.execute(plan.commands, StatusMessage::Key("status.imported_step"))
-                .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))?;
+            self.execute_from(
+                plan.commands,
+                StatusMessage::Key("status.imported_step"),
+                TransactionSource::Import,
+            )
+            .map_err(|error| cadx_io::ExportError::InvalidStep(error.to_string()))?;
             if plan.unsupported_color_count > 0 {
                 let count = plan.unsupported_color_count.to_string();
                 self.status = StatusMessage::Text(

@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 
+pub mod context;
 mod genai;
+pub mod intent;
+pub mod tools;
 
 use std::{future::Future, pin::Pin};
 

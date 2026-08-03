@@ -11,6 +11,22 @@ members = [
     "crates/cadx-ai",
     "crates/cadx-i18n",
     "crates/cadx-render",
+    "crates/cadx-domain-api",
+    "crates/cadx-mcad-standards",
+    "crates/cadx-mcad-dfm",
+    "crates/cadx-mcad-bom",
+    "crates/cadx-mcad-model",
+    "crates/cadx-mcad",
+    "crates/cadx-aec-bim",
+    "crates/cadx-aec-ifc",
+    "crates/cadx-aec-analysis",
+    "crates/cadx-aec",
+    "crates/cadx-ecad-layout",
+    "crates/cadx-ecad-netlist",
+    "crates/cadx-ecad-router",
+    "crates/cadx-ecad-drc",
+    "crates/cadx-ecad-export",
+    "crates/cadx-ecad",
     "crates/cadx-desktop",
 ]
 default-members = ["crates/cadx-desktop"]
@@ -33,6 +49,22 @@ cadx-kernel-truck = { path = "crates/cadx-kernel-truck" }
 cadx-ai = { path = "crates/cadx-ai" }
 cadx-i18n = { path = "crates/cadx-i18n" }
 cadx-render = { path = "crates/cadx-render" }
+cadx-domain-api = { path = "crates/cadx-domain-api" }
+cadx-mcad-standards = { path = "crates/cadx-mcad-standards" }
+cadx-mcad-dfm = { path = "crates/cadx-mcad-dfm" }
+cadx-mcad-bom = { path = "crates/cadx-mcad-bom" }
+cadx-mcad-model = { path = "crates/cadx-mcad-model" }
+cadx-mcad = { path = "crates/cadx-mcad" }
+cadx-aec-bim = { path = "crates/cadx-aec-bim" }
+cadx-aec-ifc = { path = "crates/cadx-aec-ifc" }
+cadx-aec-analysis = { path = "crates/cadx-aec-analysis" }
+cadx-aec = { path = "crates/cadx-aec" }
+cadx-ecad-layout = { path = "crates/cadx-ecad-layout" }
+cadx-ecad-netlist = { path = "crates/cadx-ecad-netlist" }
+cadx-ecad-router = { path = "crates/cadx-ecad-router" }
+cadx-ecad-drc = { path = "crates/cadx-ecad-drc" }
+cadx-ecad-export = { path = "crates/cadx-ecad-export" }
+cadx-ecad = { path = "crates/cadx-ecad" }
 bytemuck = { version = "1.25", features = ["derive"] }
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.35"

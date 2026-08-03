@@ -21,6 +21,18 @@ impl CadxApp {
             self.redo();
         } else if context.input(|input| command && shift && input.key_pressed(egui::Key::E)) {
             self.export_stl();
+        } else if !context.egui_wants_keyboard_input()
+            && context.input(|input| command && shift && input.key_pressed(egui::Key::R))
+        {
+            self.run_domain_tool(if self.active_domain == cadx_domain_api::DomainId::Ecad {
+                "drc"
+            } else {
+                "dfm"
+            });
+        } else if !context.egui_wants_keyboard_input()
+            && context.input(|input| command && shift && input.key_pressed(egui::Key::B))
+        {
+            self.run_domain_tool("bom");
         } else if context.input(|input| command && input.key_pressed(egui::Key::S)) {
             self.save_document(false);
         } else if context.input(|input| command && input.key_pressed(egui::Key::O)) {

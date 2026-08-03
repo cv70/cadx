@@ -14,6 +14,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 cadx-kernel-truck.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

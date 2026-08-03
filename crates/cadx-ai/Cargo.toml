@@ -11,6 +11,7 @@ repository.workspace = true
 cadx-analysis.workspace = true
 cadx-config.workspace = true
 cadx-core.workspace = true
+cadx-domain-api.workspace = true
 genai.workspace = true
 serde.workspace = true
 serde_json.workspace = true

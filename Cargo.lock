@@ -312,12 +312,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cadx-aec"
+version = "0.1.0"
+dependencies = [
+ "cadx-aec-analysis",
+ "cadx-aec-bim",
+ "cadx-aec-ifc",
+ "cadx-domain-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cadx-aec-analysis"
+version = "0.1.0"
+dependencies = [
+ "cadx-aec-bim",
+ "serde",
+]
+
+[[package]]
+name = "cadx-aec-bim"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-aec-ifc"
+version = "0.1.0"
+dependencies = [
+ "cadx-aec-bim",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "cadx-ai"
 version = "0.1.0"
 dependencies = [
  "cadx-analysis",
  "cadx-config",
  "cadx-core",
+ "cadx-domain-api",
  "genai",
  "serde",
  "serde_json",
@@ -340,6 +378,7 @@ dependencies = [
  "cadx-core",
  "cadx-io",
  "cadx-kernel-truck",
+ "serde_json",
  "thiserror 2.0.19",
 ]
 
@@ -368,20 +407,88 @@ dependencies = [
 name = "cadx-desktop"
 version = "0.1.0"
 dependencies = [
+ "cadx-aec",
  "cadx-ai",
  "cadx-analysis",
  "cadx-app",
  "cadx-config",
  "cadx-core",
+ "cadx-domain-api",
+ "cadx-ecad",
  "cadx-i18n",
  "cadx-io",
  "cadx-kernel-truck",
+ "cadx-mcad",
  "cadx-render",
  "eframe",
  "egui",
  "iconflow",
  "rfd",
+ "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "cadx-domain-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-ecad"
+version = "0.1.0"
+dependencies = [
+ "cadx-domain-api",
+ "cadx-ecad-drc",
+ "cadx-ecad-export",
+ "cadx-ecad-layout",
+ "cadx-ecad-netlist",
+ "cadx-ecad-router",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cadx-ecad-drc"
+version = "0.1.0"
+dependencies = [
+ "cadx-ecad-layout",
+ "serde",
+]
+
+[[package]]
+name = "cadx-ecad-export"
+version = "0.1.0"
+dependencies = [
+ "cadx-ecad-layout",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-ecad-layout"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-ecad-netlist"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-ecad-router"
+version = "0.1.0"
+dependencies = [
+ "cadx-ecad-layout",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -417,6 +524,49 @@ dependencies = [
  "truck-shapeops",
  "truck-stepio",
  "truck-topology",
+]
+
+[[package]]
+name = "cadx-mcad"
+version = "0.1.0"
+dependencies = [
+ "cadx-domain-api",
+ "cadx-mcad-bom",
+ "cadx-mcad-dfm",
+ "cadx-mcad-model",
+ "cadx-mcad-standards",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cadx-mcad-bom"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cadx-mcad-dfm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cadx-mcad-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "cadx-mcad-standards"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
