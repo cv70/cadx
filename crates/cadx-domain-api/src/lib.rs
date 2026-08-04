@@ -304,6 +304,8 @@ pub struct DomainAiTool {
     pub label: &'static str,
     pub description: &'static str,
     pub schema_id: &'static str,
+    /// Stable [`DomainTool::id`] executed after the model selects this tool.
+    pub executable_tool_id: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -13,14 +13,18 @@ use thiserror::Error;
 use cadx_analysis::{MeasurementResult, SceneAnalysis};
 use cadx_core::{
     diagnostics::{BooleanDiagnostic, EdgeModifierDiagnostic, SketchConstraintDiagnostic},
-    domain::{CadDocument, FeatureId, ModelCommand, SketchDimensionKind},
+    domain::{CadDocument, ModelCommand, SketchDimensionKind},
     kernel::{CadKernelCapabilities, InterferenceAnalysis, SketchSolveDiagnostic},
-    topology::{EdgeRef, FaceRef, VertexRef},
 };
+use cadx_domain_api::{DomainContext, DomainId, DomainParameters};
+
+use crate::tools::DomainAiToolBinding;
 
 pub use genai::GenAiAssistant;
 
 pub type AiFuture = Pin<Box<dyn Future<Output = Result<AiPlan, AiError>> + Send + 'static>>;
+pub type DomainAiFuture =
+    Pin<Box<dyn Future<Output = Result<DomainAiPlan, AiError>> + Send + 'static>>;
 
 #[derive(Debug, Clone)]
 pub struct AiRequest {
@@ -31,14 +35,30 @@ pub struct AiRequest {
     pub context: Option<AiContext>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainAiRequest {
+    pub prompt: String,
+    pub domain: DomainId,
+    pub context: DomainContext,
+    /// Request-scoped allow-list already bound to executable domain tools.
+    pub tools: Vec<DomainAiToolBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainAiPlan {
+    pub domain: DomainId,
+    pub ai_tool_id: String,
+    pub executable_tool_id: String,
+    pub parameters: DomainParameters,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiContext {
+    /// Bounded interaction, topology, document-graph, and spatial focus state
+    /// collected for this exact document revision.
+    pub interaction: context::ContextSnapshot,
     /// Capabilities declared by the kernel that validated `scene_analysis`.
     pub kernel_capabilities: CadKernelCapabilities,
-    pub selected_feature_id: Option<FeatureId>,
-    pub selected_face: Option<FaceRef>,
-    pub selected_edges: Vec<EdgeRef>,
-    pub selected_vertex: Option<VertexRef>,
     /// Optional result from the user's active, validated measurement set.
     pub measurement: Option<MeasurementResult>,
     /// Most recent structured boolean rejection, retained for a corrective
@@ -70,6 +90,30 @@ pub struct AiSketchDimension {
 pub struct AiPlan {
     pub summary: String,
     pub commands: Vec<ModelCommand>,
+    /// Optional independent approaches. Engineering metrics are intentionally
+    /// absent: the host computes them from each kernel-evaluated sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<AiPlanCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiPlanCandidate {
+    pub summary: String,
+    pub commands: Vec<ModelCommand>,
+}
+
+impl AiPlan {
+    /// Flattens the primary proposal and at most two independent alternatives.
+    #[must_use]
+    pub fn into_candidates(self) -> Vec<AiPlanCandidate> {
+        let mut candidates = Vec::with_capacity(1 + self.alternatives.len().min(2));
+        candidates.push(AiPlanCandidate {
+            summary: self.summary,
+            commands: self.commands,
+        });
+        candidates.extend(self.alternatives.into_iter().take(2));
+        candidates
+    }
 }
 
 /// Provider-neutral AI boundary. Implementations return declarative commands;
@@ -77,6 +121,7 @@ pub struct AiPlan {
 pub trait AiAssistant: Send + Sync {
     fn model_name(&self) -> &str;
     fn plan(&self, request: AiRequest) -> AiFuture;
+    fn plan_domain(&self, request: DomainAiRequest) -> DomainAiFuture;
 }
 
 #[cfg(test)]
@@ -90,7 +135,7 @@ mod tests {
             EdgeModifierParameter,
         },
         domain::BooleanOperation,
-        topology::PrimitiveFace,
+        topology::{EdgeRef, FaceRef, PrimitiveFace},
     };
 
     #[test]
@@ -102,11 +147,15 @@ mod tests {
             0,
         );
         let context = AiContext {
+            interaction: context::ContextSnapshot {
+                document_revision: 11,
+                selection: context::ContextSelection {
+                    selected_feature_id: Some(7),
+                    ..context::ContextSelection::default()
+                },
+                ..context::ContextSnapshot::default()
+            },
             kernel_capabilities: CadKernelCapabilities::default(),
-            selected_feature_id: Some(7),
-            selected_face: None,
-            selected_edges: Vec::new(),
-            selected_vertex: None,
             measurement: Some(MeasurementResult::EdgeLength {
                 edge: edge.clone(),
                 length_mm: 25.0,
@@ -168,7 +217,11 @@ mod tests {
             encoded["kernel_capabilities"]["chamfer"]["edge_count"],
             "unsupported"
         );
-        assert_eq!(encoded["selected_feature_id"], 7);
+        assert_eq!(
+            encoded["interaction"]["selection"]["selected_feature_id"],
+            7
+        );
+        assert_eq!(encoded["interaction"]["document_revision"], 11);
         assert_eq!(encoded["scene_analysis"]["total_volume_mm3"], 42.0);
         assert_eq!(encoded["measurement"]["length_mm"], 25.0);
         assert_eq!(encoded["measurement"]["precision"]["kind"], "exact");
@@ -191,6 +244,38 @@ mod tests {
             serde_json::json!([7, 8])
         );
     }
+
+    #[test]
+    fn plan_flattens_at_most_three_independent_candidates() {
+        let command = |name: &str| ModelCommand::CreateBox {
+            name: name.into(),
+            size: [1.0; 3],
+            position: [0.0; 3],
+        };
+        let plan = AiPlan {
+            summary: "primary".into(),
+            commands: vec![command("primary")],
+            alternatives: vec![
+                AiPlanCandidate {
+                    summary: "second".into(),
+                    commands: vec![command("second")],
+                },
+                AiPlanCandidate {
+                    summary: "third".into(),
+                    commands: vec![command("third")],
+                },
+                AiPlanCandidate {
+                    summary: "ignored".into(),
+                    commands: vec![command("ignored")],
+                },
+            ],
+        };
+
+        let candidates = plan.into_candidates();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].summary, "primary");
+        assert_eq!(candidates[2].summary, "third");
+    }
 }
 
 #[derive(Debug, Error)]
@@ -203,4 +288,6 @@ pub enum AiError {
     MissingToolCall(String),
     #[error("model returned an invalid CAD plan: {0}")]
     InvalidPlan(String),
+    #[error("model returned an invalid domain tool call: {0}")]
+    InvalidDomainToolCall(String),
 }

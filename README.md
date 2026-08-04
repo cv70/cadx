@@ -33,9 +33,11 @@ Industry behavior is pluginized above the shared kernel. `cadx-domain-api` defin
 
 AI responses cannot mutate geometry directly. `cadx-ai` exposes a JSON-schema tool that returns `ModelCommand` values and receives read-only scene, interference, and kernel capability context when available. `cadx-app::CoreBus` tags UI, AI, domain-pack, and import transactions, buffers streamable command batches, publishes events, and delegates to `DocumentSession`, which validates the complete batch against a staged document and commits it only after the CAD kernel accepts the resulting geometry. See [`docs/kernel-capabilities.md`](docs/kernel-capabilities.md) for the conservative capability contract used by desktop and AI adapters.
 
+Generic AI requests use a revision-bound dynamic context collector instead of serializing the complete document. Selection and persistent topology owners rank first, followed by prompt name/ID matches, two-hop feature dependencies and dependents, AABB distance from the resolved selection or viewport focus, and recent-feature fallback. The provider receives full parameters only for the bounded retrieved feature set, related assembly ancestors/mates, filtered per-part scene detail, aggregate engineering metrics, namespace counts rather than opaque domain values, and relevance-ranked interference detail with explicit omitted counts. Embedded STEP source text is redacted. The default request carries at most 32 feature records and 16 spatial records; hard limits are 64 and 32 respectively. This keeps large product contexts predictable without allowing the model to invent omitted IDs.
+
 Solid features can persist a named material and density in kg/m^3. The desktop inspector offers common engineering presets while keeping both fields editable. `cadx-analysis` uses these assignments to compute mass, center of mass, and centroidal inertia tensors in kg mm^2. An explicit analysis density remains available as a uniform override; otherwise aggregate mass properties are omitted when any visible part is unassigned. The complete contract and numerical method are documented in [`docs/materials-and-mass-properties.md`](docs/materials-and-mass-properties.md).
 
-AI plans are never applied on receipt. The workbench presents the validated command list for explicit approval, and an approved plan enters history as one undoable transaction.
+AI plans are never applied on receipt. Every provider task has a unique request identity, snapshot revision, and abort handle; users can cancel immediately, document changes proactively cancel stale work, and queued responses from canceled tasks cannot complete a newer request. Each current response may contain one primary command batch plus two independent alternatives. CADX evaluates every candidate from the same committed document in a kernel-backed copy-on-write sandbox, then computes body/triangle deltas, volume, surface area, available mass/center-of-mass changes, and optional exact interference evidence locally. The model cannot supply those engineering results. The review panel switches the viewport among candidates, overlaying added and modified results in cyan and removed geometry in red through independent translucent WGPU passes. Approval atomically installs only the selected validated preview as one undoable revision and explicitly discards the rest; rejection or a stale base revision leaves the live document unchanged. See [`docs/ai-transaction-sandbox.md`](docs/ai-transaction-sandbox.md).
 
 Sketches retain one editable exact outer loop, explicit non-overlapping hole
 loops, up to 128 independent non-solid construction exact-curve segments, and
@@ -110,7 +112,7 @@ provider:
   timeout_seconds: 45
 ```
 
-For an OpenAI-compatible gateway, set `provider.endpoint` and optionally `provider.adapter: openai`. The API key is held in memory only for the configured client and is redacted from configuration diagnostics.
+For an OpenAI-compatible gateway, set `provider.endpoint` to its API base URL and optionally set `provider.adapter: openai`. CADX parses the endpoint as an HTTP(S) URL and normalizes its path as a directory, so a conventional value ending in `/v1` correctly resolves `chat/completions` beneath `/v1/`; query parameters are preserved and URL fragments are rejected. Provider errors shown by the workbench are whitespace-normalized and bounded, while HTML login/error pages are replaced with an actionable diagnostic instead of being copied into the conversation. The API key is held in memory only for the configured client and is redacted from configuration diagnostics.
 
 CADX settings are not read from provider or preference environment variables. `ConfigStore` discovers the user's home only to locate the fixed `~/.cadx` root; tests and alternate hosts inject an explicit root directory.
 
@@ -140,6 +142,6 @@ The next modeling milestones are deliberately ordered around stable product cont
 1. Extend bounded boolean healing beyond planar interfaces to curved contact surfaces and locally provable tensor-product surface families beyond affine ruled homotopies, and grow the imported freeform B-Rep regression corpus.
 2. Extend persisted assembly mates beyond tree-structured single-axis motion to broader joints and closed-loop constraint solving.
 3. Persistent per-face styles, PMI, BOM, and manufacturing metadata workflows across AP242 import and export.
-4. Sandboxed AI tools for analysis, design alternatives, DFM, and simulation.
+4. Build analysis, design-alternative, DFM, and simulation tools on the revision-bound AI transaction sandbox.
 
 The kernel boundary, versioned document format, atomic command transactions, and AI approval gate in this repository are the foundation for those additions.

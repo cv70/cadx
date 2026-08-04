@@ -12,13 +12,11 @@ use eframe::egui;
 
 use cadx_aec::AecPack;
 use cadx_ai::{
-    AiAssistant, AiError, AiPlan, GenAiAssistant,
-    context::{ContextCollector, ContextSnapshot},
-    intent::IntentDiff,
-    tools::ToolRegistry,
+    AiAssistant, AiError, AiPlan, AiPlanCandidate, DomainAiPlan, GenAiAssistant,
+    context::ContextCollector, intent::IntentDiff, tools::ToolRegistry,
 };
-use cadx_analysis::{MeasurementEntity, analyze_scene};
-use cadx_app::{CoreBus, DocumentState, TransactionSource};
+use cadx_analysis::{MeasurementEntity, ScalarComparison, SceneComparison, analyze_scene};
+use cadx_app::{CoreBus, DocumentState, TransactionPreview, TransactionSource};
 use cadx_config::{ConfigStore, Preferences, ProviderConfig, Settings};
 use cadx_core::{
     assembly::{
@@ -44,8 +42,8 @@ use cadx_core::{
 };
 use cadx_domain_api::{
     DomainAction, DomainArtifact, DomainContext, DomainExecution, DomainFieldKind,
-    DomainFieldSchema, DomainFieldValue, DomainId, DomainParameters, DomainRegistry, DomainRoute,
-    DomainToolRequest,
+    DomainFieldSchema, DomainFieldValue, DomainId, DomainIssue, DomainParameters, DomainRegistry,
+    DomainRoute, DomainToolRequest,
 };
 use cadx_ecad::{EcadPack, drc as pcb_drc, export as pcb_export, layout::PcbBoard};
 use cadx_i18n::{Language, Translator};
@@ -69,11 +67,12 @@ pub struct CadxApp {
     status: StatusMessage,
     assistant: Arc<dyn AiAssistant>,
     runtime: tokio::runtime::Runtime,
-    ai_sender: mpsc::Sender<Result<AiPlan, AiError>>,
-    ai_receiver: mpsc::Receiver<Result<AiPlan, AiError>>,
+    ai_sender: mpsc::Sender<AiTaskResponse>,
+    ai_receiver: mpsc::Receiver<AiTaskResponse>,
     ai_input: String,
-    ai_pending: bool,
-    pending_ai_plan: Option<AiPlan>,
+    ai_tasks: AiTaskTracker,
+    pending_ai_candidates: Vec<PendingAiCandidate>,
+    active_ai_candidate: usize,
     conversation: Vec<ConversationEntry>,
     translator: Translator,
     toolbar_tab: ToolbarTab,
@@ -102,6 +101,89 @@ pub struct CadxApp {
     last_intent_diff: Option<IntentDiff>,
 }
 
+struct AiTaskResponse {
+    request_id: u64,
+    base_revision: u64,
+    result: Result<AiTaskResult, AiError>,
+}
+
+enum AiTaskResult {
+    Cad(AiPlan),
+    Domain {
+        plan: DomainAiPlan,
+        context: DomainContext,
+    },
+}
+
+#[derive(Debug)]
+struct PendingAiTask {
+    request_id: u64,
+    base_revision: u64,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+#[derive(Debug, Default)]
+struct AiTaskTracker {
+    next_request_id: u64,
+    pending: Option<PendingAiTask>,
+}
+
+impl AiTaskTracker {
+    fn reserve_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("AI request id space exhausted");
+        request_id
+    }
+
+    fn track(
+        &mut self,
+        request_id: u64,
+        base_revision: u64,
+        abort_handle: tokio::task::AbortHandle,
+    ) {
+        if let Some(previous) = self.pending.replace(PendingAiTask {
+            request_id,
+            base_revision,
+            abort_handle,
+        }) {
+            previous.abort_handle.abort();
+        }
+    }
+
+    fn finish(&mut self, request_id: u64) -> Option<u64> {
+        if self.pending.as_ref()?.request_id != request_id {
+            return None;
+        }
+        self.pending.take().map(|pending| pending.base_revision)
+    }
+
+    fn cancel(&mut self) -> bool {
+        let Some(pending) = self.pending.take() else {
+            return false;
+        };
+        pending.abort_handle.abort();
+        true
+    }
+
+    fn cancel_if_revision_changed(&mut self, revision: u64) -> bool {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.base_revision != revision)
+        {
+            return self.cancel();
+        }
+        false
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Speaker {
     User,
@@ -128,6 +210,29 @@ type StatusMessage = LocalizedText;
 struct ConversationEntry {
     speaker: Speaker,
     content: LocalizedText,
+}
+
+struct PendingAiCandidate {
+    plan: AiPlanCandidate,
+    preview: TransactionPreview,
+    comparison: SceneComparison,
+    interference: Option<InterferenceAnalysis>,
+    review_items: Vec<String>,
+    domain_effects: Option<PendingDomainEffects>,
+}
+
+struct PreparedDomainExecution {
+    plan: AiPlanCandidate,
+    effects: PendingDomainEffects,
+}
+
+struct PendingDomainEffects {
+    domain: DomainId,
+    summary: String,
+    deferred: Vec<DomainAction>,
+    artifacts: Vec<DomainArtifact>,
+    issues: Vec<DomainIssue>,
+    persisted_board: Option<PcbBoard>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +473,9 @@ impl CadxApp {
         domain_bus.register(Arc::new(EcadPack));
         let mut ai_tools = ToolRegistry::default();
         for pack in domain_bus.enabled_packs() {
-            ai_tools.register_pack(pack.as_ref());
+            ai_tools
+                .register_pack(pack.as_ref())
+                .expect("built-in domain AI tool mappings must be valid");
         }
 
         Self {
@@ -388,8 +495,9 @@ impl CadxApp {
             ai_sender,
             ai_receiver,
             ai_input: String::new(),
-            ai_pending: false,
-            pending_ai_plan: None,
+            ai_tasks: AiTaskTracker::default(),
+            pending_ai_candidates: Vec::new(),
+            active_ai_candidate: 0,
             conversation: vec![ConversationEntry {
                 speaker: Speaker::Assistant,
                 content: LocalizedText::Key("ai.welcome"),
@@ -1514,7 +1622,7 @@ impl CadxApp {
         }
     }
 
-    fn route_domain_prompt(&mut self, prompt: &str) -> Option<DomainRoute> {
+    fn route_domain_prompt(&mut self, prompt: &str) -> Option<DomainId> {
         let normalized = prompt.to_ascii_lowercase();
         let pcb_keyword = normalized.contains("pcb")
             || normalized.contains("ecad")
@@ -1562,27 +1670,11 @@ impl CadxApp {
         } else {
             DomainId::Mcad
         };
-        self.active_domain = routed_domain;
-        let domain_context = self.domain_context();
-        let pack = self
-            .domain_bus
-            .enabled_packs()
-            .into_iter()
-            .find(|pack| pack.manifest().id == routed_domain)?;
-        let mut context_collector = ContextCollector::new(ContextSnapshot {
-            domain: Some(routed_domain),
-            document_name: domain_context.document_name.clone(),
-            selected_feature_ids: domain_context.selected_feature_ids.clone(),
-            visible_solid_count: domain_context.visible_solid_count,
-            active_feature_count: domain_context.active_feature_count,
-            ..ContextSnapshot::default()
-        });
-        if let Ok(serde_json::Value::Object(schema)) = serde_json::to_value(pack.inspector_schema())
-        {
-            context_collector.set_domain_schema(schema);
+        if !self.domain_bus.is_enabled(routed_domain) {
+            return None;
         }
-        self.context_collector = context_collector;
-        Some(pack.route_natural_language(prompt, &domain_context))
+        self.active_domain = routed_domain;
+        Some(routed_domain)
     }
 
     fn dispatch_domain_route(&mut self, route: DomainRoute) {
@@ -1590,6 +1682,33 @@ impl CadxApp {
     }
 
     fn dispatch_domain_execution(&mut self, execution: DomainExecution) {
+        let prepared = match self.prepare_domain_execution(self.active_domain, execution) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status = StatusMessage::Text(error);
+                return;
+            }
+        };
+        let effects = prepared.effects;
+        if !prepared.plan.commands.is_empty()
+            && self
+                .execute_from(
+                    prepared.plan.commands,
+                    StatusMessage::Text(effects.summary.clone()),
+                    TransactionSource::DomainPack,
+                )
+                .is_err()
+        {
+            return;
+        }
+        self.apply_domain_effects(effects);
+    }
+
+    fn prepare_domain_execution(
+        &self,
+        domain: DomainId,
+        execution: DomainExecution,
+    ) -> Result<PreparedDomainExecution, String> {
         let DomainExecution {
             summary,
             actions,
@@ -1600,6 +1719,7 @@ impl CadxApp {
         let mut deferred = Vec::new();
         let mut board_update = None;
         let mut component_updates = Vec::new();
+        let mut next_feature_id = self.session.document().next_feature_id();
 
         for action in actions {
             match action {
@@ -1607,33 +1727,48 @@ impl CadxApp {
                     name,
                     size_mm,
                     position_mm,
-                } => commands.push(ModelCommand::CreateBox {
-                    name,
-                    size: size_mm,
-                    position: position_mm,
-                }),
+                } => {
+                    commands.push(ModelCommand::CreateBox {
+                        name,
+                        size: size_mm,
+                        position: position_mm,
+                    });
+                    next_feature_id = next_feature_id
+                        .checked_add(1)
+                        .ok_or_else(|| "feature id space exhausted".to_owned())?;
+                }
                 DomainAction::CreateSolidCylinder {
                     name,
                     radius_mm,
                     height_mm,
                     position_mm,
-                } => commands.push(ModelCommand::CreateCylinder {
-                    name,
-                    radius: radius_mm,
-                    height: height_mm,
-                    position: position_mm,
-                }),
+                } => {
+                    commands.push(ModelCommand::CreateCylinder {
+                        name,
+                        radius: radius_mm,
+                        height: height_mm,
+                        position: position_mm,
+                    });
+                    next_feature_id = next_feature_id
+                        .checked_add(1)
+                        .ok_or_else(|| "feature id space exhausted".to_owned())?;
+                }
                 DomainAction::CreateProfileExtrusion {
                     name,
                     profile_mm,
                     height_mm,
                     position_mm,
-                } => commands.push(ModelCommand::CreateExtrusion {
-                    name,
-                    profile: profile_mm,
-                    height: height_mm,
-                    position: position_mm,
-                }),
+                } => {
+                    commands.push(ModelCommand::CreateExtrusion {
+                        name,
+                        profile: profile_mm,
+                        height: height_mm,
+                        position: position_mm,
+                    });
+                    next_feature_id = next_feature_id
+                        .checked_add(1)
+                        .ok_or_else(|| "feature id space exhausted".to_owned())?;
+                }
                 DomainAction::CreatePcbBoard {
                     name,
                     width_mm,
@@ -1653,12 +1788,12 @@ impl CadxApp {
                             size: [width_mm, height_mm, thickness_mm],
                             position: [-width_mm * 0.5, -height_mm * 0.5, 0.0],
                         });
+                        next_feature_id = next_feature_id
+                            .checked_add(1)
+                            .ok_or_else(|| "feature id space exhausted".to_owned())?;
                         board_update = Some(board);
                     }
-                    Err(error) => {
-                        self.status = StatusMessage::Text(error.to_string());
-                        return;
-                    }
+                    Err(error) => return Err(error.to_string()),
                 },
                 DomainAction::PlacePcbComponent {
                     reference,
@@ -1674,15 +1809,20 @@ impl CadxApp {
                         .find(|candidate| candidate.package.eq_ignore_ascii_case(&footprint))
                         .unwrap_or(&cadx_ecad::footprint_library()[0]);
                     let size = descriptor.body_size_mm;
+                    let board = board_update.as_ref().unwrap_or(&self.pcb_board);
+                    let linked_feature_id = next_feature_id;
                     commands.push(ModelCommand::CreateBox {
                         name: format!("{reference} {value}"),
                         size: [size[0], size[1], descriptor.default_height_mm],
                         position: [
-                            -self.pcb_board.width_mm * 0.5 + position_mm[0] - size[0] * 0.5,
-                            -self.pcb_board.height_mm * 0.5 + position_mm[1] - size[1] * 0.5,
-                            self.pcb_board.thickness_mm,
+                            -board.width_mm * 0.5 + position_mm[0] - size[0] * 0.5,
+                            -board.height_mm * 0.5 + position_mm[1] - size[1] * 0.5,
+                            board.thickness_mm,
                         ],
                     });
+                    next_feature_id = next_feature_id
+                        .checked_add(1)
+                        .ok_or_else(|| "feature id space exhausted".to_owned())?;
                     component_updates.push(cadx_ecad::layout::PcbComponent {
                         reference,
                         value,
@@ -1697,7 +1837,7 @@ impl CadxApp {
                             cadx_ecad::layout::ComponentSide::Top
                         },
                         model_3d,
-                        linked_feature_id: None,
+                        linked_feature_id: Some(linked_feature_id),
                     });
                 }
                 DomainAction::UpsertDomainMetadata {
@@ -1705,13 +1845,7 @@ impl CadxApp {
                     namespace,
                     values,
                 } => {
-                    let value = match serde_json::to_value(values) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            self.status = StatusMessage::Text(error.to_string());
-                            return;
-                        }
-                    };
+                    let value = serde_json::to_value(values).map_err(|error| error.to_string())?;
                     commands.push(ModelCommand::SetDomainData {
                         namespace,
                         entity_key,
@@ -1726,17 +1860,8 @@ impl CadxApp {
         if board_update.is_some() || !component_updates.is_empty() {
             let mut board = board_update.unwrap_or_else(|| self.pcb_board.clone());
             board.components.extend(component_updates);
-            if let Err(error) = board.validate() {
-                self.status = StatusMessage::Text(error.to_string());
-                return;
-            }
-            let value = match serde_json::to_value(&board) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.status = StatusMessage::Text(error.to_string());
-                    return;
-                }
-            };
+            board.validate().map_err(|error| error.to_string())?;
+            let value = serde_json::to_value(&board).map_err(|error| error.to_string())?;
             commands.push(ModelCommand::SetDomainData {
                 namespace: "ecad.layout".into(),
                 entity_key: "board".into(),
@@ -1745,17 +1870,32 @@ impl CadxApp {
             persisted_board = Some(board);
         }
 
-        if !commands.is_empty()
-            && self
-                .execute_from(
-                    commands,
-                    StatusMessage::Text(summary.clone()),
-                    TransactionSource::DomainPack,
-                )
-                .is_err()
-        {
-            return;
-        }
+        Ok(PreparedDomainExecution {
+            plan: AiPlanCandidate {
+                summary: summary.clone(),
+                commands,
+            },
+            effects: PendingDomainEffects {
+                domain,
+                summary,
+                deferred,
+                artifacts,
+                issues,
+                persisted_board,
+            },
+        })
+    }
+
+    fn apply_domain_effects(&mut self, effects: PendingDomainEffects) {
+        let PendingDomainEffects {
+            domain,
+            summary,
+            deferred,
+            artifacts,
+            issues,
+            persisted_board,
+        } = effects;
+        self.active_domain = domain;
         if let Some(board) = persisted_board {
             self.pcb_board = board;
         }
@@ -1765,15 +1905,15 @@ impl CadxApp {
         if !artifacts.is_empty() {
             self.domain_report = Some(DomainReport::Artifacts(artifacts));
         }
-        if !issues.is_empty() {
+        if issues.is_empty() {
+            self.status = StatusMessage::Text(summary);
+        } else {
             let issue_summary = issues
                 .iter()
                 .map(|issue| format!("{}: {}", issue.code, issue.message))
                 .collect::<Vec<_>>()
                 .join("; ");
             self.status = StatusMessage::Text(issue_summary);
-        } else if self.domain_report.is_none() {
-            self.status = StatusMessage::Text(summary);
         }
     }
 
@@ -4129,13 +4269,29 @@ impl CadxApp {
                                 }
                                 self.domain_intent_review(ui, &translator);
                                 self.ai_plan_review(ui, &translator);
-                                if self.ai_pending {
+                                if self.ai_plan_is_pending() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
                                         ui.label(
                                             egui::RichText::new(translator.text("ai.planning"))
                                                 .size(11.0)
                                                 .color(appearance::TEXT_MUTED),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if icon_button(
+                                                    ui,
+                                                    "x",
+                                                    translator.text("ai.cancel"),
+                                                    true,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.cancel_ai_plan();
+                                                }
+                                            },
                                         );
                                     });
                                 }
@@ -4161,8 +4317,8 @@ impl CadxApp {
                             .color(appearance::TEXT_FAINT),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_send = !self.ai_pending
-                            && self.pending_ai_plan.is_none()
+                        let can_send = !self.ai_plan_is_pending()
+                            && self.pending_ai_candidates.is_empty()
                             && self
                                 .last_intent_diff
                                 .as_ref()
@@ -5226,9 +5382,20 @@ impl CadxApp {
     }
 
     fn ai_plan_review(&mut self, ui: &mut egui::Ui, translator: &Translator) {
-        let Some(plan) = self.pending_ai_plan.clone() else {
+        let Some(candidate) = self.pending_ai_candidates.get(self.active_ai_candidate) else {
             return;
         };
+        let plan = candidate.plan.clone();
+        let diff = candidate.preview.diff().clone();
+        let comparison = candidate.comparison.clone();
+        let interference = candidate.interference.clone();
+        let review_items = candidate.review_items.clone();
+        let candidate_summaries = self
+            .pending_ai_candidates
+            .iter()
+            .map(|candidate| candidate.plan.summary.clone())
+            .collect::<Vec<_>>();
+        let mut selected_candidate = self.active_ai_candidate;
         let mut approve = false;
         let mut reject = false;
         egui::Frame::new()
@@ -5244,16 +5411,205 @@ impl CadxApp {
                         .color(appearance::ACCENT),
                 );
                 ui.add_space(3.0);
+                if candidate_summaries.len() > 1 {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, summary) in candidate_summaries.iter().enumerate() {
+                            let number = (index + 1).to_string();
+                            ui.selectable_value(
+                                &mut selected_candidate,
+                                index,
+                                translator.format("ai.candidate", &[("index", &number)]),
+                            )
+                            .on_hover_text(summary);
+                        }
+                    });
+                    ui.add_space(3.0);
+                }
                 ui.label(egui::RichText::new(plan.summary).size(11.0));
+                let added = diff.added_features.len().to_string();
+                let modified = diff.modified_features.len().to_string();
+                let removed = diff.removed_features.len().to_string();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(appearance::icon("circle", 7.0).color(appearance::ACCENT));
+                    ui.label(
+                        egui::RichText::new(translator.format(
+                            "ai.diff_summary",
+                            &[
+                                ("added", &added),
+                                ("modified", &modified),
+                                ("removed", &removed),
+                            ],
+                        ))
+                        .monospace()
+                        .size(9.0)
+                        .color(appearance::TEXT_MUTED),
+                    );
+                });
                 egui::ScrollArea::vertical()
                     .id_salt("ai_plan_commands")
-                    .max_height(82.0)
+                    .max_height(210.0)
                     .show(ui, |ui| {
+                        for item in &review_items {
+                            ui.label(
+                                egui::RichText::new(item)
+                                    .size(10.0)
+                                    .color(appearance::TEXT_MUTED),
+                            );
+                        }
                         for (index, command) in plan.commands.iter().enumerate() {
                             ui.label(
                                 egui::RichText::new(format!("{}  {}", index + 1, command.label()))
                                     .size(10.0)
                                     .color(appearance::TEXT_MUTED),
+                            );
+                        }
+                        for (key, color, features) in [
+                            (
+                                "ai.diff_added",
+                                appearance::ACCENT,
+                                diff.added_features.as_slice(),
+                            ),
+                            (
+                                "ai.diff_modified",
+                                appearance::WARNING,
+                                diff.modified_features.as_slice(),
+                            ),
+                            (
+                                "ai.diff_removed",
+                                appearance::DANGER,
+                                diff.removed_features.as_slice(),
+                            ),
+                        ] {
+                            for feature in features {
+                                ui.horizontal(|ui| {
+                                    ui.label(appearance::icon("circle", 6.0).color(color));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  #{} {}",
+                                            translator.text(key),
+                                            feature.id,
+                                            feature.name
+                                        ))
+                                        .size(9.0)
+                                        .color(appearance::TEXT_MUTED),
+                                    );
+                                });
+                            }
+                        }
+                        if !diff.changed_assemblies.is_empty() {
+                            let count = diff.changed_assemblies.len().to_string();
+                            ui.label(
+                                egui::RichText::new(
+                                    translator.format("ai.diff_assemblies", &[("count", &count)]),
+                                )
+                                .size(9.0)
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        }
+                        if !diff.changed_domain_namespaces.is_empty() {
+                            ui.label(
+                                egui::RichText::new(translator.format(
+                                    "ai.diff_domains",
+                                    &[("namespaces", &diff.changed_domain_namespaces.join(", "))],
+                                ))
+                                .size(9.0)
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(translator.text("ai.engineering_evidence"))
+                                .size(9.0)
+                                .strong()
+                                .color(appearance::TEXT_MUTED),
+                        );
+                        let body_delta = format!("{:+}", comparison.body_count_delta);
+                        let triangle_delta = format!("{:+}", comparison.triangle_count_delta);
+                        ui.label(
+                            egui::RichText::new(translator.format(
+                                "ai.geometry_delta",
+                                &[("bodies", &body_delta), ("triangles", &triangle_delta)],
+                            ))
+                            .monospace()
+                            .size(9.0)
+                            .color(appearance::TEXT_MUTED),
+                        );
+                        for (label, value, unit) in [
+                            (
+                                translator.text("ai.metric_volume"),
+                                comparison.volume_mm3,
+                                "mm3",
+                            ),
+                            (
+                                translator.text("ai.metric_surface"),
+                                comparison.surface_area_mm2,
+                                "mm2",
+                            ),
+                        ] {
+                            ui.label(
+                                egui::RichText::new(format_ai_scalar_comparison(
+                                    label, value, unit,
+                                ))
+                                .monospace()
+                                .size(9.0)
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        }
+                        if let Some(mass) = comparison.mass_kg {
+                            ui.label(
+                                egui::RichText::new(format_ai_scalar_comparison(
+                                    translator.text("ai.metric_mass"),
+                                    mass,
+                                    "kg",
+                                ))
+                                .monospace()
+                                .size(9.0)
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(translator.format(
+                                    "ai.metric_unavailable",
+                                    &[("metric", translator.text("ai.metric_mass"))],
+                                ))
+                                .size(9.0)
+                                .color(appearance::TEXT_FAINT),
+                            );
+                        }
+                        if let Some(shift) = comparison.center_of_mass_shift_mm {
+                            let shift = format!("{shift:.3}");
+                            ui.label(
+                                egui::RichText::new(
+                                    translator.format("ai.com_shift", &[("value", &shift)]),
+                                )
+                                .monospace()
+                                .size(9.0)
+                                .color(appearance::TEXT_MUTED),
+                            );
+                        }
+                        if let Some(report) = &interference {
+                            let clear = report.clear_pair_count.to_string();
+                            let clashes = report.interfering_pair_count.to_string();
+                            let failed = report.failed_pair_count.to_string();
+                            let color = if report.failed_pair_count > 0 {
+                                appearance::WARNING
+                            } else if report.has_interference() {
+                                appearance::DANGER
+                            } else {
+                                appearance::ACCENT
+                            };
+                            ui.label(
+                                egui::RichText::new(translator.format(
+                                    "ai.interference_evidence",
+                                    &[
+                                        ("clear", &clear),
+                                        ("clashes", &clashes),
+                                        ("failed", &failed),
+                                    ],
+                                ))
+                                .monospace()
+                                .size(9.0)
+                                .color(color),
                             );
                         }
                     });
@@ -5276,6 +5632,10 @@ impl CadxApp {
                     .clicked();
                 });
             });
+        if selected_candidate != self.active_ai_candidate {
+            self.active_ai_candidate = selected_candidate;
+            self.sync_viewport();
+        }
         if approve {
             self.approve_ai_plan();
         } else if reject {
@@ -5562,10 +5922,19 @@ impl CadxApp {
                     conflict_constraints,
                     editing_constraint,
                 );
+                let viewport_label = if self.pending_ai_candidates.is_empty() {
+                    translator.text("viewport.perspective").to_owned()
+                } else {
+                    format!(
+                        "{}  ·  {}",
+                        translator.text("viewport.perspective"),
+                        translator.text("ai.preview_active")
+                    )
+                };
                 ui.painter().text(
                     rect.left_top() + egui::vec2(14.0, 12.0),
                     egui::Align2::LEFT_TOP,
-                    translator.text("viewport.perspective"),
+                    viewport_label,
                     egui::FontId::proportional(10.0),
                     appearance::TEXT_MUTED,
                 );
@@ -5696,6 +6065,23 @@ impl CadxApp {
         )
         .is_ok()
     }
+}
+
+fn format_ai_scalar_comparison(label: &str, comparison: ScalarComparison, unit: &str) -> String {
+    comparison.percent.map_or_else(
+        || {
+            format!(
+                "{label}: {:.3} -> {:.3} {unit} ({:+.3})",
+                comparison.baseline, comparison.candidate, comparison.delta
+            )
+        },
+        |percent| {
+            format!(
+                "{label}: {:.3} -> {:.3} {unit} ({:+.3}, {percent:+.1}%)",
+                comparison.baseline, comparison.candidate, comparison.delta
+            )
+        },
+    )
 }
 
 fn boolean_diagnostic_ui(
@@ -5938,6 +6324,7 @@ const fn interference_reason_key(reason: InterferenceFailureReason) -> &'static 
 impl eframe::App for CadxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.keyboard_shortcuts(ui.ctx());
+        self.cancel_ai_plan_for_document_change();
         self.receive_ai_plans();
         self.header(ui);
         self.status_bar(ui);
@@ -5951,7 +6338,7 @@ impl eframe::App for CadxApp {
         self.measurement_panel(ui.ctx());
         self.sketch_dimension_dialog(ui.ctx());
         self.domain_report_window(ui.ctx());
-        if self.ai_pending {
+        if self.ai_plan_is_pending() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -8024,6 +8411,53 @@ fn conversation_entry(ui: &mut egui::Ui, entry: &ConversationEntry, translator: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_domain_ai_tools_have_executable_bindings() {
+        let mut registry = ToolRegistry::default();
+        registry.register_pack(&McadPack).unwrap();
+        registry.register_pack(&AecPack).unwrap();
+        registry.register_pack(&EcadPack).unwrap();
+
+        for (domain, expected) in [
+            (
+                DomainId::Mcad,
+                &[
+                    ("mcad_create_prismatic_part", "ai-part"),
+                    ("mcad_open_sketch", "sketch"),
+                    ("mcad_run_dfm", "dfm"),
+                    ("mcad_generate_bom", "bom"),
+                ][..],
+            ),
+            (
+                DomainId::Aec,
+                &[
+                    ("aec_create_wall", "wall"),
+                    ("aec_create_slab", "slab"),
+                    ("aec_update_bim_properties", "bim-attrs"),
+                    ("aec_run_clash", "clash"),
+                    ("aec_export_ifc", "ifc"),
+                ][..],
+            ),
+            (
+                DomainId::Ecad,
+                &[
+                    ("ecad_create_board", "board"),
+                    ("ecad_place_component", "placement"),
+                    ("ecad_route_net", "routing"),
+                    ("ecad_run_drc", "drc"),
+                    ("ecad_export_manufacturing", "gerber"),
+                ][..],
+            ),
+        ] {
+            assert_eq!(registry.ai_tools_for(domain).len(), expected.len());
+            for &(ai_tool_id, executable_tool_id) in expected {
+                let binding = registry.find_ai_tool(domain, ai_tool_id).unwrap();
+                assert_eq!(binding.executable_tool.id, executable_tool_id);
+                assert_eq!(binding.parameter_schema()["additionalProperties"], false);
+            }
+        }
+    }
 
     #[test]
     fn loft_section_precheck_requires_matching_segments_and_winding() {

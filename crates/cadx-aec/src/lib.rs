@@ -307,30 +307,35 @@ const AI_TOOLS: [DomainAiTool; 5] = [
         label: "Create wall",
         description: "Create a wall solid with BIM metadata",
         schema_id: "cadx.domain.aec.create_wall.v1",
+        executable_tool_id: "wall",
     },
     DomainAiTool {
         id: "aec_create_slab",
         label: "Create slab",
         description: "Create a slab solid with BIM metadata",
         schema_id: "cadx.domain.aec.create_slab.v1",
+        executable_tool_id: "slab",
     },
     DomainAiTool {
         id: "aec_update_bim_properties",
         label: "Update BIM properties",
         description: "Apply IFC class and property-set values",
         schema_id: "cadx.domain.aec.update_bim_properties.v1",
+        executable_tool_id: "bim-attrs",
     },
     DomainAiTool {
         id: "aec_run_clash",
         label: "Run clash review",
         description: "Run spatial coordination checks",
         schema_id: "cadx.domain.aec.run_clash.v1",
+        executable_tool_id: "clash",
     },
     DomainAiTool {
         id: "aec_export_ifc",
         label: "Export IFC",
         description: "Validate and export IFC4/IFC4X3",
         schema_id: "cadx.domain.aec.export_ifc.v1",
+        executable_tool_id: "ifc",
     },
 ];
 

@@ -48,6 +48,9 @@ impl CadxApp {
             if self.sketch_dimension_editor.take().is_some() {
                 return;
             }
+            if self.cancel_ai_plan() {
+                return;
+            }
             self.selected = None;
             self.clear_topology_selection();
             self.clear_measurement();

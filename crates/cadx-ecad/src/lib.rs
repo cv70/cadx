@@ -454,30 +454,35 @@ const AI_TOOLS: [DomainAiTool; 5] = [
         label: "Create board",
         description: "Create a board outline and stackup proposal",
         schema_id: "cadx.domain.ecad.create_board.v1",
+        executable_tool_id: "board",
     },
     DomainAiTool {
         id: "ecad_place_component",
         label: "Place component",
         description: "Place a footprint and optional linked 3D package",
         schema_id: "cadx.domain.ecad.place_component.v1",
+        executable_tool_id: "placement",
     },
     DomainAiTool {
         id: "ecad_route_net",
         label: "Route net",
         description: "Route a net with width, layer, and clearance constraints",
         schema_id: "cadx.domain.ecad.route_net.v1",
+        executable_tool_id: "routing",
     },
     DomainAiTool {
         id: "ecad_run_drc",
         label: "Run DRC",
         description: "Run deterministic electrical design-rule checks",
         schema_id: "cadx.domain.ecad.run_drc.v1",
+        executable_tool_id: "drc",
     },
     DomainAiTool {
         id: "ecad_export_manufacturing",
         label: "Export manufacturing",
         description: "Validate and preview Gerber/drill manufacturing outputs",
         schema_id: "cadx.domain.ecad.export_manufacturing.v1",
+        executable_tool_id: "gerber",
     },
 ];
 
@@ -592,6 +597,7 @@ impl DomainPack for EcadPack {
     fn tool_panel(&self, tool_id: &str) -> Option<DomainPanelSchema> {
         match tool_id {
             "board" => Some(PANELS[0]),
+            "routing" => Some(PANELS[1]),
             "placement" | "3d-link" => Some(PANELS[2]),
             _ => None,
         }

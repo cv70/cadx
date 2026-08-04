@@ -402,24 +402,28 @@ const AI_TOOLS: [DomainAiTool; 4] = [
         label: "Create prismatic part",
         description: "Create a conservative box-based mechanical feature proposal",
         schema_id: "cadx.domain.mcad.create_prismatic_part.v1",
+        executable_tool_id: "ai-part",
     },
     DomainAiTool {
-        id: "mcad_open_feature_tool",
-        label: "Open feature tool",
-        description: "Open sketch, extrude, chamfer, fillet, or assembly tooling",
-        schema_id: "cadx.domain.mcad.open_feature_tool.v1",
+        id: "mcad_open_sketch",
+        label: "Open sketch",
+        description: "Open the mechanical sketch workflow",
+        schema_id: "cadx.domain.mcad.open_sketch.v1",
+        executable_tool_id: "sketch",
     },
     DomainAiTool {
         id: "mcad_run_dfm",
         label: "Run DFM",
         description: "Run mechanical manufacturability checks",
         schema_id: "cadx.domain.mcad.run_dfm.v1",
+        executable_tool_id: "dfm",
     },
     DomainAiTool {
         id: "mcad_generate_bom",
         label: "Generate BOM",
         description: "Generate a grouped mechanical bill of materials",
         schema_id: "cadx.domain.mcad.generate_bom.v1",
+        executable_tool_id: "bom",
     },
 ];
 

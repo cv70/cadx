@@ -13,6 +13,13 @@ pub enum SessionError {
     Kernel(#[from] KernelError),
     #[error("document revision id space is exhausted")]
     RevisionExhausted,
+    #[error(
+        "preview was evaluated at revision {preview_revision}, but the active document is revision {active_revision}"
+    )]
+    StalePreview {
+        preview_revision: u64,
+        active_revision: u64,
+    },
 }
 
 impl SessionError {
@@ -20,7 +27,10 @@ impl SessionError {
     pub const fn boolean_diagnostic(&self) -> Option<&BooleanDiagnostic> {
         match self {
             Self::Kernel(KernelError::Boolean(diagnostic)) => Some(diagnostic),
-            Self::Document(_) | Self::Kernel(_) | Self::RevisionExhausted => None,
+            Self::Document(_)
+            | Self::Kernel(_)
+            | Self::RevisionExhausted
+            | Self::StalePreview { .. } => None,
         }
     }
 
@@ -28,7 +38,10 @@ impl SessionError {
     pub const fn edge_modifier_diagnostic(&self) -> Option<&EdgeModifierDiagnostic> {
         match self {
             Self::Kernel(KernelError::EdgeModifier(diagnostic)) => Some(diagnostic),
-            Self::Document(_) | Self::Kernel(_) | Self::RevisionExhausted => None,
+            Self::Document(_)
+            | Self::Kernel(_)
+            | Self::RevisionExhausted
+            | Self::StalePreview { .. } => None,
         }
     }
 
@@ -36,7 +49,10 @@ impl SessionError {
     pub const fn sketch_constraint_diagnostic(&self) -> Option<&SketchConstraintDiagnostic> {
         match self {
             Self::Document(DocumentError::SketchConstraint(diagnostic)) => Some(diagnostic),
-            Self::Document(_) | Self::Kernel(_) | Self::RevisionExhausted => None,
+            Self::Document(_)
+            | Self::Kernel(_)
+            | Self::RevisionExhausted
+            | Self::StalePreview { .. } => None,
         }
     }
 }

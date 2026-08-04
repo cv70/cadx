@@ -79,6 +79,40 @@ pub struct SceneAnalysis {
     pub inertia_centroid_kg_mm2: Option<[[f64; 3]; 3]>,
 }
 
+/// Authoritative metric change between a committed and candidate scene.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScalarComparison {
+    pub baseline: f64,
+    pub candidate: f64,
+    pub delta: f64,
+    pub percent: Option<f64>,
+}
+
+impl ScalarComparison {
+    #[must_use]
+    pub fn new(baseline: f64, candidate: f64) -> Self {
+        let delta = candidate - baseline;
+        let percent = (baseline.abs() > f64::EPSILON).then_some(delta / baseline * 100.0);
+        Self {
+            baseline,
+            candidate,
+            delta,
+            percent,
+        }
+    }
+}
+
+/// Deterministic engineering evidence for one staged design alternative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneComparison {
+    pub body_count_delta: i64,
+    pub triangle_count_delta: i64,
+    pub surface_area_mm2: ScalarComparison,
+    pub volume_mm3: ScalarComparison,
+    pub mass_kg: Option<ScalarComparison>,
+    pub center_of_mass_shift_mm: Option<f64>,
+}
+
 impl Default for SceneAnalysis {
     fn default() -> Self {
         Self {
@@ -163,6 +197,57 @@ pub fn analyze_scene(
         center_of_mass_mm,
         inertia_centroid_kg_mm2,
     })
+}
+
+/// Compares committed and candidate scenes using locally computed geometry.
+///
+/// Mass and center-of-mass changes are reported only when material assignments
+/// (or the supplied density override) make both scene analyses complete.
+///
+/// # Errors
+///
+/// Returns [`AnalysisError`] when either scene contains invalid analysis mesh
+/// data or the density override is invalid.
+pub fn compare_scenes(
+    baseline: &EvaluatedScene,
+    candidate: &EvaluatedScene,
+    density_override_kg_m3: Option<f64>,
+) -> Result<SceneComparison, AnalysisError> {
+    let baseline_analysis = analyze_scene(baseline, density_override_kg_m3)?;
+    let candidate_analysis = analyze_scene(candidate, density_override_kg_m3)?;
+    let mass_kg = baseline_analysis
+        .total_mass_kg
+        .zip(candidate_analysis.total_mass_kg)
+        .map(|(baseline, candidate)| ScalarComparison::new(baseline, candidate));
+    let center_of_mass_shift_mm = baseline_analysis
+        .center_of_mass_mm
+        .zip(candidate_analysis.center_of_mass_mm)
+        .map(|(baseline, candidate)| length(sub(candidate, baseline)));
+    Ok(SceneComparison {
+        body_count_delta: signed_count_delta(candidate.parts.len(), baseline.parts.len()),
+        triangle_count_delta: signed_count_delta(
+            candidate.triangle_count(),
+            baseline.triangle_count(),
+        ),
+        surface_area_mm2: ScalarComparison::new(
+            baseline_analysis.total_surface_area_mm2,
+            candidate_analysis.total_surface_area_mm2,
+        ),
+        volume_mm3: ScalarComparison::new(
+            baseline_analysis.total_volume_mm3,
+            candidate_analysis.total_volume_mm3,
+        ),
+        mass_kg,
+        center_of_mass_shift_mm,
+    })
+}
+
+fn signed_count_delta(candidate: usize, baseline: usize) -> i64 {
+    if candidate >= baseline {
+        i64::try_from(candidate - baseline).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(baseline - candidate).unwrap_or(i64::MAX)
+    }
 }
 
 fn analyze_part(
@@ -478,6 +563,28 @@ mod tests {
         for (axis, row) in inertia.iter().enumerate() {
             assert!((row[axis] - 1.0e-6 / 6.0).abs() < 1.0e-12);
         }
+    }
+
+    #[test]
+    fn compares_candidate_metrics_without_model_supplied_numbers() {
+        let baseline = cube_scene();
+        let mut candidate = baseline.clone();
+        let mut second = candidate.parts[0].clone();
+        second.feature_id = 2;
+        for position in &mut second.mesh.positions {
+            position[0] += 2.0;
+        }
+        candidate.parts.push(second);
+
+        let comparison = compare_scenes(&baseline, &candidate, Some(1_000.0)).unwrap();
+        assert_eq!(comparison.body_count_delta, 1);
+        assert_eq!(comparison.triangle_count_delta, 12);
+        assert!((comparison.volume_mm3.baseline - 1.0).abs() < 1.0e-6);
+        assert!((comparison.volume_mm3.candidate - 2.0).abs() < 1.0e-6);
+        assert!((comparison.volume_mm3.percent.unwrap() - 100.0).abs() < 1.0e-6);
+        assert!((comparison.surface_area_mm2.delta - 6.0).abs() < 1.0e-6);
+        assert!((comparison.mass_kg.unwrap().delta - 1.0e-6).abs() < 1.0e-12);
+        assert!((comparison.center_of_mass_shift_mm.unwrap() - 1.0).abs() < 1.0e-12);
     }
 
     #[test]

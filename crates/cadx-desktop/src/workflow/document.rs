@@ -17,10 +17,11 @@ impl CadxApp {
             return;
         }
         self.document_path = None;
+        self.cancel_ai_plan_for_document_change();
         self.selected = None;
         self.clear_topology_selection();
         self.clear_measurement();
-        self.pending_ai_plan = None;
+        self.discard_pending_ai_candidates();
         self.loft_dialog = None;
         self.boolean_dialog = None;
         self.edge_modifier_dialog = None;
@@ -52,13 +53,14 @@ impl CadxApp {
                     return;
                 }
                 self.document_path = Some(path);
+                self.cancel_ai_plan_for_document_change();
                 self.selected = self
                     .session
                     .document()
                     .features
                     .last()
                     .map(|feature| feature.id);
-                self.pending_ai_plan = None;
+                self.discard_pending_ai_candidates();
                 self.loft_dialog = None;
                 self.boolean_dialog = None;
                 self.edge_modifier_dialog = None;

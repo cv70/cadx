@@ -80,6 +80,7 @@ serde_yaml = "0.9"
 ruststep = "0.4.0"
 tempfile = "3.27"
 thiserror = "2"
+url = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 rfd = "0.17"
 truck-meshalgo = { version = "0.4", default-features = false, features = ["tessellation"] }

@@ -1,4 +1,6 @@
-use cadx_app::{SessionError, TransactionSource};
+use cadx_app::{
+    SessionError, TransactionMetadata, TransactionOutcome, TransactionPreview, TransactionSource,
+};
 use cadx_core::domain::{FeatureId, ModelCommand, Primitive};
 
 use crate::{CadxApp, StatusMessage};
@@ -44,7 +46,46 @@ impl CadxApp {
 
     pub(crate) fn sync_viewport(&self) {
         let measurement = self.measurement.topology(self.session.scene());
-        self.viewport_scene.update_with_topology(
+        let mut added_features = Vec::new();
+        let mut modified_features = Vec::new();
+        let mut removed_features = Vec::new();
+        let pending_preview = self
+            .pending_ai_candidates
+            .get(self.active_ai_candidate)
+            .map(|candidate| &candidate.preview)
+            .filter(|preview| preview.base_revision() == self.session.revision());
+        let preview = if let Some(preview) = pending_preview {
+            added_features.extend(
+                preview
+                    .diff()
+                    .added_features
+                    .iter()
+                    .map(|feature| feature.id),
+            );
+            modified_features.extend(
+                preview
+                    .diff()
+                    .modified_features
+                    .iter()
+                    .map(|feature| feature.id),
+            );
+            removed_features.extend(
+                preview
+                    .diff()
+                    .removed_features
+                    .iter()
+                    .map(|feature| feature.id),
+            );
+            Some(cadx_render::GhostPreview {
+                scene: preview.scene(),
+                added_features: &added_features,
+                modified_features: &modified_features,
+                removed_features: &removed_features,
+            })
+        } else {
+            None
+        };
+        self.viewport_scene.update_with_topology_and_preview(
             self.session.scene(),
             self.selected,
             cadx_render::TopologySelection {
@@ -56,6 +97,7 @@ impl CadxApp {
                 measurement_vertices: &measurement.vertices,
                 measurement_guides: &measurement.guides,
             },
+            preview,
         );
     }
 
@@ -82,20 +124,65 @@ impl CadxApp {
         let outcome = match self.session.execute_with_source(commands, source) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let Some(diagnostic) = error.boolean_diagnostic() {
-                    self.last_boolean_failure = Some(diagnostic.clone());
-                }
-                if let Some(diagnostic) = error.edge_modifier_diagnostic() {
-                    self.last_edge_modifier_failure = Some(diagnostic.clone());
-                }
-                if let Some(diagnostic) = error.sketch_constraint_diagnostic() {
-                    self.last_sketch_failure = Some(diagnostic.clone());
-                    self.last_sketch_failure_feature = selected_sketch;
-                }
-                self.status = StatusMessage::Text(error.to_string());
+                self.record_session_error(&error, selected_sketch);
                 return Err(error);
             }
         };
+        self.finish_transaction(&outcome, status, source);
+        Ok(())
+    }
+
+    pub(crate) fn commit_preview_from(
+        &mut self,
+        preview: TransactionPreview,
+        status: StatusMessage,
+        source: TransactionSource,
+        label: String,
+    ) -> Result<(), SessionError> {
+        let selected_sketch = self.selected.filter(|id| {
+            self.session
+                .document()
+                .feature(*id)
+                .is_some_and(|feature| matches!(feature.primitive, Primitive::Sketch { .. }))
+        });
+        let outcome = match self
+            .session
+            .commit_preview_with_metadata(preview, TransactionMetadata::new(source, label))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.record_session_error(&error, selected_sketch);
+                return Err(error);
+            }
+        };
+        self.finish_transaction(&outcome, status, source);
+        Ok(())
+    }
+
+    fn record_session_error(&mut self, error: &SessionError, selected_sketch: Option<FeatureId>) {
+        if let Some(diagnostic) = error.boolean_diagnostic() {
+            self.last_boolean_failure = Some(diagnostic.clone());
+        }
+        if let Some(diagnostic) = error.edge_modifier_diagnostic() {
+            self.last_edge_modifier_failure = Some(diagnostic.clone());
+        }
+        if let Some(diagnostic) = error.sketch_constraint_diagnostic() {
+            self.last_sketch_failure = Some(diagnostic.clone());
+            self.last_sketch_failure_feature = selected_sketch;
+        }
+        self.status = StatusMessage::Text(error.to_string());
+    }
+
+    fn finish_transaction(
+        &mut self,
+        outcome: &TransactionOutcome,
+        status: StatusMessage,
+        source: TransactionSource,
+    ) {
+        if source != TransactionSource::Ai {
+            self.cancel_ai_plan_for_document_change();
+            self.discard_pending_ai_candidates();
+        }
         self.last_boolean_failure = None;
         self.last_edge_modifier_failure = None;
         self.last_sketch_failure = None;
@@ -126,12 +213,13 @@ impl CadxApp {
         self.sync_domain_state();
         self.status = status;
         self.sync_viewport();
-        Ok(())
     }
 
     pub(crate) fn undo(&mut self) {
         match self.session.undo() {
             Ok(true) => {
+                self.cancel_ai_plan_for_document_change();
+                self.discard_pending_ai_candidates();
                 self.interference_dialog = None;
                 self.status = StatusMessage::Key("status.undo");
                 self.reconcile_selection();
@@ -144,6 +232,8 @@ impl CadxApp {
     pub(crate) fn redo(&mut self) {
         match self.session.redo() {
             Ok(true) => {
+                self.cancel_ai_plan_for_document_change();
+                self.discard_pending_ai_candidates();
                 self.interference_dialog = None;
                 self.status = StatusMessage::Key("status.redo");
                 self.reconcile_selection();

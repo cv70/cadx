@@ -6,7 +6,10 @@ use cadx_core::{
 };
 use thiserror::Error;
 
-use crate::{DocumentSession, DocumentState, SessionError, TransactionOutcome};
+use crate::{
+    DocumentDiff, DocumentSession, DocumentState, SessionError, TransactionOutcome,
+    TransactionPreview,
+};
 
 pub const DEFAULT_EVENT_LOG_LIMIT: usize = 256;
 
@@ -73,6 +76,19 @@ pub enum CoreEvent {
         label: String,
         command_count: usize,
         error: String,
+    },
+    PreviewPrepared {
+        source: TransactionSource,
+        label: String,
+        base_revision: u64,
+        command_count: usize,
+        diff: DocumentDiff,
+    },
+    PreviewDiscarded {
+        source: TransactionSource,
+        label: String,
+        base_revision: u64,
+        command_count: usize,
     },
     UndoApplied {
         revision: u64,
@@ -319,6 +335,102 @@ impl CoreBus {
                 Err(error)
             }
         }
+    }
+
+    /// Evaluates a command batch in an isolated copy-on-write sandbox.
+    ///
+    /// The active document, evaluated scene, revision, dirty state, and history
+    /// are unchanged. The returned preview is bound to the active revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when document or kernel validation fails.
+    pub fn preview_with_source(
+        &mut self,
+        commands: &[ModelCommand],
+        source: TransactionSource,
+    ) -> Result<TransactionPreview, SessionError> {
+        let metadata = TransactionMetadata::from_commands(source, commands);
+        self.preview_with_metadata(commands, metadata)
+    }
+
+    /// Evaluates a command batch in a sandbox with caller-provided metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when document or kernel validation fails.
+    pub fn preview_with_metadata(
+        &mut self,
+        commands: &[ModelCommand],
+        metadata: TransactionMetadata,
+    ) -> Result<TransactionPreview, SessionError> {
+        let preview = self.session.preview(commands)?;
+        self.dispatcher.publish(CoreEvent::PreviewPrepared {
+            source: metadata.source,
+            label: metadata.label,
+            base_revision: preview.base_revision(),
+            command_count: preview.command_count(),
+            diff: preview.diff().clone(),
+        });
+        Ok(preview)
+    }
+
+    /// Commits a kernel-validated preview as one observable transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StalePreview`] when the active revision changed
+    /// after preview evaluation. No document state is changed on failure.
+    pub fn commit_preview_with_metadata(
+        &mut self,
+        preview: TransactionPreview,
+        metadata: TransactionMetadata,
+    ) -> Result<TransactionOutcome, SessionError> {
+        let transaction_id = self.allocate_transaction_id();
+        let command_count = preview.command_count();
+        self.dispatcher.publish(CoreEvent::TransactionStarted {
+            transaction_id,
+            source: metadata.source,
+            label: metadata.label.clone(),
+            command_count,
+        });
+        match self.session.commit_preview(preview) {
+            Ok(outcome) => {
+                self.dispatcher.publish(CoreEvent::TransactionCommitted {
+                    transaction_id,
+                    source: metadata.source,
+                    label: metadata.label,
+                    revision: self.session.revision(),
+                    state: self.session.state(),
+                    command_count,
+                    created_features: outcome.created_features.clone(),
+                });
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.dispatcher.publish(CoreEvent::TransactionRejected {
+                    transaction_id,
+                    source: metadata.source,
+                    label: metadata.label,
+                    command_count,
+                    error: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Records explicit rejection of a preview. The live session is unchanged.
+    pub fn discard_preview(&mut self, preview: TransactionPreview, metadata: TransactionMetadata) {
+        let base_revision = preview.base_revision();
+        let command_count = preview.command_count();
+        drop(preview);
+        self.dispatcher.publish(CoreEvent::PreviewDiscarded {
+            source: metadata.source,
+            label: metadata.label,
+            base_revision,
+            command_count,
+        });
     }
 
     /// Replaces the active document and clears undo/redo history.
@@ -639,6 +751,74 @@ mod tests {
                 created_features,
                 ..
             }) if *id == stream_id && created_features == &vec![1, 2]
+        ));
+    }
+
+    #[test]
+    fn preview_publishes_diff_and_commit_events_without_early_mutation() {
+        let mut bus = test_bus();
+        let preview = bus
+            .preview_with_source(&[create_box("candidate")], TransactionSource::Ai)
+            .unwrap();
+        assert!(bus.document().features.is_empty());
+        assert_eq!(bus.revision(), 1);
+        assert!(matches!(
+            bus.drain_events().as_slice(),
+            [CoreEvent::PreviewPrepared {
+                source: TransactionSource::Ai,
+                base_revision: 1,
+                command_count: 1,
+                diff,
+                ..
+            }] if diff.added_features.len() == 1 && diff.added_features[0].id == 1
+        ));
+
+        bus.commit_preview_with_metadata(
+            preview,
+            TransactionMetadata::new(TransactionSource::Ai, "candidate"),
+        )
+        .unwrap();
+        assert_eq!(bus.document().features.len(), 1);
+        assert!(matches!(
+            bus.drain_events().as_slice(),
+            [
+                CoreEvent::TransactionStarted {
+                    source: TransactionSource::Ai,
+                    command_count: 1,
+                    ..
+                },
+                CoreEvent::TransactionCommitted {
+                    source: TransactionSource::Ai,
+                    revision: 2,
+                    created_features,
+                    ..
+                }
+            ] if created_features == &vec![1]
+        ));
+    }
+
+    #[test]
+    fn discarding_preview_is_observable_and_does_not_mutate_document() {
+        let mut bus = test_bus();
+        let preview = bus
+            .preview_with_source(&[create_box("candidate")], TransactionSource::Ai)
+            .unwrap();
+        let _ = bus.drain_events();
+        bus.discard_preview(
+            preview,
+            TransactionMetadata::new(TransactionSource::Ai, "candidate"),
+        );
+
+        assert!(bus.document().features.is_empty());
+        assert_eq!(bus.revision(), 1);
+        assert!(matches!(
+            bus.drain_events().as_slice(),
+            [CoreEvent::PreviewDiscarded {
+                source: TransactionSource::Ai,
+                base_revision: 1,
+                command_count: 1,
+                ..
+            }]
         ));
     }
 }

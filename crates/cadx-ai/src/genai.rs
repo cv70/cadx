@@ -1,21 +1,43 @@
 use genai::{
     Client, ModelIden, ServiceTarget, WebConfig,
     adapter::AdapterKind,
-    chat::{ChatMessage, ChatRequest, Tool},
+    chat::{ChatMessage, ChatOptions, ChatRequest, Tool, ToolChoice},
     resolver::{AuthData, Endpoint, ServiceTargetResolver},
 };
+use serde::Serialize;
 use serde_json::json;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
+use cadx_analysis::{MeasurementResult, SceneAnalysis};
 use cadx_config::ProviderConfig;
-use cadx_core::domain::Primitive;
+use cadx_core::{
+    assembly::{AssemblyMate, ComponentDefinition, ComponentOccurrence},
+    diagnostics::{BooleanDiagnostic, EdgeModifierDiagnostic, SketchConstraintDiagnostic},
+    domain::{CadDocument, Feature, FeatureId, Primitive},
+    kernel::{
+        CadKernelCapabilities, InterferenceAnalysis, InterferencePairAnalysis,
+        InterferencePairOutcome, SketchSolveDiagnostic,
+    },
+};
 
-use super::{AiAssistant, AiError, AiFuture, AiRequest};
+use super::{
+    AiAssistant, AiContext, AiError, AiFuture, AiRequest, AiSketchDimension, DomainAiFuture,
+    DomainAiPlan, DomainAiRequest,
+};
 
 const SYSTEM_PROMPT: &str = r"You are the modeling agent inside CADX, a parametric 3D CAD application.
 Convert the user's request into safe, explicit modeling commands by calling apply_cad_plan exactly once.
 All dimensions and positions are in millimeters. Preserve existing features unless the user asks to change them.
 Use the feature ids in the supplied document when modifying existing geometry. Keep the plan concise.
+When the user asks to optimize, compare tradeoffs, or explore approaches and
+there are genuinely distinct solutions, include up to two independent
+alternatives. Every alternative must be a complete command batch against the
+same current document, not an incremental edit after another candidate. Do not
+invent volume, mass, clearance, interference, or performance claims; CADX will
+kernel-evaluate and measure every candidate locally before showing it.
 Sketch profiles may include ordered Coincident, Horizontal, Vertical, Fixed,
 Distance, HorizontalDistance, VerticalDistance, PointLineDistance,
 LineThroughCenter, Length, EqualLength, Parallel, Perpendicular, and Angle constraints;
@@ -69,8 +91,11 @@ no holes. Order the ids monotonically through the intended body; do not use a
 loft for folded or branching section sequences.
 The user will review the proposed command batch before CADX applies it.
 Use the computed geometric context for spatial reasoning when present. Treat
-it as read-only evidence. Selected faces, edges, and vertices use persistent
-kernel-neutral references. A selected face or vertex may be used for reference-geometry
+it as read-only evidence. Interaction selection is nested under
+interaction.selection; viewport focus, retrieved feature graph entries, spatial
+neighbors, and every omitted count are under interaction. Selected faces,
+edges, and vertices use persistent kernel-neutral references. A selected face
+or vertex may be used for reference-geometry
 commands. Follow kernel_capabilities when deciding whether chamfer or fillet is available and which
 multi-edge, support-surface, convexity, and shared-vertex restrictions apply. When capabilities are
 absent, use the conservative contract of one convex linear edge between two planar faces. Do not
@@ -97,7 +122,23 @@ to refine a sketch without treating redundancy as inconsistency. For a rejected
 edit, branch on last_sketch_failure.reason and its zero-based constraint_indices.
 Use diagnostic stage and reason codes for corrective planning; never infer behavior by parsing a diagnostic detail string.
 Do not invent tolerance data that is not supplied.
+The document context is relevance-retrieved and bounded. Never guess an omitted
+feature, occurrence, mate, or identifier. Use only detailed objects supplied in
+the current request; if the requested object is omitted or ambiguous, return no
+speculative edit.
 Never claim support for operations that are absent from the tool schema.";
+const DOMAIN_SYSTEM_PROMPT: &str = r"You are the domain tool router inside CADX, an industrial CAD application.
+Choose exactly one of the offered tools that best satisfies the user's request and call it exactly once.
+Use the supplied document context for entity references and dimensions. Do not invent tool names or fields.
+Arguments use the plain JSON types declared by the selected tool schema. Omit optional values only when the
+schema permits it. Never emit CAD commands directly; the selected domain pack validates and executes the call.";
+const MAX_PROVIDER_ERROR_CHARS: usize = 800;
+const MAX_PROMPT_FEATURES_WITHOUT_CONTEXT: usize = 64;
+const MAX_PROMPT_ASSEMBLIES: usize = 8;
+const MAX_PROMPT_OCCURRENCES_PER_ASSEMBLY: usize = 32;
+const MAX_PROMPT_INTERFERENCE_FEATURES: usize = 64;
+const MAX_PROMPT_INTERFERENCE_PAIRS: usize = 32;
+const OCCURRENCE_SCORE_PRIORITY_STRIDE: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct GenAiAssistant {
@@ -139,7 +180,11 @@ impl GenAiAssistant {
             None => AdapterKind::from_model(&model)
                 .map_err(|error| AiError::Configuration(error.to_string()))?,
         };
-        let endpoint = config.endpoint.clone();
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .map(normalize_endpoint_base_url)
+            .transpose()?;
         let api_key = config.api_key.clone();
         let resolver = ServiceTargetResolver::from_resolver_fn(
             move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -184,7 +229,7 @@ impl AiAssistant for GenAiAssistant {
             let response = client
                 .exec_chat(&model, chat_request, None)
                 .await
-                .map_err(|error| AiError::Request(error.to_string()))?;
+                .map_err(|error| AiError::Request(provider_error_message(&error.to_string())))?;
             let fallback_text = response
                 .first_text()
                 .unwrap_or("no response text")
@@ -199,10 +244,203 @@ impl AiAssistant for GenAiAssistant {
                 .map_err(|error| AiError::InvalidPlan(error.to_string()))
         })
     }
+
+    fn plan_domain(&self, request: DomainAiRequest) -> DomainAiFuture {
+        let client = self.client.clone();
+        let model = self.model.clone();
+        Box::pin(async move {
+            let DomainAiRequest {
+                prompt,
+                domain,
+                context,
+                tools,
+            } = request;
+            if tools.is_empty() {
+                return Err(AiError::InvalidDomainToolCall(format!(
+                    "no AI tools are registered for {}",
+                    domain.slug()
+                )));
+            }
+
+            let provider_tools = tools
+                .iter()
+                .map(|binding| {
+                    Tool::new(binding.ai_tool.id)
+                        .with_description(binding.ai_tool.description)
+                        .with_schema(binding.parameter_schema())
+                        .with_strict(true)
+                })
+                .collect::<Vec<_>>();
+            let prompt = serde_json::to_string(&json!({
+                "user_request": prompt,
+                "active_domain": domain,
+                "document_context": context,
+            }))
+            .map_err(|error| AiError::InvalidPlan(error.to_string()))?;
+            let chat_request = ChatRequest::new(vec![
+                ChatMessage::system(DOMAIN_SYSTEM_PROMPT),
+                ChatMessage::user(prompt),
+            ])
+            .with_tools(provider_tools);
+            let options = ChatOptions::default().with_tool_choice(ToolChoice::Required);
+            let response = client
+                .exec_chat(&model, chat_request, Some(&options))
+                .await
+                .map_err(|error| AiError::Request(provider_error_message(&error.to_string())))?;
+            let fallback_text = response
+                .first_text()
+                .unwrap_or("no response text")
+                .to_owned();
+            let calls = response.tool_calls();
+            if calls.len() != 1 {
+                return Err(AiError::InvalidDomainToolCall(format!(
+                    "expected exactly one offered tool call, received {}; {fallback_text}",
+                    calls.len()
+                )));
+            }
+            let call = calls[0];
+            let binding = tools
+                .iter()
+                .find(|binding| binding.ai_tool.id == call.fn_name)
+                .ok_or_else(|| {
+                    AiError::InvalidDomainToolCall(format!(
+                        "tool {} was not offered for {}",
+                        call.fn_name,
+                        domain.slug()
+                    ))
+                })?;
+            let parameters = binding
+                .decode_parameters(&call.fn_arguments)
+                .map_err(AiError::InvalidDomainToolCall)?;
+
+            Ok(DomainAiPlan {
+                domain,
+                ai_tool_id: binding.ai_tool.id.into(),
+                executable_tool_id: binding.executable_tool.id.into(),
+                parameters,
+            })
+        })
+    }
+}
+
+fn normalize_endpoint_base_url(endpoint: &str) -> Result<String, AiError> {
+    let mut url = url::Url::parse(endpoint.trim()).map_err(|error| {
+        AiError::Configuration(format!("provider.endpoint is not a valid URL: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(AiError::Configuration(
+            "provider.endpoint must be an HTTP(S) base URL".into(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(AiError::Configuration(
+            "provider.endpoint must not contain a URL fragment".into(),
+        ));
+    }
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url.into())
+}
+
+fn provider_error_message(message: &str) -> String {
+    if message.contains("text/html") || message.contains("<!DOCTYPE html") {
+        return "provider returned HTML instead of JSON; verify provider.endpoint is an API base URL and gateway API authentication is enabled".into();
+    }
+
+    let mut compact = String::new();
+    let mut previous_was_whitespace = false;
+    let mut truncated = false;
+    for (character_count, character) in message.chars().enumerate() {
+        if character_count >= MAX_PROVIDER_ERROR_CHARS {
+            truncated = true;
+            break;
+        }
+        if character.is_whitespace() {
+            if !previous_was_whitespace {
+                compact.push(' ');
+            }
+            previous_was_whitespace = true;
+        } else {
+            compact.push(character);
+            previous_was_whitespace = false;
+        }
+    }
+    let compact = compact.trim();
+    if truncated {
+        format!("{compact}...")
+    } else {
+        compact.to_owned()
+    }
+}
+
+#[derive(Serialize)]
+struct PlanningDocumentContext {
+    name: String,
+    next_feature_id: FeatureId,
+    total_feature_count: usize,
+    features: Vec<Feature>,
+    omitted_feature_count: usize,
+    total_assembly_count: usize,
+    assemblies: Vec<PlanningAssemblyContext>,
+    omitted_assembly_count: usize,
+    domain_namespaces: Vec<DomainNamespaceSummary>,
+}
+
+#[derive(Serialize)]
+struct PlanningAssemblyContext {
+    id: u64,
+    name: String,
+    total_definition_count: usize,
+    definitions: Vec<ComponentDefinition>,
+    omitted_definition_count: usize,
+    total_occurrence_count: usize,
+    occurrences: Vec<ComponentOccurrence>,
+    omitted_occurrence_count: usize,
+    total_mate_count: usize,
+    mates: Vec<AssemblyMate>,
+    omitted_mate_count: usize,
+}
+
+#[derive(Serialize)]
+struct DomainNamespaceSummary {
+    namespace: String,
+    entry_count: usize,
+}
+
+#[derive(Serialize)]
+struct PlanningAiContext<'a> {
+    interaction: &'a crate::context::ContextSnapshot,
+    kernel_capabilities: &'a CadKernelCapabilities,
+    measurement: &'a Option<MeasurementResult>,
+    last_boolean_failure: &'a Option<BooleanDiagnostic>,
+    last_edge_modifier_failure: &'a Option<EdgeModifierDiagnostic>,
+    last_sketch_failure: &'a Option<SketchConstraintDiagnostic>,
+    selected_sketch_diagnostic: &'a Option<SketchSolveDiagnostic>,
+    selected_sketch_dimensions: &'a [AiSketchDimension],
+    scene_analysis: &'a SceneAnalysis,
+    interference_analysis: Option<PlanningInterferenceContext<'a>>,
+}
+
+#[derive(Serialize)]
+struct PlanningInterferenceContext<'a> {
+    total_candidate_feature_count: usize,
+    candidate_feature_ids: Vec<FeatureId>,
+    omitted_candidate_feature_count: usize,
+    total_pair_count: u64,
+    broad_phase_pair_count: u64,
+    clear_pair_count: u64,
+    interfering_pair_count: u64,
+    failed_pair_count: u64,
+    volume_tolerance_mm3: f64,
+    total_pair_detail_count: usize,
+    pairs: Vec<&'a InterferencePairAnalysis>,
+    omitted_pair_detail_count: usize,
 }
 
 fn build_prompt(request: &AiRequest) -> Result<String, AiError> {
-    let mut document_context = request.document.clone();
+    let mut document_context = planning_document_context(request);
     for feature in &mut document_context.features {
         if let Primitive::ImportedStep { source, .. } = &mut feature.primitive {
             *source = format!("<redacted embedded STEP source: {} bytes>", source.len());
@@ -213,19 +451,368 @@ fn build_prompt(request: &AiRequest) -> Result<String, AiError> {
     let context = request
         .context
         .as_ref()
-        .map(serde_json::to_string_pretty)
+        .map(planning_ai_context)
+        .map(|context| serde_json::to_string_pretty(&context))
         .transpose()
         .map_err(|error| AiError::InvalidPlan(error.to_string()))?
         .unwrap_or_else(|| "{}".into());
     Ok(format!(
-        "Current CAD document:\n{document}\n\nComputed geometric context (read-only):\n{context}\n\nUser request:\n{}",
+        "Retrieved CAD document context (read-only, bounded):\n{document}\n\nComputed geometric and interaction context (read-only, bounded):\n{context}\n\nUser request:\n{}",
         request.prompt
     ))
 }
 
+fn planning_ai_context(context: &AiContext) -> PlanningAiContext<'_> {
+    let relevant_feature_ids = context
+        .interaction
+        .relevant_features
+        .iter()
+        .map(|feature| feature.feature_id)
+        .chain(
+            context
+                .interaction
+                .spatial_entities
+                .iter()
+                .map(|entity| entity.feature_id),
+        )
+        .chain(context.interaction.selection.selected_feature_id)
+        .chain(
+            context
+                .interaction
+                .selection
+                .selected_face
+                .as_ref()
+                .map(|face| face.feature_id),
+        )
+        .chain(
+            context
+                .interaction
+                .selection
+                .selected_edges
+                .iter()
+                .map(|edge| edge.feature_id),
+        )
+        .chain(
+            context
+                .interaction
+                .selection
+                .selected_vertex
+                .as_ref()
+                .map(|vertex| vertex.feature_id),
+        )
+        .collect::<BTreeSet<_>>();
+    PlanningAiContext {
+        interaction: &context.interaction,
+        kernel_capabilities: &context.kernel_capabilities,
+        measurement: &context.measurement,
+        last_boolean_failure: &context.last_boolean_failure,
+        last_edge_modifier_failure: &context.last_edge_modifier_failure,
+        last_sketch_failure: &context.last_sketch_failure,
+        selected_sketch_diagnostic: &context.selected_sketch_diagnostic,
+        selected_sketch_dimensions: &context.selected_sketch_dimensions,
+        scene_analysis: &context.scene_analysis,
+        interference_analysis: context
+            .interference_analysis
+            .as_ref()
+            .map(|analysis| planning_interference_context(analysis, &relevant_feature_ids)),
+    }
+}
+
+fn planning_interference_context<'a>(
+    analysis: &'a InterferenceAnalysis,
+    relevant_feature_ids: &BTreeSet<FeatureId>,
+) -> PlanningInterferenceContext<'a> {
+    let mut ranked_pairs = analysis.pairs.iter().enumerate().collect::<Vec<_>>();
+    ranked_pairs.sort_by_key(|(index, pair)| {
+        let related = pair
+            .feature_ids
+            .iter()
+            .any(|feature_id| relevant_feature_ids.contains(feature_id));
+        let outcome_priority = match pair.outcome {
+            InterferencePairOutcome::Interfering { .. } => 0,
+            InterferencePairOutcome::Failed { .. } => 1,
+            InterferencePairOutcome::Clear { .. } => 2,
+        };
+        (!related, outcome_priority, *index)
+    });
+    ranked_pairs.truncate(MAX_PROMPT_INTERFERENCE_PAIRS);
+    let pairs = ranked_pairs
+        .into_iter()
+        .map(|(_, pair)| pair)
+        .collect::<Vec<_>>();
+
+    let available_feature_ids = analysis
+        .candidate_feature_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut seen_feature_ids = BTreeSet::new();
+    let candidate_feature_ids = analysis
+        .candidate_feature_ids
+        .iter()
+        .copied()
+        .filter(|feature_id| relevant_feature_ids.contains(feature_id))
+        .chain(
+            pairs
+                .iter()
+                .flat_map(|pair| pair.feature_ids)
+                .filter(|feature_id| available_feature_ids.contains(feature_id)),
+        )
+        .chain(analysis.candidate_feature_ids.iter().copied())
+        .filter(|feature_id| seen_feature_ids.insert(*feature_id))
+        .take(MAX_PROMPT_INTERFERENCE_FEATURES)
+        .collect::<Vec<_>>();
+
+    PlanningInterferenceContext {
+        total_candidate_feature_count: analysis.candidate_feature_ids.len(),
+        omitted_candidate_feature_count: analysis
+            .candidate_feature_ids
+            .len()
+            .saturating_sub(candidate_feature_ids.len()),
+        candidate_feature_ids,
+        total_pair_count: analysis.total_pair_count,
+        broad_phase_pair_count: analysis.broad_phase_pair_count,
+        clear_pair_count: analysis.clear_pair_count,
+        interfering_pair_count: analysis.interfering_pair_count,
+        failed_pair_count: analysis.failed_pair_count,
+        volume_tolerance_mm3: analysis.volume_tolerance_mm3,
+        total_pair_detail_count: analysis.pairs.len(),
+        omitted_pair_detail_count: analysis.pairs.len().saturating_sub(pairs.len()),
+        pairs,
+    }
+}
+
+fn planning_document_context(request: &AiRequest) -> PlanningDocumentContext {
+    let document = &request.document;
+    let requested_feature_ids = request
+        .context
+        .as_ref()
+        .map(|context| {
+            context
+                .interaction
+                .relevant_features
+                .iter()
+                .map(|feature| feature.feature_id)
+                .collect::<Vec<_>>()
+        })
+        .filter(|feature_ids| !feature_ids.is_empty())
+        .unwrap_or_else(|| {
+            let mut ids = document
+                .features
+                .iter()
+                .rev()
+                .take(MAX_PROMPT_FEATURES_WITHOUT_CONTEXT)
+                .map(|feature| feature.id)
+                .collect::<Vec<_>>();
+            ids.reverse();
+            ids
+        });
+    let mut seen_feature_ids = BTreeSet::new();
+    let features = requested_feature_ids
+        .iter()
+        .filter(|feature_id| seen_feature_ids.insert(**feature_id))
+        .filter_map(|feature_id| document.feature(*feature_id).cloned())
+        .collect::<Vec<_>>();
+    let included_feature_ids = features
+        .iter()
+        .map(|feature| feature.id)
+        .collect::<BTreeSet<_>>();
+    let assemblies = planning_assemblies(document, &included_feature_ids, &request.prompt);
+    PlanningDocumentContext {
+        name: document.name.clone(),
+        next_feature_id: document.next_feature_id(),
+        total_feature_count: document.features.len(),
+        omitted_feature_count: document.features.len().saturating_sub(features.len()),
+        features,
+        total_assembly_count: document.assemblies.len(),
+        omitted_assembly_count: document.assemblies.len().saturating_sub(assemblies.len()),
+        assemblies,
+        domain_namespaces: document
+            .domain_data
+            .iter()
+            .map(|(namespace, entries)| DomainNamespaceSummary {
+                namespace: namespace.clone(),
+                entry_count: entries.len(),
+            })
+            .collect(),
+    }
+}
+
+fn planning_assemblies(
+    document: &CadDocument,
+    included_feature_ids: &BTreeSet<FeatureId>,
+    prompt: &str,
+) -> Vec<PlanningAssemblyContext> {
+    let prompt = prompt.to_lowercase();
+    let assembly_intent = [
+        "assembly",
+        "component",
+        "occurrence",
+        "mate",
+        "装配",
+        "组件",
+        "实例",
+        "配合",
+    ]
+    .iter()
+    .any(|keyword| prompt.contains(keyword));
+    document
+        .assemblies
+        .iter()
+        .filter_map(|assembly| {
+            let definitions = assembly
+                .definitions
+                .iter()
+                .map(|definition| (definition.id, definition))
+                .collect::<BTreeMap<_, _>>();
+            let occurrences = assembly
+                .occurrences
+                .iter()
+                .map(|occurrence| (occurrence.id, occurrence))
+                .collect::<BTreeMap<_, _>>();
+            let mut scores = BTreeMap::<u64, u64>::new();
+            for (index, occurrence) in assembly.occurrences.iter().enumerate() {
+                if occurrence
+                    .feature_ids
+                    .iter()
+                    .any(|feature_id| included_feature_ids.contains(feature_id))
+                {
+                    add_occurrence_score(&mut scores, occurrence.id, occurrence_score(0, index));
+                }
+                if label_matches_prompt(&prompt, &occurrence.name) {
+                    add_occurrence_score(&mut scores, occurrence.id, occurrence_score(1, index));
+                }
+                if definitions
+                    .get(&occurrence.definition_id)
+                    .is_some_and(|definition| label_matches_prompt(&prompt, &definition.name))
+                {
+                    add_occurrence_score(&mut scores, occurrence.id, occurrence_score(2, index));
+                }
+            }
+            if assembly_intent || label_matches_prompt(&prompt, &assembly.name) {
+                for (index, occurrence) in assembly.occurrences.iter().enumerate() {
+                    add_occurrence_score(&mut scores, occurrence.id, occurrence_score(6, index));
+                }
+            }
+            if scores.is_empty() {
+                return None;
+            }
+
+            let seeds = scores.keys().copied().collect::<Vec<_>>();
+            for seed in seeds {
+                let mut current = occurrences
+                    .get(&seed)
+                    .and_then(|occurrence| occurrence.parent_id);
+                let mut depth = 0_usize;
+                while let Some(parent_id) = current {
+                    add_occurrence_score(&mut scores, parent_id, occurrence_score(3, depth));
+                    current = occurrences
+                        .get(&parent_id)
+                        .and_then(|occurrence| occurrence.parent_id);
+                    depth += 1;
+                }
+                for child in assembly
+                    .occurrences
+                    .iter()
+                    .filter(|occurrence| occurrence.parent_id == Some(seed))
+                {
+                    add_occurrence_score(&mut scores, child.id, occurrence_score(5, 0));
+                }
+            }
+            for mate in &assembly.mates {
+                if scores.contains_key(&mate.parent_occurrence_id)
+                    || scores.contains_key(&mate.child_occurrence_id)
+                {
+                    add_occurrence_score(
+                        &mut scores,
+                        mate.parent_occurrence_id,
+                        occurrence_score(4, 0),
+                    );
+                    add_occurrence_score(
+                        &mut scores,
+                        mate.child_occurrence_id,
+                        occurrence_score(4, 0),
+                    );
+                }
+            }
+
+            let mut ranked = scores.into_iter().collect::<Vec<_>>();
+            ranked.sort_by_key(|(occurrence_id, score)| (*score, *occurrence_id));
+            ranked.truncate(MAX_PROMPT_OCCURRENCES_PER_ASSEMBLY);
+            let included_occurrence_ids = ranked
+                .iter()
+                .map(|(occurrence_id, _)| *occurrence_id)
+                .collect::<BTreeSet<_>>();
+            let included_occurrences = ranked
+                .into_iter()
+                .filter_map(|(occurrence_id, _)| occurrences.get(&occurrence_id).copied().cloned())
+                .collect::<Vec<_>>();
+            let included_definition_ids = included_occurrences
+                .iter()
+                .map(|occurrence| occurrence.definition_id)
+                .collect::<BTreeSet<_>>();
+            let included_definitions = assembly
+                .definitions
+                .iter()
+                .filter(|definition| included_definition_ids.contains(&definition.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let included_mates = assembly
+                .mates
+                .iter()
+                .filter(|mate| {
+                    included_occurrence_ids.contains(&mate.parent_occurrence_id)
+                        && included_occurrence_ids.contains(&mate.child_occurrence_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            Some(PlanningAssemblyContext {
+                id: assembly.id,
+                name: assembly.name.clone(),
+                total_definition_count: assembly.definitions.len(),
+                omitted_definition_count: assembly
+                    .definitions
+                    .len()
+                    .saturating_sub(included_definitions.len()),
+                definitions: included_definitions,
+                total_occurrence_count: assembly.occurrences.len(),
+                omitted_occurrence_count: assembly
+                    .occurrences
+                    .len()
+                    .saturating_sub(included_occurrences.len()),
+                occurrences: included_occurrences,
+                total_mate_count: assembly.mates.len(),
+                omitted_mate_count: assembly.mates.len().saturating_sub(included_mates.len()),
+                mates: included_mates,
+            })
+        })
+        .take(MAX_PROMPT_ASSEMBLIES)
+        .collect()
+}
+
+fn occurrence_score(priority: u64, tie_breaker: usize) -> u64 {
+    priority
+        .saturating_mul(OCCURRENCE_SCORE_PRIORITY_STRIDE)
+        .saturating_add(tie_breaker as u64)
+}
+
+fn add_occurrence_score(scores: &mut BTreeMap<u64, u64>, occurrence_id: u64, score: u64) {
+    scores
+        .entry(occurrence_id)
+        .and_modify(|current| *current = (*current).min(score))
+        .or_insert(score);
+}
+
+fn label_matches_prompt(prompt: &str, label: &str) -> bool {
+    let label = label.trim().to_lowercase();
+    label.chars().count() >= 2 && prompt.contains(&label)
+}
+
 fn cad_plan_tool() -> Tool {
-    Tool::new("apply_cad_plan")
-        .with_description("Apply an ordered, atomic batch of parametric CAD document commands")
+    let mut tool = Tool::new("apply_cad_plan")
+        .with_description(
+            "Propose one primary atomic CAD edit and optional independent design alternatives",
+        )
         .with_schema(json!({
             "type": "object",
             "properties": {
@@ -1347,7 +1934,34 @@ fn cad_plan_tool() -> Tool {
                     "additionalProperties": false
                 }
             }
-        }))
+        }));
+    let schema = tool.schema.as_mut().expect("planning tool has a schema");
+    let command_schema = schema["properties"]["commands"]["items"].clone();
+    schema["properties"]["alternatives"] = json!({
+        "type": "array",
+        "description": "Up to two complete, independent design alternatives evaluated against the same current document",
+        "maxItems": 2,
+        "items": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Short description of this distinct approach"
+                },
+                "commands": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 24,
+                    "items": command_schema
+                }
+            },
+            "required": ["summary", "commands"],
+            "additionalProperties": false
+        }
+    });
+    schema["required"] = json!(["summary", "commands"]);
+    schema["additionalProperties"] = json!(false);
+    tool
 }
 
 #[cfg(test)]
@@ -1355,11 +1969,60 @@ mod tests {
     use crate::{AiContext, AiPlan, AiRequest};
     use cadx_analysis::SceneAnalysis;
     use cadx_config::ProviderConfig;
-    use cadx_core::domain::{
-        BooleanOperation, Constraint, ModelCommand, SketchPlane, SketchSegment2D,
+    use cadx_core::{
+        assembly::{
+            AssemblyMate, AssemblyMateKind, AssemblyTransform, ComponentDefinition, ComponentKind,
+            ComponentOccurrence,
+        },
+        domain::{
+            BooleanOperation, CadDocument, Constraint, FeatureId, ModelCommand, SketchPlane,
+            SketchSegment2D,
+        },
     };
 
     use super::*;
+
+    fn add_box(document: &mut CadDocument, name: &str, size: f64) -> FeatureId {
+        document
+            .apply(ModelCommand::CreateBox {
+                name: name.into(),
+                size: [size; 3],
+                position: [size, 0.0, 0.0],
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn context_with_interaction(interaction: crate::context::ContextSnapshot) -> AiContext {
+        AiContext {
+            interaction,
+            kernel_capabilities: cadx_core::kernel::CadKernelCapabilities::default(),
+            measurement: None,
+            last_boolean_failure: None,
+            last_edge_modifier_failure: None,
+            last_sketch_failure: None,
+            selected_sketch_diagnostic: None,
+            selected_sketch_dimensions: Vec::new(),
+            scene_analysis: SceneAnalysis::default(),
+            interference_analysis: None,
+        }
+    }
+
+    #[test]
+    fn planning_tool_schema_limits_independent_alternatives() {
+        let schema = cad_plan_tool().schema.expect("planning tool has a schema");
+        assert_eq!(schema["required"], json!(["summary", "commands"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["alternatives"]["maxItems"], 2);
+        assert_eq!(
+            schema["properties"]["alternatives"]["items"]["required"],
+            json!(["summary", "commands"])
+        );
+        assert_eq!(
+            schema["properties"]["alternatives"]["items"]["properties"]["commands"]["items"],
+            schema["properties"]["commands"]["items"]
+        );
+    }
 
     #[test]
     fn tool_arguments_deserialize_into_commands() {
@@ -1392,16 +2055,58 @@ mod tests {
     }
 
     #[test]
+    fn provider_endpoint_preserves_a_path_base_without_a_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint_base_url("https://example.test/v1").unwrap(),
+            "https://example.test/v1/"
+        );
+        assert_eq!(
+            normalize_endpoint_base_url("https://example.test/gateway/v1?tenant=cadx").unwrap(),
+            "https://example.test/gateway/v1/?tenant=cadx"
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_rejects_non_http_and_fragment_urls() {
+        for endpoint in [
+            "file:///tmp/provider",
+            "not a URL",
+            "https://example.test/v1#chat",
+        ] {
+            assert!(matches!(
+                normalize_endpoint_base_url(endpoint),
+                Err(AiError::Configuration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_errors_hide_html_and_bound_untrusted_response_text() {
+        let html = provider_error_message(
+            "Response content type 'text/html' is not JSON: <!DOCTYPE html><title>Login</title>",
+        );
+        assert!(html.contains("returned HTML instead of JSON"));
+        assert!(!html.contains("<title>"));
+
+        let long = provider_error_message(&"provider failure ".repeat(200));
+        assert!(long.ends_with("..."));
+        assert!(long.chars().count() <= 803);
+    }
+
+    #[test]
     fn planning_prompt_contains_read_only_scene_context() {
         let prompt = build_prompt(&AiRequest {
             prompt: "inspect this part".into(),
             document: cadx_core::domain::CadDocument::default(),
             context: Some(AiContext {
+                interaction: crate::context::ContextSnapshot {
+                    selection: crate::context::ContextSelection {
+                        selected_feature_id: Some(4),
+                        ..crate::context::ContextSelection::default()
+                    },
+                    ..crate::context::ContextSnapshot::default()
+                },
                 kernel_capabilities: cadx_core::kernel::CadKernelCapabilities::default(),
-                selected_feature_id: Some(4),
-                selected_face: None,
-                selected_edges: Vec::new(),
-                selected_vertex: None,
                 measurement: None,
                 last_boolean_failure: None,
                 last_edge_modifier_failure: None,
@@ -1431,6 +2136,238 @@ mod tests {
         assert!(prompt.contains("interference_analysis"));
         assert!(prompt.contains("interfering_pair_count"));
         assert!(prompt.contains("read-only"));
+    }
+
+    #[test]
+    fn planning_interference_context_is_relevance_ranked_and_bounded() {
+        let bounds = cadx_core::diagnostics::AxisAlignedBounds {
+            min: [0.0; 3],
+            max: [1.0; 3],
+        };
+        let pairs = (0..40)
+            .map(|index| cadx_core::kernel::InterferencePairAnalysis {
+                feature_ids: [index * 2 + 1, index * 2 + 2],
+                bounds: [bounds; 2],
+                outcome: cadx_core::kernel::InterferencePairOutcome::Clear {
+                    volume_mm3: 0.0,
+                    precision: cadx_core::kernel::InterferenceVolumePrecision::Tessellated {
+                        chord_tolerance_mm: 0.01,
+                    },
+                    method: cadx_core::kernel::InterferenceIntersectionMethod::BrepBoolean,
+                },
+            })
+            .collect::<Vec<_>>();
+        let analysis = cadx_core::kernel::InterferenceAnalysis {
+            candidate_feature_ids: (1..=80).collect(),
+            total_pair_count: 3_160,
+            broad_phase_pair_count: 40,
+            clear_pair_count: 3_160,
+            interfering_pair_count: 0,
+            failed_pair_count: 0,
+            volume_tolerance_mm3: 1.0e-6,
+            pairs,
+        };
+
+        let planning = planning_interference_context(&analysis, &BTreeSet::from([80]));
+
+        assert_eq!(planning.pairs.len(), MAX_PROMPT_INTERFERENCE_PAIRS);
+        assert_eq!(planning.omitted_pair_detail_count, 8);
+        assert_eq!(planning.pairs[0].feature_ids, [79, 80]);
+        assert_eq!(
+            planning.candidate_feature_ids.len(),
+            MAX_PROMPT_INTERFERENCE_FEATURES
+        );
+        assert_eq!(planning.candidate_feature_ids[0], 80);
+        assert_eq!(planning.omitted_candidate_feature_count, 16);
+        assert_eq!(planning.total_pair_count, 3_160);
+    }
+
+    #[test]
+    fn planning_document_only_serializes_retrieved_feature_parameters() {
+        let mut document = CadDocument::default();
+        let mut feature_ids = Vec::new();
+        for index in 0..70 {
+            let name = if index == 5 {
+                "Target bracket".into()
+            } else {
+                format!("Body {index}")
+            };
+            feature_ids.push(add_box(&mut document, &name, f64::from(index) + 1.0));
+        }
+        let analysis = SceneAnalysis::default();
+        let collector =
+            crate::context::ContextCollector::collect(crate::context::ContextCollectionInput {
+                domain: None,
+                document_revision: 3,
+                prompt: "resize the target bracket",
+                document: &document,
+                scene_analysis: &analysis,
+                selection: crate::context::ContextSelection {
+                    selected_feature_id: Some(feature_ids[1]),
+                    ..crate::context::ContextSelection::default()
+                },
+                viewport: crate::context::ViewportContext::default(),
+                domain_schema: serde_json::Map::new(),
+                budget: crate::context::ContextBudget {
+                    feature_details: 2,
+                    spatial_entities: 1,
+                },
+            })
+            .unwrap();
+        let request = AiRequest {
+            prompt: "resize the target bracket".into(),
+            document,
+            context: Some(context_with_interaction(collector.into_snapshot())),
+        };
+
+        let planning = planning_document_context(&request);
+        let included_ids = planning
+            .features
+            .iter()
+            .map(|feature| feature.id)
+            .collect::<Vec<_>>();
+        assert_eq!(included_ids, vec![feature_ids[1], feature_ids[5]]);
+        assert_eq!(planning.total_feature_count, 70);
+        assert_eq!(planning.omitted_feature_count, 68);
+
+        let encoded = serde_json::to_value(planning).unwrap();
+        assert_eq!(encoded["features"].as_array().unwrap().len(), 2);
+        assert_eq!(encoded["features"][0]["primitive"]["size"]["x"], 2.0);
+        assert_eq!(encoded["features"][1]["primitive"]["size"]["x"], 6.0);
+        assert!(!encoded.to_string().contains("Body 69"));
+    }
+
+    #[test]
+    fn planning_document_includes_related_assembly_ancestors_and_mates() {
+        let mut document = CadDocument::default();
+        let selected_feature = add_box(&mut document, "Selected gear", 4.0);
+        let unrelated_feature = add_box(&mut document, "Unrelated cover", 8.0);
+        document
+            .apply(ModelCommand::Move {
+                id: selected_feature,
+                position: [0.0; 3],
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::Move {
+                id: unrelated_feature,
+                position: [0.0; 3],
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssembly {
+                name: "Gearbox".into(),
+                definitions: vec![
+                    ComponentDefinition {
+                        id: 1,
+                        name: "Gearbox root".into(),
+                        kind: ComponentKind::Assembly,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 2,
+                        name: "Gear".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                    ComponentDefinition {
+                        id: 3,
+                        name: "Cover".into(),
+                        kind: ComponentKind::Part,
+                        source: None,
+                    },
+                ],
+                occurrences: vec![
+                    ComponentOccurrence {
+                        id: 1,
+                        name: "Gearbox root".into(),
+                        definition_id: 1,
+                        parent_id: None,
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: Vec::new(),
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 2,
+                        name: "Selected gear occurrence".into(),
+                        definition_id: 2,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![selected_feature],
+                        source: None,
+                    },
+                    ComponentOccurrence {
+                        id: 3,
+                        name: "Unrelated cover occurrence".into(),
+                        definition_id: 3,
+                        parent_id: Some(1),
+                        suppressed: false,
+                        transform: AssemblyTransform::IDENTITY,
+                        feature_ids: vec![unrelated_feature],
+                        source: None,
+                    },
+                ],
+            })
+            .unwrap();
+        document
+            .apply(ModelCommand::CreateAssemblyMate {
+                assembly_id: 1,
+                mate: AssemblyMate {
+                    id: 1,
+                    name: "Fixed gear".into(),
+                    parent_occurrence_id: 1,
+                    child_occurrence_id: 2,
+                    parent_frame: AssemblyTransform::IDENTITY,
+                    child_frame: AssemblyTransform::IDENTITY,
+                    kind: AssemblyMateKind::Fixed,
+                    state: 0.0,
+                },
+            })
+            .unwrap();
+        let interaction = crate::context::ContextSnapshot {
+            relevant_features: vec![crate::context::ContextFeature {
+                feature_id: selected_feature,
+                name: "Selected gear".into(),
+                primitive: "Box".into(),
+                visible: true,
+                position_mm: [4.0, 0.0, 0.0],
+                rotation_degrees: [0.0; 3],
+                dependencies: Vec::new(),
+                direct_dependents: Vec::new(),
+                relevance: vec![crate::context::ContextRelevance::Selected],
+                assembly: None,
+            }],
+            omitted_feature_count: 1,
+            ..crate::context::ContextSnapshot::default()
+        };
+        let request = AiRequest {
+            prompt: "adjust the selected gear".into(),
+            document,
+            context: Some(context_with_interaction(interaction)),
+        };
+
+        let planning = planning_document_context(&request);
+        assert_eq!(planning.assemblies.len(), 1);
+        let assembly = &planning.assemblies[0];
+        assert_eq!(
+            assembly
+                .occurrences
+                .iter()
+                .map(|occurrence| occurrence.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(assembly.omitted_occurrence_count, 1);
+        assert_eq!(assembly.mates.len(), 1);
+        assert_eq!(assembly.mates[0].id, 1);
+        assert!(
+            assembly
+                .occurrences
+                .iter()
+                .all(|occurrence| occurrence.id != 3)
+        );
     }
 
     #[test]

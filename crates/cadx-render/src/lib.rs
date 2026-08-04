@@ -60,8 +60,10 @@ struct CameraUniform {
 struct SceneBuffers {
     revision: u64,
     solid: SolidBuffers,
+    ghost: SolidBuffers,
     grid_vertices: Vec<GpuVertex>,
     topology_vertices: Vec<GpuVertex>,
+    ghost_topology_vertices: Vec<GpuVertex>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -73,6 +75,15 @@ pub struct TopologySelection<'a> {
     pub measurement_edges: &'a [EdgeRef],
     pub measurement_vertices: &'a [VertexRef],
     pub measurement_guides: &'a [[[f64; 3]; 2]],
+}
+
+/// Kernel-evaluated geometry shown before a transaction is committed.
+#[derive(Debug, Clone, Copy)]
+pub struct GhostPreview<'a> {
+    pub scene: &'a EvaluatedScene,
+    pub added_features: &'a [FeatureId],
+    pub modified_features: &'a [FeatureId],
+    pub removed_features: &'a [FeatureId],
 }
 
 #[derive(Debug, Clone)]
@@ -119,11 +130,23 @@ impl ViewportScene {
         selected: Option<FeatureId>,
         topology: TopologySelection<'_>,
     ) {
+        self.update_with_topology_and_preview(scene, selected, topology, None);
+    }
+
+    pub fn update_with_topology_and_preview(
+        &self,
+        scene: &EvaluatedScene,
+        selected: Option<FeatureId>,
+        topology: TopologySelection<'_>,
+        preview: Option<GhostPreview<'_>>,
+    ) {
         let Ok(mut buffers) = self.buffers.write() else {
             return;
         };
         buffers.solid.clear();
+        buffers.ghost.clear();
         buffers.topology_vertices.clear();
+        buffers.ghost_topology_vertices.clear();
 
         let mut instanced_features = HashSet::new();
         for definition in &scene.mesh_definitions {
@@ -306,7 +329,136 @@ impl ViewportScene {
                 [0.18, 0.82, 0.92, 1.0],
             );
         }
+        if let Some(preview) = preview {
+            const REMOVED_COLOR: [f32; 4] = [0.96, 0.24, 0.24, 0.38];
+            const PROPOSED_COLOR: [f32; 4] = [0.12, 0.88, 0.94, 0.52];
+            if !append_ghost_solids(
+                &mut buffers.ghost,
+                scene,
+                preview.removed_features,
+                REMOVED_COLOR,
+            ) || !append_ghost_solids(
+                &mut buffers.ghost,
+                preview.scene,
+                preview.added_features,
+                PROPOSED_COLOR,
+            ) || !append_ghost_solids(
+                &mut buffers.ghost,
+                preview.scene,
+                preview.modified_features,
+                PROPOSED_COLOR,
+            ) {
+                buffers.ghost.clear();
+            }
+            append_ghost_references(
+                &mut buffers.ghost_topology_vertices,
+                scene,
+                preview.removed_features,
+                REMOVED_COLOR,
+            );
+            append_ghost_references(
+                &mut buffers.ghost_topology_vertices,
+                preview.scene,
+                preview.added_features,
+                PROPOSED_COLOR,
+            );
+            append_ghost_references(
+                &mut buffers.ghost_topology_vertices,
+                preview.scene,
+                preview.modified_features,
+                PROPOSED_COLOR,
+            );
+        }
         buffers.revision = buffers.revision.wrapping_add(1);
+    }
+}
+
+fn append_ghost_solids(
+    buffers: &mut SolidBuffers,
+    scene: &EvaluatedScene,
+    feature_ids: &[FeatureId],
+    color: [f32; 4],
+) -> bool {
+    if feature_ids.is_empty() {
+        return true;
+    }
+    let feature_ids = feature_ids.iter().copied().collect::<HashSet<_>>();
+    let mut instanced_features = HashSet::new();
+    for definition in &scene.mesh_definitions {
+        let instances = scene
+            .mesh_instances
+            .iter()
+            .filter(|instance| {
+                instance.definition == definition.key && feature_ids.contains(&instance.feature_id)
+            })
+            .map(|instance| {
+                instanced_features.insert(instance.feature_id);
+                GpuInstance::new(instance.transform, color)
+            })
+            .collect::<Vec<_>>();
+        if !instances.is_empty() && !buffers.append(&definition.mesh, &instances) {
+            return false;
+        }
+    }
+    for part in &scene.parts {
+        if feature_ids.contains(&part.feature_id)
+            && !instanced_features.contains(&part.feature_id)
+            && !buffers.append(
+                &part.mesh,
+                &[GpuInstance::new(AssemblyTransform::IDENTITY, color)],
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn append_ghost_references(
+    vertices: &mut Vec<GpuVertex>,
+    scene: &EvaluatedScene,
+    feature_ids: &[FeatureId],
+    color: [f32; 4],
+) {
+    if feature_ids.is_empty() {
+        return;
+    }
+    let feature_ids = feature_ids.iter().copied().collect::<HashSet<_>>();
+    let extent = reference_extent(scene);
+    let datum_point_radius = (extent * 0.12).clamp(0.25, 3.0);
+    for sketch in &scene.sketches {
+        if !feature_ids.contains(&sketch.feature_id) {
+            continue;
+        }
+        for sketch_loop in sketch_loops(sketch) {
+            for segment in sketch_segments(sketch_loop) {
+                append_polyline(vertices, &segment, color);
+            }
+        }
+        for polyline in &sketch.construction {
+            for segment in construction_segments(polyline) {
+                append_polyline(vertices, &segment, color);
+            }
+        }
+    }
+    for plane in &scene.datum_planes {
+        if !feature_ids.contains(&plane.feature_id) {
+            continue;
+        }
+        for segment in datum_plane_segments(
+            plane.origin,
+            plane.x_direction,
+            plane.y_direction,
+            plane.normal,
+            extent,
+        ) {
+            append_polyline(vertices, &segment, color);
+        }
+    }
+    for point in &scene.datum_points {
+        if feature_ids.contains(&point.feature_id) {
+            append_vertex_marker(vertices, point.position, datum_point_radius, color);
+        }
     }
 }
 
@@ -1004,17 +1156,25 @@ impl CallbackTrait for ViewportCallback {
 
 struct ViewportRenderer {
     solid_pipeline: wgpu::RenderPipeline,
+    ghost_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    ghost_line_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     solid_vertex_buffer: wgpu::Buffer,
     solid_index_buffer: wgpu::Buffer,
     solid_instance_buffer: wgpu::Buffer,
+    ghost_vertex_buffer: wgpu::Buffer,
+    ghost_index_buffer: wgpu::Buffer,
+    ghost_instance_buffer: wgpu::Buffer,
     grid_vertex_buffer: wgpu::Buffer,
     topology_vertex_buffer: wgpu::Buffer,
+    ghost_topology_vertex_buffer: wgpu::Buffer,
     solid_draws: Vec<SolidDraw>,
+    ghost_draws: Vec<SolidDraw>,
     grid_vertex_count: u32,
     topology_vertex_count: u32,
+    ghost_topology_vertex_count: u32,
     uploaded_revision: Option<u64>,
 }
 
@@ -1066,6 +1226,21 @@ impl ViewportRenderer {
                 fragment_entry: "fs_solid",
                 vertex_buffers: &[GpuMeshVertex::layout(), GpuInstance::layout()],
                 depth_write: true,
+                alpha_blend: false,
+            },
+        );
+        let ghost_pipeline = create_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            target_format,
+            PipelineSpec {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                vertex_entry: "vs_solid",
+                fragment_entry: "fs_solid",
+                vertex_buffers: &[GpuMeshVertex::layout(), GpuInstance::layout()],
+                depth_write: false,
+                alpha_blend: true,
             },
         );
         let grid_pipeline = create_pipeline(
@@ -1079,6 +1254,21 @@ impl ViewportRenderer {
                 fragment_entry: "fs_grid",
                 vertex_buffers: &[GpuVertex::layout()],
                 depth_write: false,
+                alpha_blend: false,
+            },
+        );
+        let ghost_line_pipeline = create_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            target_format,
+            PipelineSpec {
+                topology: wgpu::PrimitiveTopology::LineList,
+                vertex_entry: "vs_colored",
+                fragment_entry: "fs_grid",
+                vertex_buffers: &[GpuVertex::layout()],
+                depth_write: false,
+                alpha_blend: true,
             },
         );
         let solid_vertex_buffer =
@@ -1087,24 +1277,43 @@ impl ViewportRenderer {
             empty_buffer(device, "cadx solid indices", wgpu::BufferUsages::INDEX);
         let solid_instance_buffer =
             empty_buffer(device, "cadx solid instances", wgpu::BufferUsages::VERTEX);
+        let ghost_vertex_buffer =
+            empty_buffer(device, "cadx ghost vertices", wgpu::BufferUsages::VERTEX);
+        let ghost_index_buffer =
+            empty_buffer(device, "cadx ghost indices", wgpu::BufferUsages::INDEX);
+        let ghost_instance_buffer =
+            empty_buffer(device, "cadx ghost instances", wgpu::BufferUsages::VERTEX);
         let grid_vertex_buffer =
             empty_buffer(device, "cadx grid vertices", wgpu::BufferUsages::VERTEX);
         let topology_vertex_buffer =
             empty_buffer(device, "cadx topology vertices", wgpu::BufferUsages::VERTEX);
+        let ghost_topology_vertex_buffer = empty_buffer(
+            device,
+            "cadx ghost topology vertices",
+            wgpu::BufferUsages::VERTEX,
+        );
 
         Self {
             solid_pipeline,
+            ghost_pipeline,
             grid_pipeline,
+            ghost_line_pipeline,
             camera_buffer,
             camera_bind_group,
             solid_vertex_buffer,
             solid_index_buffer,
             solid_instance_buffer,
+            ghost_vertex_buffer,
+            ghost_index_buffer,
+            ghost_instance_buffer,
             grid_vertex_buffer,
             topology_vertex_buffer,
+            ghost_topology_vertex_buffer,
             solid_draws: Vec::new(),
+            ghost_draws: Vec::new(),
             grid_vertex_count: 0,
             topology_vertex_count: 0,
+            ghost_topology_vertex_count: 0,
             uploaded_revision: None,
         }
     }
@@ -1145,6 +1354,24 @@ impl ViewportRenderer {
             bytemuck::cast_slice(&buffers.solid.instances),
             wgpu::BufferUsages::VERTEX,
         );
+        self.ghost_vertex_buffer = buffer_with_data(
+            device,
+            "cadx ghost vertices",
+            bytemuck::cast_slice(&buffers.ghost.vertices),
+            wgpu::BufferUsages::VERTEX,
+        );
+        self.ghost_index_buffer = buffer_with_data(
+            device,
+            "cadx ghost indices",
+            bytemuck::cast_slice(&buffers.ghost.indices),
+            wgpu::BufferUsages::INDEX,
+        );
+        self.ghost_instance_buffer = buffer_with_data(
+            device,
+            "cadx ghost instances",
+            bytemuck::cast_slice(&buffers.ghost.instances),
+            wgpu::BufferUsages::VERTEX,
+        );
         self.grid_vertex_buffer = buffer_with_data(
             device,
             "cadx grid vertices",
@@ -1157,10 +1384,19 @@ impl ViewportRenderer {
             bytemuck::cast_slice(&buffers.topology_vertices),
             wgpu::BufferUsages::VERTEX,
         );
+        self.ghost_topology_vertex_buffer = buffer_with_data(
+            device,
+            "cadx ghost topology vertices",
+            bytemuck::cast_slice(&buffers.ghost_topology_vertices),
+            wgpu::BufferUsages::VERTEX,
+        );
         self.solid_draws.clone_from(&buffers.solid.draws);
+        self.ghost_draws.clone_from(&buffers.ghost.draws);
         self.grid_vertex_count = u32::try_from(buffers.grid_vertices.len()).unwrap_or(u32::MAX);
         self.topology_vertex_count =
             u32::try_from(buffers.topology_vertices.len()).unwrap_or(u32::MAX);
+        self.ghost_topology_vertex_count =
+            u32::try_from(buffers.ghost_topology_vertices.len()).unwrap_or(u32::MAX);
         self.uploaded_revision = Some(buffers.revision);
     }
 
@@ -1179,9 +1415,21 @@ impl ViewportRenderer {
             render_pass.draw_indexed(draw.indices.clone(), 0, draw.instances.clone());
         }
 
+        render_pass.set_pipeline(&self.ghost_pipeline);
+        render_pass.set_vertex_buffer(0, self.ghost_vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.ghost_instance_buffer.slice(..));
+        render_pass.set_index_buffer(self.ghost_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        for draw in &self.ghost_draws {
+            render_pass.draw_indexed(draw.indices.clone(), 0, draw.instances.clone());
+        }
+
         render_pass.set_pipeline(&self.grid_pipeline);
         render_pass.set_vertex_buffer(0, self.topology_vertex_buffer.slice(..));
         render_pass.draw(0..self.topology_vertex_count, 0..1);
+
+        render_pass.set_pipeline(&self.ghost_line_pipeline);
+        render_pass.set_vertex_buffer(0, self.ghost_topology_vertex_buffer.slice(..));
+        render_pass.draw(0..self.ghost_topology_vertex_count, 0..1);
     }
 }
 
@@ -1192,6 +1440,7 @@ struct PipelineSpec<'a> {
     fragment_entry: &'a str,
     vertex_buffers: &'a [wgpu::VertexBufferLayout<'a>],
     depth_write: bool,
+    alpha_blend: bool,
 }
 
 fn create_pipeline(
@@ -1216,7 +1465,11 @@ fn create_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(if spec.alpha_blend {
+                    wgpu::BlendState::ALPHA_BLENDING
+                } else {
+                    wgpu::BlendState::REPLACE
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -1332,6 +1585,65 @@ mod tests {
         )
         .validate(&module)
         .expect("viewport shader must pass Naga validation");
+    }
+
+    #[test]
+    fn ghost_preview_uses_separate_translucent_buffers_for_added_and_removed_geometry() {
+        let part = |feature_id, name: &str, offset: f32| EvaluatedPart {
+            feature_id,
+            name: name.into(),
+            color: [0.6, 0.6, 0.6, 1.0],
+            material: None,
+            mesh: TriangleMesh {
+                positions: vec![
+                    [offset, 0.0, 0.0],
+                    [offset + 1.0, 0.0, 0.0],
+                    [offset, 1.0, 0.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                indices: vec![0, 1, 2],
+            },
+            faces: Vec::new(),
+            edges: Vec::new(),
+            vertices: Vec::new(),
+        };
+        let active = EvaluatedScene {
+            parts: vec![part(1, "removed", 0.0)],
+            ..EvaluatedScene::default()
+        };
+        let proposed = EvaluatedScene {
+            parts: vec![part(2, "added", 2.0)],
+            ..EvaluatedScene::default()
+        };
+        let viewport = ViewportScene::default();
+
+        viewport.update_with_topology_and_preview(
+            &active,
+            None,
+            TopologySelection::default(),
+            Some(GhostPreview {
+                scene: &proposed,
+                added_features: &[2],
+                modified_features: &[],
+                removed_features: &[1],
+            }),
+        );
+
+        let buffers = viewport.buffers.read().unwrap();
+        assert_eq!(buffers.solid.draws.len(), 1);
+        assert_eq!(buffers.ghost.draws.len(), 2);
+        assert_eq!(buffers.ghost.instances.len(), 2);
+        for (actual, expected) in [
+            (buffers.ghost.instances[0].color, [0.96, 0.24, 0.24, 0.38]),
+            (buffers.ghost.instances[1].color, [0.12, 0.88, 0.94, 0.52]),
+        ] {
+            assert!(
+                actual
+                    .into_iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
+            );
+        }
     }
 
     #[test]

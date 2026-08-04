@@ -16,4 +16,7 @@ pub use bus::{
 };
 pub use error::SessionError;
 pub use import::{StepImportPlan, StepImportPlanError, plan_step_import};
-pub use session::{DEFAULT_HISTORY_LIMIT, DocumentSession, DocumentState, TransactionOutcome};
+pub use session::{
+    DEFAULT_HISTORY_LIMIT, DocumentDiff, DocumentSession, DocumentState, FeatureChange,
+    TransactionOutcome, TransactionPreview,
+};

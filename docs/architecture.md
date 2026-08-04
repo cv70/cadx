@@ -121,11 +121,16 @@ conformance tests. Production adapters do not depend on one another.
 1. Presentation, AI, import, or a domain pack creates declarative
    `ModelCommand` values.
 2. `CoreBus` tags the source, buffers streamable command batches when needed,
-   and publishes transaction, undo/redo, document, and stream events.
+   and publishes transaction, preview, undo/redo, document, and stream events.
 3. `DocumentSession` applies the complete batch to a cloned document.
 4. The configured `CadKernel` evaluates the staged document.
-5. Only a successful evaluation replaces active state and creates one revision.
-6. The viewport consumes the committed `EvaluatedScene`.
+5. Direct edits install a successful evaluation immediately as one revision.
+   AI edits retain the staged document, evaluated scene, created IDs, structural
+   diff, command count, and base revision in an opaque `TransactionPreview`.
+6. The WGPU viewport keeps committed geometry as the picking and analysis source
+   while rendering preview changes through independent translucent ghost passes.
+7. Approval consumes the exact preview only when its base revision is still
+   active. Rejection or revision mismatch cannot replace document state.
 
 Each evaluated solid also exposes kernel-neutral face, edge, and vertex
 indexes. Persistent references are generated from feature semantics, topology
@@ -206,6 +211,57 @@ can only propose commands; it cannot access mutable application state, the
 kernel, files, or the renderer. Material changes use the same command boundary.
 Analysis is computed from the committed evaluated scene and never becomes an
 alternate source of geometry truth.
+
+Before a generic provider request, `cadx-desktop` establishes the active domain,
+analyzes the committed scene, and asks `cadx-ai::ContextCollector` for one typed,
+revision-bound context snapshot. Retrieval is deterministic: selected features
+and persistent face/edge/vertex owners, prompt name or ID matches, two upstream
+and downstream dependency hops, spatial AABB distance from the most specific
+resolved selection (falling back to viewport target), and then recent features.
+The default/hard budgets are 32/64 detailed features and 16/32 spatial entities;
+selected edge references are capped at 64 and oversized domain schemas are
+omitted above 64 KiB. Every truncated category records an omitted count.
+
+The provider adapter builds a second compact document view. It serializes full
+parameters only for retrieved feature IDs, summarizes opaque domain namespaces
+by entry count, redacts embedded STEP physical-file source, and retrieves at
+most eight related assemblies with 32 occurrences each. Occurrence retrieval
+retains selected or prompt-matched instances, hierarchy ancestors, adjacent
+children, referenced definitions, and mates whose endpoints are both present.
+Interference aggregates remain complete while candidate IDs and pair detail are
+relevance-ranked and capped at 64 and 32. Per-part scene analysis is restricted
+to the retrieved spatial set while total area, volume, mass, center of mass, and
+inertia remain the committed aggregate evidence. The system prompt forbids edits
+against omitted or ambiguous identifiers.
+
+The desktop assigns every asynchronous AI request a unique identity, records
+the revision used to construct it, and retains a Tokio abort handle. The user
+can cancel planning directly or with Escape; a successful edit, undo/redo, new,
+or open operation proactively aborts planning when its snapshot becomes stale.
+Only the currently tracked identity may complete, so a response already queued
+by an aborted request cannot clear or replace a newer request even when both
+share a document revision. A matching response is still discarded if the
+document advanced while the provider was planning. A current response may
+contain one primary command batch and up to two independent alternatives. Each
+batch enters `DocumentSession::preview`
+separately against the same committed document; candidates never build on one
+another. The complete batch and kernel evaluation run against a copy-on-write
+document without changing dirty state, history, or active scene.
+
+The resulting `DocumentDiff` reports stable added, modified, and removed
+feature identities, changed assemblies, and changed domain-data namespaces.
+`cadx-analysis::compare_scenes` derives body and triangle deltas, volume,
+surface area, and available mass and center-of-mass changes from committed and
+candidate `EvaluatedScene` values. When the active kernel advertises support,
+`analyze_preview_interference` also runs exact interference analysis over the
+staged document. These values are local engineering evidence and are absent
+from the AI plan contract, so a provider cannot assert its own score as fact.
+The renderer draws the selected candidate in cyan and removed committed
+geometry in red without making ghost geometry pickable. `commit_preview`
+performs an optimistic revision check and consumes only the selected validated
+staged document as one undoable transaction; all other candidate previews are
+explicitly discarded.
+See [`ai-transaction-sandbox.md`](ai-transaction-sandbox.md).
 
 `CadKernelCapabilities` exposes operation availability, interference analysis,
 and edge-modifier
