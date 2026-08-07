@@ -1,0 +1,12 @@
+[package]
+name = "cadx-arch"
+description = "Executable architecture contract for the CADX workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@ use ruststep::ast::{EntityInstance, Parameter, Record};
 
 use crate::ExportError;
 
-use super::{entity_by_id, entity_id, entity_records, parameter_list, parameter_ref};
+use super::ast::{entity_by_id, entity_id, entity_records, parameter_list, parameter_ref};
 
 #[derive(Debug)]
 pub(super) struct StepBodyDefinition {
@@ -244,4 +244,105 @@ fn body_name(values: &[Parameter]) -> Option<String> {
 
 fn invalid_body(body_id: u64, message: &str) -> ExportError {
     ExportError::InvalidStep(format!("STEP body #{body_id} {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use cadx_core::domain::StepShellBoundary;
+
+    use crate::{
+        ExportError, StepBodyColor,
+        step::{
+            parse_step,
+            test_support::{VALID_STEP, read_source},
+        },
+    };
+
+    #[test]
+    fn groups_brep_with_voids_as_one_oriented_body() {
+        let source = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('outer',(#90));\n\
+             #21=CLOSED_SHELL('void',(#91));\n\
+             #22=ORIENTED_CLOSED_SHELL('',*,#21,.F.);\n\
+             #23=BREP_WITH_VOIDS('Valve housing',#20,(#22));\n\
+             #30=COLOUR_RGB('',0.15,0.3,0.75);\n\
+             #31=SURFACE_STYLE_SHADING(#30);\n\
+             #32=PRESENTATION_STYLE_ASSIGNMENT((#31));\n\
+             #33=STYLED_ITEM('',(#32),#23);",
+        );
+        let imported = read_source(&source);
+        assert_eq!(imported.bodies.len(), 1);
+        let body = &imported.bodies[0];
+        assert_eq!(body.name.as_deref(), Some("Valve housing"));
+        assert_eq!(body.shell_id, 20);
+        assert_eq!(
+            body.void_shells,
+            vec![StepShellBoundary {
+                shell_id: 21,
+                orientation: false,
+            }]
+        );
+        assert_eq!(body.color, StepBodyColor::Uniform([0.15, 0.3, 0.75, 1.0]));
+    }
+
+    #[test]
+    fn keeps_unowned_closed_shells_separate_from_void_ownership() {
+        let source = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('outer',(#90));\n\
+             #21=CLOSED_SHELL('void',(#91));\n\
+             #22=ORIENTED_CLOSED_SHELL('',*,#21,.T.);\n\
+             #23=BREP_WITH_VOIDS('Hollow body',#20,(#22));\n\
+             #24=CLOSED_SHELL('standalone',(#92));",
+        );
+        let imported = read_source(&source);
+        assert_eq!(imported.bodies.len(), 2);
+        assert_eq!(imported.bodies[0].shell_id, 20);
+        assert_eq!(imported.bodies[0].void_shells[0].shell_id, 21);
+        assert_eq!(imported.bodies[1].shell_id, 24);
+        assert!(imported.bodies[1].void_shells.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_or_multiply_owned_void_shells() {
+        let invalid_void = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('outer',(#90));\n\
+             #21=CLOSED_SHELL('void',(#91));\n\
+             #23=BREP_WITH_VOIDS('Invalid',#20,(#21));",
+        );
+        assert!(matches!(
+            parse_step(invalid_void),
+            Err(ExportError::InvalidStep(message))
+                if message.contains("not an ORIENTED_CLOSED_SHELL")
+        ));
+
+        let shared_shell = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('shared',(#90));\n\
+             #21=MANIFOLD_SOLID_BREP('First',#20);\n\
+             #22=MANIFOLD_SOLID_BREP('Second',#20);",
+        );
+        assert!(matches!(
+            parse_step(shared_shell),
+            Err(ExportError::InvalidStep(message)) if message.contains("owned by multiple solids")
+        ));
+    }
+
+    #[test]
+    fn recognizes_faceted_brep_as_the_shell_owner() {
+        let source = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('',(#99));\n\
+             #21=FACETED_BREP('Supplier tessellation',#20);",
+        );
+        let imported = read_source(&source);
+        assert_eq!(imported.bodies.len(), 1);
+        assert_eq!(imported.bodies[0].shell_id, 20);
+        assert_eq!(
+            imported.bodies[0].name.as_deref(),
+            Some("Supplier tessellation")
+        );
+    }
 }

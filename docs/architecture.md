@@ -4,6 +4,11 @@ CADX uses a layered workspace with inward-owned contracts. Domain and use-case
 code do not depend on desktop frameworks, provider SDKs, concrete kernels, or
 filesystem implementations.
 
+The rules on this page are prose. The parts a machine can check — layer
+classification, inward-only dependencies, forbidden technologies per layer, and
+the per-file size budget — are enforced by `cargo test -p cadx-arch` and
+tabulated in [`module-map.md`](module-map.md).
+
 ## Industrial AI-CAD Architecture
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -88,6 +93,7 @@ filesystem implementations.
 | Presentation | `cadx-render` | Kernel-neutral egui/wgpu viewport rendering and picking |
 | Presentation | `cadx-i18n` | Translation resources and runtime language selection |
 | Composition root | `cadx-desktop` | egui interaction, dialogs, asynchronous task wiring, and adapter construction |
+| Architecture contract | `cadx-arch` | The executable layering contract: layer classification, inward-only dependency audit, per-layer forbidden technologies, and the per-file size budget |
 
 ## Dependency Direction
 
@@ -115,6 +121,14 @@ cadx-desktop ---> cadx-app + all required adapters
 
 `cadx-kernel-truck` uses `cadx-io` only as a development dependency for STEP
 conformance tests. Production adapters do not depend on one another.
+
+`cadx-arch` depends on nothing. It reads the workspace manifests and sources
+from disk rather than linking against them, so a rule added there can only fail
+the build — it can never change shipped behavior. Two ratchets record known
+debt: `PENDING_INVERSION` for outward crate edges that still exist, and
+`PENDING_DECOMPOSITION` for files still over the line budget. Both lists may
+only shrink; a dedicated test fails once an entry becomes unnecessary, forcing it
+to be deleted. See [`module-map.md`](module-map.md).
 
 ## State Changes
 
@@ -420,3 +434,9 @@ The constraint semantics and file-compatibility contract are documented in
   reference no longer resolves uniquely after a topology-changing edit.
 - External data is parsed and validated before replacing active state or a
   destination file.
+- A new workspace member must be classified in `cadx-arch::CRATE_LAYERS` and
+  documented in [`module-map.md`](module-map.md) before it will compile in CI.
+- A crate root holds module declarations, re-exports, and at most the type that
+  defines the crate's entry point. Logic lives in a named submodule.
+- No source file exceeds 1000 lines. A module that outgrows the budget is split
+  into cohesive submodules; the budget is not raised.

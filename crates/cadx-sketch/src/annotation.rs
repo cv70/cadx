@@ -1,6 +1,9 @@
-use super::{
-    Constraint, ConstraintGeometry, PointId, SketchError, SketchLoop2D, SketchSegment2D,
-    validate_construction,
+use crate::{
+    PointId,
+    constraints::{Constraint, ConstraintGeometry},
+    error::SketchError,
+    geometry::{SketchLoop2D, SketchSegment2D},
+    solver::validate_construction,
 };
 
 /// Kernel-neutral geometry used to place one solved sketch constraint in a

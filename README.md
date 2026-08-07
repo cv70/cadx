@@ -25,9 +25,12 @@ crates/
   cadx-aec-*/         AEC BIM, wall/slab, IFC, quantities, and clash analysis
   cadx-ecad-*/        ECAD netlist, layout, router, DRC, manufacturing export
   cadx-desktop/       Native egui presentation adapter and composition root
+  cadx-arch/          Executable architecture contract: layers, dependency audit, size budget
 ```
 
 The dependency flow is intentionally one-way. `cadx-core` has no filesystem, UI, GPU, AI provider, or concrete CAD-kernel dependency. `cadx-app` coordinates domain commands through the kernel ports without depending on desktop or storage adapters. Truck-native shapes remain private to `cadx-kernel-truck`; other crates receive only kernel-neutral values.
+
+That flow is not a convention — it is a test. `cadx-arch` classifies every workspace member into exactly one layer, then fails the build on an outward dependency, on an inward layer naming a UI/GPU/kernel/provider crate, on an unclassified new member, or on any source file over 1000 lines. Known debt lives in two ratchet lists that may only shrink. Run `cargo test -p cadx-arch`; the rules are tabulated in [`docs/module-map.md`](docs/module-map.md).
 
 Industry behavior is pluginized above the shared kernel. `cadx-domain-api` defines the geometry-neutral `DomainPack` SPI and `DomainRegistry` bus. The built-in MCAD, AEC/BIM, and ECAD packs live in independent `cadx-mcad-*`, `cadx-aec-*`, and `cadx-ecad-*` crates. Packs validate schema-driven tool requests and return transaction-ready actions, diagnostics, and artifacts without depending on `cadx-core` or egui. The desktop renders the schemas, translates actions into `ModelCommand`, and persists namespaced pack state in the document transaction. See [`docs/domain-packs.md`](docs/domain-packs.md).
 
@@ -131,9 +134,16 @@ The native UI loads an installed CJK font on macOS, Windows, and common Linux di
 
 ```bash
 cargo fmt --all -- --check
+cargo test -p cadx-arch
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+`cargo test -p cadx-arch` is the architecture gate and runs in under a second, so
+run it first: it fails on an outward crate dependency, an inward layer that names
+a UI/GPU/kernel/provider crate, an unclassified new workspace member, or a source
+file over 1000 lines. `.github/workflows/verify.yml` runs all four steps on every
+push and pull request.
 
 ## Industrial roadmap
 

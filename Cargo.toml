@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/cadx-arch",
     "crates/cadx-core",
     "crates/cadx-analysis",
     "crates/cadx-sketch",
@@ -39,6 +40,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/cadx/cadx"
 
 [workspace.dependencies]
+cadx-arch = { path = "crates/cadx-arch" }
 cadx-core = { path = "crates/cadx-core" }
 cadx-analysis = { path = "crates/cadx-analysis" }
 cadx-sketch = { path = "crates/cadx-sketch" }

@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use ruststep::ast::{EntityInstance, Parameter, Record};
 
-use super::{collect_entity_refs, entity_by_id, entity_records, parameter_list, parameter_ref};
+use super::ast::{
+    collect_entity_refs, entity_by_id, entity_records, parameter_list, parameter_ref,
+};
 
 /// Result of reducing STEP presentation styles to CADX's per-body color model.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -437,4 +439,104 @@ fn rgb_matches(left: [f32; 3], right: [f32; 3]) -> bool {
 
 fn channel_matches(left: f32, right: f32) -> bool {
     (left - right).abs() <= 1.0e-6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StepBodyColor;
+    use crate::step::test_support::{VALID_STEP, read_source};
+
+    #[test]
+    fn shell_style_on_only_one_boundary_is_not_flattened() {
+        let source = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('outer',(#90));\n\
+             #21=CLOSED_SHELL('void',(#91));\n\
+             #22=ORIENTED_CLOSED_SHELL('',*,#21,.T.);\n\
+             #23=BREP_WITH_VOIDS('Partially styled',#20,(#22));\n\
+             #30=COLOUR_RGB('',0.15,0.3,0.75);\n\
+             #31=SURFACE_STYLE_SHADING(#30);\n\
+             #32=PRESENTATION_STYLE_ASSIGNMENT((#31));\n\
+             #33=STYLED_ITEM('',(#32),#20);",
+        );
+        let imported = read_source(&source);
+        assert_eq!(imported.bodies.len(), 1);
+        assert_eq!(imported.bodies[0].color, StepBodyColor::Unsupported);
+    }
+
+    #[test]
+    fn reads_solid_level_ap214_color_and_transparency() {
+        let source = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            "#20=CLOSED_SHELL('',(#99));\n\
+             #21=MANIFOLD_SOLID_BREP('Painted housing',#20);\n\
+             #30=COLOUR_RGB('Supplier blue',0.1,0.2,0.8);\n\
+             #31=SURFACE_STYLE_RENDERING(#30,0.25);\n\
+             #32=PRESENTATION_STYLE_ASSIGNMENT((#31));\n\
+             #33=STYLED_ITEM('',(#32),#21);",
+        );
+        let imported = read_source(&source);
+        assert_eq!(
+            imported.bodies[0].color,
+            StepBodyColor::Uniform([0.1, 0.2, 0.8, 0.75])
+        );
+    }
+
+    #[test]
+    fn promotes_only_complete_uniform_face_color_to_a_body_color() {
+        let style = "#30=COLOUR_RGB('',0.8,0.3,0.1);\n\
+                     #31=FILL_AREA_STYLE_COLOUR('',#30);\n\
+                     #32=FILL_AREA_STYLE('',(#31));\n\
+                     #33=SURFACE_STYLE_FILL_AREA(#32);\n\
+                     #34=SURFACE_SIDE_STYLE('',(#33));\n\
+                     #35=SURFACE_STYLE_USAGE(.BOTH.,#34);\n\
+                     #36=PRESENTATION_STYLE_ASSIGNMENT((#35));";
+        let geometry = "#20=CLOSED_SHELL('',(#21,#22));\n\
+                        #21=ADVANCED_FACE('',(#91),#92,.T.);\n\
+                        #22=ADVANCED_FACE('',(#93),#94,.T.);\n\
+                        #23=MANIFOLD_SOLID_BREP('Uniform faces',#20);";
+        let complete = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            &format!(
+                "{geometry}\n{style}\n#37=STYLED_ITEM('',(#36),#21);\n#38=STYLED_ITEM('',(#36),#22);"
+            ),
+        );
+        let partial = VALID_STEP.replace(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+            &format!("{geometry}\n{style}\n#37=STYLED_ITEM('',(#36),#21);"),
+        );
+
+        assert_eq!(
+            read_source(&complete).bodies[0].color,
+            StepBodyColor::Uniform([0.8, 0.3, 0.1, 1.0])
+        );
+        assert_eq!(
+            read_source(&partial).bodies[0].color,
+            StepBodyColor::Unsupported
+        );
+    }
+
+    #[test]
+    fn preserves_malformed_or_unrecognized_style_attachments_as_unsupported() {
+        let geometry = "#20=CLOSED_SHELL('',(#21));\n\
+                        #21=ADVANCED_FACE('',(#91),#92,.T.);\n\
+                        #22=MANIFOLD_SOLID_BREP('Styled body',#20);";
+        let style_cases = [
+            "#30=STYLED_ITEM('',('not a style reference'),#22);",
+            "#30=STYLED_ITEM('',(#999),#22,'extra');",
+            "#30=CURVE_STYLE('',#99,$,#98);\n#31=STYLED_ITEM('',(#30),#22);",
+            "#30=PRESENTATION_STYLE_ASSIGNMENT((#999));\n#31=STYLED_ITEM('',(#30),#22);",
+        ];
+
+        for style in style_cases {
+            let source = VALID_STEP.replace(
+                "#1=CARTESIAN_POINT('',(0.,0.,0.));",
+                &format!("{geometry}\n{style}"),
+            );
+            assert_eq!(
+                read_source(&source).bodies[0].color,
+                StepBodyColor::Unsupported
+            );
+        }
+    }
 }
